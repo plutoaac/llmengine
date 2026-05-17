@@ -152,21 +152,20 @@ void embedding(const float* weight, const int* ids, float* out,
 // SIMD: vectorize the even/odd rotation pairs
 // ===========================================================================
 
-void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base) {
+void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base, int pos_offset) {
     int half = head_dim / 2;
     for (int s = 0; s < seq_len; ++s) {
         const float* x_row = x + s * head_dim;
         float* y_row = y + s * head_dim;
 
+        int pos = pos_offset + s;
         // Precompute cos/sin for this position
-        // theta_d = s / base^(2d/head_dim)  — note: this is the on-the-fly version
-        // We compute in chunks for SIMD
         int d = 0;
         for (; d + MINILLM_SIMD_WIDTH <= half; d += MINILLM_SIMD_WIDTH) {
             alignas(64) float cos_t[MINILLM_SIMD_WIDTH];
             alignas(64) float sin_t[MINILLM_SIMD_WIDTH];
             for (int k = 0; k < MINILLM_SIMD_WIDTH; ++k) {
-                float theta = std::pow(base, -2.0f * (d + k) / head_dim) * s;
+                float theta = std::pow(base, -2.0f * (d + k) / head_dim) * pos;
                 cos_t[k] = std::cos(theta);
                 sin_t[k] = std::sin(theta);
             }
@@ -178,7 +177,7 @@ void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base)
             VF_STORE(y_row + d + half, VF_ADD(VF_MUL(ve, vs), VF_MUL(vo, vc)));
         }
         for (; d < half; ++d) {
-            float theta = std::pow(base, -2.0f * d / head_dim) * s;
+            float theta = std::pow(base, -2.0f * d / head_dim) * pos;
             float cos_t = std::cos(theta);
             float sin_t = std::sin(theta);
             float x_even = x_row[d];
@@ -190,28 +189,29 @@ void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base)
 }
 
 // ===========================================================================
-// SDPA: scaled dot-product attention
+// SDPA: scaled dot-product attention (general q_len x kv_len)
 // SIMD: vectorized QK dot product, softmax, and attn@V
 // ===========================================================================
 
 void sdpa(const float* Q, const float* K, const float* V, float* output,
-          int heads, int seq_len, int head_dim, bool causal) {
+          int heads, int q_len, int kv_len, int head_dim, bool causal) {
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    int per_head = seq_len * head_dim;
+    int q_per_head = q_len * head_dim;
+    int kv_per_head = kv_len * head_dim;
 
-    std::vector<float> scores(static_cast<size_t>(seq_len) * seq_len);
+    std::vector<float> scores(static_cast<size_t>(q_len) * kv_len);
 
     for (int h = 0; h < heads; ++h) {
-        const float* q_h = Q + h * per_head;
-        const float* k_h = K + h * per_head;
-        const float* v_h = V + h * per_head;
-        float* o_h = output + h * per_head;
+        const float* q_h = Q + h * q_per_head;
+        const float* k_h = K + h * kv_per_head;
+        const float* v_h = V + h * kv_per_head;
+        float* o_h = output + h * q_per_head;
 
         // QK^T * scale (SIMD dot product)
-        for (int qi = 0; qi < seq_len; ++qi) {
-            for (int ki = 0; ki < seq_len; ++ki) {
+        for (int qi = 0; qi < q_len; ++qi) {
+            for (int ki = 0; ki < kv_len; ++ki) {
                 if (causal && ki > qi) {
-                    scores[qi * seq_len + ki] = -std::numeric_limits<float>::infinity();
+                    scores[qi * kv_len + ki] = -std::numeric_limits<float>::infinity();
                     continue;
                 }
                 float dot = 0.0f;
@@ -224,34 +224,34 @@ void sdpa(const float* Q, const float* K, const float* V, float* output,
                 dot = hsum(vsum);
                 for (; d < head_dim; ++d)
                     dot += q_h[qi * head_dim + d] * k_h[ki * head_dim + d];
-                scores[qi * seq_len + ki] = dot * scale;
+                scores[qi * kv_len + ki] = dot * scale;
             }
         }
 
         // Softmax each row (SIMD)
-        for (int qi = 0; qi < seq_len; ++qi) {
-            float* row = scores.data() + qi * seq_len;
+        for (int qi = 0; qi < q_len; ++qi) {
+            float* row = scores.data() + qi * kv_len;
 
             // Find max
             vfloat vmax = VF_SET1(-std::numeric_limits<float>::max());
             float max_val = -std::numeric_limits<float>::max();
             int ki = 0;
-            for (; ki + MINILLM_SIMD_WIDTH <= seq_len; ki += MINILLM_SIMD_WIDTH)
+            for (; ki + MINILLM_SIMD_WIDTH <= kv_len; ki += MINILLM_SIMD_WIDTH)
                 vmax = VF_MAX(vmax, VF_LOAD(row + ki));
             max_val = hmax(vmax);
-            for (; ki < seq_len; ++ki) max_val = std::max(max_val, row[ki]);
+            for (; ki < kv_len; ++ki) max_val = std::max(max_val, row[ki]);
 
             // exp(x - max) and sum
             vfloat vsum = VF_SETZERO();
             float sum = 0.0f;
             ki = 0;
-            for (; ki + MINILLM_SIMD_WIDTH <= seq_len; ki += MINILLM_SIMD_WIDTH) {
+            for (; ki + MINILLM_SIMD_WIDTH <= kv_len; ki += MINILLM_SIMD_WIDTH) {
                 vfloat ve = v_exp(VF_SUB(VF_LOAD(row + ki), VF_SET1(max_val)));
                 VF_STORE(row + ki, ve);
                 vsum = VF_ADD(vsum, ve);
             }
             sum = hsum(vsum);
-            for (; ki < seq_len; ++ki) {
+            for (; ki < kv_len; ++ki) {
                 row[ki] = std::exp(row[ki] - max_val);
                 sum += row[ki];
             }
@@ -259,19 +259,85 @@ void sdpa(const float* Q, const float* K, const float* V, float* output,
             // Normalize
             vfloat vinv = VF_SET1(1.0f / sum);
             ki = 0;
-            for (; ki + MINILLM_SIMD_WIDTH <= seq_len; ki += MINILLM_SIMD_WIDTH)
+            for (; ki + MINILLM_SIMD_WIDTH <= kv_len; ki += MINILLM_SIMD_WIDTH)
                 VF_STORE(row + ki, VF_MUL(VF_LOAD(row + ki), vinv));
-            for (; ki < seq_len; ++ki) row[ki] /= sum;
+            for (; ki < kv_len; ++ki) row[ki] /= sum;
         }
 
         // attn @ V
-        for (int qi = 0; qi < seq_len; ++qi) {
+        for (int qi = 0; qi < q_len; ++qi) {
             for (int d = 0; d < head_dim; ++d) {
                 float acc = 0.0f;
-                for (int ki = 0; ki < seq_len; ++ki)
-                    acc += scores[qi * seq_len + ki] * v_h[ki * head_dim + d];
+                for (int ki = 0; ki < kv_len; ++ki)
+                    acc += scores[qi * kv_len + ki] * v_h[ki * head_dim + d];
                 o_h[qi * head_dim + d] = acc;
             }
+        }
+    }
+}
+
+// ===========================================================================
+// SDPA decode: Q=1 path with GQA support
+// Q: [num_heads, 1, head_dim]   — interleaved heads
+// K: [kv_len, kv_hidden]        — cached K, interleaved kv_heads per position
+// V: [kv_len, kv_hidden]        — cached V, same layout
+// output: [num_heads * head_dim] — single position output
+// ===========================================================================
+
+void sdpa_decode(const float* Q, const float* K, const float* V, float* output,
+                 int num_heads, int num_kv_heads, int head_dim, int kv_len) {
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    int kv_hidden = num_kv_heads * head_dim;
+    int group_size = num_heads / num_kv_heads;
+
+    // For each query head, compute attention over the full KV cache
+    for (int h = 0; h < num_heads; ++h) {
+        int kv_h = h / group_size;
+        const float* q_vec = Q + h * head_dim;  // [head_dim]
+        const float* k_cache = K;                // [kv_len, kv_hidden]
+        const float* v_cache = V;                // [kv_len, kv_hidden]
+
+        // Compute QK^T: [kv_len]
+        std::vector<float> scores(kv_len);
+        float max_val = -std::numeric_limits<float>::max();
+
+        for (int ki = 0; ki < kv_len; ++ki) {
+            const float* k_vec = k_cache + ki * kv_hidden + kv_h * head_dim;
+            float dot = 0.0f;
+            vfloat vsum = VF_SETZERO();
+            int d = 0;
+            for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                vsum = VF_ADD(vsum, VF_MUL(
+                    VF_LOAD(q_vec + d), VF_LOAD(k_vec + d)));
+            dot = hsum(vsum);
+            for (; d < head_dim; ++d)
+                dot += q_vec[d] * k_vec[d];
+            scores[ki] = dot * scale;
+            max_val = std::max(max_val, scores[ki]);
+        }
+
+        // Softmax
+        float sum = 0.0f;
+        for (int ki = 0; ki < kv_len; ++ki) {
+            scores[ki] = std::exp(scores[ki] - max_val);
+            sum += scores[ki];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int ki = 0; ki < kv_len; ++ki)
+            scores[ki] *= inv_sum;
+
+        // Weighted sum of V
+        float* o_vec = output + h * head_dim;
+        std::memset(o_vec, 0, head_dim * sizeof(float));
+        for (int ki = 0; ki < kv_len; ++ki) {
+            const float* v_vec = v_cache + ki * kv_hidden + kv_h * head_dim;
+            float w = scores[ki];
+            vfloat vw = VF_SET1(w);
+            int d = 0;
+            for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                VF_STORE(o_vec + d, VF_ADD(VF_LOAD(o_vec + d), VF_MUL(vw, VF_LOAD(v_vec + d))));
+            for (; d < head_dim; ++d)
+                o_vec[d] += w * v_vec[d];
         }
     }
 }

@@ -1,5 +1,7 @@
 #include "minillm/runtime/cpu_kernel_adapter.h"
 
+#include <cstring>
+
 #include "minillm/core/dtype.h"
 #include "minillm/core/shape.h"
 #include "minillm/core/tensor.h"
@@ -239,6 +241,13 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         if (auto* p = std::get_if<int64_t>(&*attr)) head_dim = *p;
     }
 
+    // Position offset: for decode with KV cache, use cached_len
+    int pos_offset = 0;
+    KVCache* cache = ctx.kv_cache();
+    if (cache && cache->initialized() && cache->cached_len() > 0 && seq_len == 1) {
+        pos_offset = cache->cached_len();
+    }
+
     // x layout: [batch*seq, num_heads * head_dim] treated as [batch*seq, hidden]
     // We apply RoPE per-head by iterating over heads
     int num_heads = hidden / static_cast<int>(head_dim);
@@ -249,7 +258,7 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         for (int h = 0; h < num_heads; ++h) {
             const float* x_head = x_data + s * hidden + h * head_dim;
             float* o_head = o_data + s * hidden + h * head_dim;
-            cpu::apply_rope(x_head, o_head, 1, static_cast<int>(head_dim), 10000.0f);
+            cpu::apply_rope(x_head, o_head, 1, static_cast<int>(head_dim), 10000.0f, pos_offset + s);
         }
     }
     return Status::make_ok();
@@ -270,7 +279,7 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     st = check_allocated(*vt, "v"); if (!st.ok()) return st;
     st = check_allocated(*ot, "output"); if (!st.ok()) return st;
 
-    int64_t num_heads = 12, num_kv_heads = 12, head_dim = 64;
+    int64_t num_heads = 12, num_kv_heads = 12, head_dim = 64, layer_idx = 0;
     if (auto attr = node.get_attr("num_heads")) {
         if (auto* p = std::get_if<int64_t>(&*attr)) num_heads = *p;
     }
@@ -279,6 +288,9 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     }
     if (auto attr = node.get_attr("head_dim")) {
         if (auto* p = std::get_if<int64_t>(&*attr)) head_dim = *p;
+    }
+    if (auto attr = node.get_attr("layer_idx")) {
+        if (auto* p = std::get_if<int64_t>(&*attr)) layer_idx = *p;
     }
 
     bool causal = true;
@@ -297,56 +309,160 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     int batch = static_cast<int>((*qt)->shape().dim(0));
     int seq_len = static_cast<int>((*qt)->shape().dim(1));
     int q_hidden = static_cast<int>((*qt)->shape().dim(2));
-    int kv_hidden = static_cast<int>((*kt)->shape().dim(2));
+    int kv_hidden_size = static_cast<int>((*kt)->shape().dim(2));
 
     const float* q_data = float_data(*qt);
     const float* k_data = float_data(*kt);
     const float* v_data = float_data(*vt);
     float* o_data = float_data_mut(*ot);
 
-    // Buffers: Q in [nh, seq, hd], K/V expanded to [nh, seq, hd] for GQA
-    std::vector<float> q_buf(static_cast<size_t>(nh) * seq_len * hd);
-    std::vector<float> k_buf(static_cast<size_t>(nh) * seq_len * hd);
-    std::vector<float> v_buf(static_cast<size_t>(nh) * seq_len * hd);
-    std::vector<float> o_buf(static_cast<size_t>(nh) * seq_len * hd);
+    // =================== NO CACHE PATH (backward compat) ===================
+    KVCache* cache = ctx.kv_cache();
+    if (!cache || !cache->initialized()) {
+        std::vector<float> q_buf(static_cast<size_t>(nh) * seq_len * hd);
+        std::vector<float> k_buf(static_cast<size_t>(nh) * seq_len * hd);
+        std::vector<float> v_buf(static_cast<size_t>(nh) * seq_len * hd);
+        std::vector<float> o_buf(static_cast<size_t>(nh) * seq_len * hd);
 
-    for (int b = 0; b < batch; ++b) {
-        // Reinterleave Q: [seq, nh*hd] -> [nh, seq, hd]
-        for (int s = 0; s < seq_len; ++s) {
-            for (int h = 0; h < nh; ++h) {
-                for (int d = 0; d < hd; ++d) {
-                    q_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] =
-                        q_data[b * seq_len * q_hidden + s * q_hidden + h * hd + d];
-                }
-            }
-        }
-
-        // Reinterleave K/V: [seq, nkv*hd] -> [nh, seq, hd] with GQA expansion
-        for (int s = 0; s < seq_len; ++s) {
-            for (int h = 0; h < nh; ++h) {
-                int kv_h = h / group_size;
-                for (int d = 0; d < hd; ++d) {
-                    auto kv_src = b * seq_len * kv_hidden + s * kv_hidden + kv_h * hd + d;
-                    k_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] = k_data[kv_src];
-                    v_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] = v_data[kv_src];
-                }
-            }
-        }
-
-        cpu::sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
-                  nh, seq_len, hd, causal);
-
-        // Reinterleave back: [nh, seq, hd] -> [seq, nh*hd]
-        for (int h = 0; h < nh; ++h) {
+        for (int b = 0; b < batch; ++b) {
             for (int s = 0; s < seq_len; ++s) {
-                for (int d = 0; d < hd; ++d) {
-                    auto dst_idx = b * seq_len * q_hidden + s * q_hidden + h * hd + d;
-                    o_data[dst_idx] = o_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d];
+                for (int h = 0; h < nh; ++h) {
+                    for (int d = 0; d < hd; ++d) {
+                        q_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] =
+                            q_data[b * seq_len * q_hidden + s * q_hidden + h * hd + d];
+                    }
+                }
+            }
+            for (int s = 0; s < seq_len; ++s) {
+                for (int h = 0; h < nh; ++h) {
+                    int kv_h = h / group_size;
+                    for (int d = 0; d < hd; ++d) {
+                        auto kv_src = b * seq_len * kv_hidden_size + s * kv_hidden_size + kv_h * hd + d;
+                        k_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] = k_data[kv_src];
+                        v_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] = v_data[kv_src];
+                    }
+                }
+            }
+
+            cpu::sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
+                      nh, seq_len, seq_len, hd, causal);
+
+            for (int h = 0; h < nh; ++h) {
+                for (int s = 0; s < seq_len; ++s) {
+                    for (int d = 0; d < hd; ++d) {
+                        auto dst_idx = b * seq_len * q_hidden + s * q_hidden + h * hd + d;
+                        o_data[dst_idx] = o_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d];
+                    }
                 }
             }
         }
+        return Status::make_ok();
     }
-    return Status::make_ok();
+
+    // =================== CACHE PATH ===================
+    int li = static_cast<int>(layer_idx);
+    float* cache_k = cache->k_data(li);
+    float* cache_v = cache->v_data(li);
+    int cached_len = cache->cached_len();
+    int kv_h = nkv * hd;  // kv_hidden per position
+
+    // ---- PREFILL: cached_len == 0 ----
+    if (cached_len == 0) {
+        // Copy K/V rows into cache: [seq, nkv*hd] -> cache[0..seq_len-1]
+        for (int b = 0; b < batch; ++b) {
+            for (int s = 0; s < seq_len; ++s) {
+                const float* k_row = k_data + b * seq_len * kv_hidden_size + s * kv_hidden_size;
+                const float* v_row = v_data + b * seq_len * kv_hidden_size + s * kv_hidden_size;
+                std::memcpy(cache_k + s * kv_h, k_row, kv_h * sizeof(float));
+                std::memcpy(cache_v + s * kv_h, v_row, kv_h * sizeof(float));
+            }
+        }
+
+        // Reinterleave Q as [nh, seq, hd]
+        std::vector<float> q_buf(static_cast<size_t>(nh) * seq_len * hd);
+        // Reinterleave cached K/V into [nh, seq, hd] with GQA expansion
+        std::vector<float> k_buf(static_cast<size_t>(nh) * seq_len * hd);
+        std::vector<float> v_buf(static_cast<size_t>(nh) * seq_len * hd);
+        std::vector<float> o_buf(static_cast<size_t>(nh) * seq_len * hd);
+
+        for (int b = 0; b < batch; ++b) {
+            for (int s = 0; s < seq_len; ++s) {
+                for (int h = 0; h < nh; ++h) {
+                    for (int d = 0; d < hd; ++d) {
+                        q_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] =
+                            q_data[b * seq_len * q_hidden + s * q_hidden + h * hd + d];
+                    }
+                }
+            }
+
+            // Reinterleave from cache (which has [seq, nkv*hd] layout)
+            for (int s = 0; s < seq_len; ++s) {
+                for (int h = 0; h < nh; ++h) {
+                    int kv_hi = h / group_size;
+                    for (int d = 0; d < hd; ++d) {
+                        k_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] =
+                            cache_k[s * kv_h + kv_hi * hd + d];
+                        v_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] =
+                            cache_v[s * kv_h + kv_hi * hd + d];
+                    }
+                }
+            }
+
+            cpu::sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
+                      nh, seq_len, seq_len, hd, causal);
+
+            for (int h = 0; h < nh; ++h) {
+                for (int s = 0; s < seq_len; ++s) {
+                    for (int d = 0; d < hd; ++d) {
+                        auto dst_idx = b * seq_len * q_hidden + s * q_hidden + h * hd + d;
+                        o_data[dst_idx] = o_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d];
+                    }
+                }
+            }
+        }
+
+        // Only the last layer should advance the cache
+        // We rely on the caller to set cached_len after the full forward pass
+        return Status::make_ok();
+    }
+
+    // ---- DECODE: cached_len > 0, seq_len should be 1 ----
+    // Copy new K/V row into cache at position cached_len
+    {
+        for (int b = 0; b < batch; ++b) {
+            const float* k_row = k_data + b * seq_len * kv_hidden_size;
+            const float* v_row = v_data + b * seq_len * kv_hidden_size;
+            std::memcpy(cache_k + cached_len * kv_h, k_row, kv_h * sizeof(float));
+            std::memcpy(cache_v + cached_len * kv_h, v_row, kv_h * sizeof(float));
+        }
+
+        int new_kv_len = cached_len + 1;
+
+        // Reinterleave Q as [nh, 1, hd]
+        std::vector<float> q_buf(static_cast<size_t>(nh) * hd);
+
+        for (int b = 0; b < batch; ++b) {
+            for (int h = 0; h < nh; ++h) {
+                for (int d = 0; d < hd; ++d) {
+                    q_buf[static_cast<size_t>(h) * hd + d] =
+                        q_data[b * seq_len * q_hidden + h * hd + d];
+                }
+            }
+
+            // Use sdpa_decode which handles GQA directly from cache layout
+            std::vector<float> o_buf(static_cast<size_t>(nh) * hd);
+            cpu::sdpa_decode(q_buf.data(), cache_k, cache_v, o_buf.data(),
+                             nh, nkv, hd, new_kv_len);
+
+            // Copy output: [nh*hd] -> [1, nh*hd]
+            for (int i = 0; i < nh * hd; ++i) {
+                o_data[i] = o_buf[i];
+            }
+        }
+
+        // Caller advances cached_len after all layers complete
+        return Status::make_ok();
+    }
 }
 
 static Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {

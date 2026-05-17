@@ -6,14 +6,12 @@
 
 #include "minillm/core/tensor.h"
 #include "minillm/graph/value.h"
+#include "minillm/runtime/kv_cache.h"
 
 namespace minillm {
 
 class Graph;
 
-// Binds ValueIds to physical Tensors at runtime.
-// Owns the Tensors it allocates for intermediates; externally-owned
-// Tensors (inputs, weights) are just referenced.
 class RuntimeContext {
 public:
     // Bind an externally-owned Tensor to a ValueId.
@@ -30,11 +28,18 @@ public:
     // Uses static shape; dynamic dims must already be resolved.
     Status allocate_intermediates(const Graph& graph);
 
+    // KV cache access
+    KVCache* kv_cache() const { return kv_cache_.get(); }
+    void set_kv_cache(std::shared_ptr<KVCache> cache) { kv_cache_ = std::move(cache); }
+    std::shared_ptr<KVCache> shared_kv_cache() { return kv_cache_; }
+
 private:
     // ValueId.value -> Tensor*
     std::unordered_map<size_t, Tensor*> bindings_;
     // Owning storage for tensors we allocate
     std::vector<std::unique_ptr<Tensor>> owned_;
+    // KV cache (shared between prefill and decode contexts)
+    std::shared_ptr<KVCache> kv_cache_;
 };
 
 } // namespace minillm

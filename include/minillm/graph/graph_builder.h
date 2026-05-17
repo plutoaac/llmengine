@@ -57,6 +57,7 @@ public:
     std::expected<ValueId, Status> attention(
         ValueId q, ValueId k, ValueId v, bool causal,
         int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+        int64_t layer_idx,
         std::string name);
 
     std::expected<ValueId, Status> qk_norm(

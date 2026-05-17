@@ -87,7 +87,8 @@ std::expected<ValueId, Status> TransformerGraphBuilder::build_tiny_decoder_block
     if (!k_rope) return std::unexpected(k_rope.error());
 
     auto attn_out = builder_.attention(*q_rope, *k_rope, *v, true,
-                                       cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, "attention");
+                                       cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
+                                       int64_t(0), "attention");
     if (!attn_out) return std::unexpected(attn_out.error());
 
     auto o_proj = builder_.linear(*attn_out, *o_proj_w, std::nullopt, "o_proj");
@@ -240,6 +241,7 @@ std::expected<ValueId, Status> TransformerGraphBuilder::build_transformer(
 
         auto attn_out = builder_.attention(*q_rope, *k_rope, *v, true,
                                            cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
+                                           layer,
                                            prefix + "attention");
         if (!attn_out) return std::unexpected(attn_out.error());
 

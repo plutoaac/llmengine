@@ -23,11 +23,17 @@ void embedding(const float* weight, const int* ids, float* out,
                int seq_len, int hidden);
 
 // RoPE (on-the-fly, no cache table)
-void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base);
+// pos_offset: absolute position of the first token (0 for prefill, cached_len for decode)
+void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base, int pos_offset = 0);
 
-// Scaled dot-product attention: Q/V [heads, seq, head_dim]
+// Scaled dot-product attention: Q [heads, q_len, head_dim], K/V [heads, kv_len, head_dim]
 void sdpa(const float* Q, const float* K, const float* V, float* output,
-          int heads, int seq_len, int head_dim, bool causal);
+          int heads, int q_len, int kv_len, int head_dim, bool causal);
+
+// Decode-path SDPA for Q=1: Q [heads, 1, head_dim], K/V [kv_len, kv_hidden]
+// Handles GQA: K/V have num_kv_heads columns, expanded to num_heads
+void sdpa_decode(const float* Q, const float* K, const float* V, float* output,
+                 int num_heads, int num_kv_heads, int head_dim, int kv_len);
 
 // Softmax: y[rows, cols]
 void softmax(const float* x, float* y, int rows, int cols);

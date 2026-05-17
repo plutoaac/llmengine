@@ -197,6 +197,7 @@ std::expected<ValueId, Status> GraphBuilder::rope(
 std::expected<ValueId, Status> GraphBuilder::attention(
     ValueId q, ValueId k, ValueId v, bool causal,
     int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+    int64_t layer_idx,
     std::string name) {
     auto qv = get_value(q);
     if (!qv) return std::unexpected(qv.error());
@@ -216,6 +217,7 @@ std::expected<ValueId, Status> GraphBuilder::attention(
         (*nd)->set_attr("num_heads", num_heads);
         (*nd)->set_attr("num_kv_heads", num_kv_heads);
         (*nd)->set_attr("head_dim", head_dim);
+        (*nd)->set_attr("layer_idx", layer_idx);
     }
     return out;
 }

@@ -43,6 +43,7 @@ add_library(minillm_runtime
     src/runtime/cpu_kernels.cpp
     src/runtime/cpu_kernel_adapter.cpp
     src/runtime/sampler.cpp
+    src/runtime/kv_cache.cpp
 )
 target_include_directories(minillm_runtime PUBLIC include)
 target_link_libraries(minillm_runtime PUBLIC minillm_graph)

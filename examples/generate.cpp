@@ -22,7 +22,7 @@ int main(int argc, char* argv[]) {
     int max_new_tokens = (argc >= 4) ? std::stoi(argv[3]) : 64;
 
     // 1. Parse GGUF file
-    std::cerr << "[1/6] Parsing GGUF file...\n";
+    std::cerr << "[1/7] Parsing GGUF file...\n";
     WeightLoader loader(gguf_path);
     auto file_result = loader.open();
     if (!file_result) {
@@ -31,7 +31,7 @@ int main(int argc, char* argv[]) {
     }
 
     // 2. Extract config and build tokenizer
-    std::cerr << "[2/6] Building tokenizer...\n";
+    std::cerr << "[2/7] Building tokenizer...\n";
     auto cfg_result = loader.extract_config(*file_result);
     if (!cfg_result) {
         std::cerr << "Failed to extract config: " << cfg_result.error().to_string() << "\n";
@@ -63,67 +63,116 @@ int main(int argc, char* argv[]) {
               << " heads=" << cfg.num_heads << " kv_heads=" << cfg.num_kv_heads
               << " head_dim=" << cfg.head_dim << " vocab=" << cfg.vocab_size << "\n";
 
-    // 3. Build graph
-    // Since we don't have KV-cache, we use a multi-step approach:
-    // Each step, run the full forward pass with only the real tokens (no padding).
-    // This is slow but correct because causal attention only sees prior tokens.
-    int64_t max_seq_len = static_cast<int64_t>(encoded->size()) + max_new_tokens;
-    cfg.seq_len = max_seq_len;
+    int prompt_len = static_cast<int>(encoded->size());
+    int max_seq_len = prompt_len + max_new_tokens;
 
-    std::cerr << "[3/6] Building computation graph (seq_len=" << cfg.seq_len << ")...\n";
-    Graph graph;
-    GraphBuilder gb(graph);
-    TransformerGraphBuilder tb(gb);
+    // 3. Build prefill graph (seq_len = prompt_len)
+    std::cerr << "[3/7] Building prefill graph (seq_len=" << prompt_len << ")...\n";
+    TransformerConfig prefill_cfg = cfg;
+    prefill_cfg.seq_len = prompt_len;
 
-    auto result = tb.build_transformer(cfg);
-    if (!result) {
-        std::cerr << "Failed to build graph: " << result.error().to_string() << "\n";
+    Graph prefill_graph;
+    GraphBuilder prefill_gb(prefill_graph);
+    TransformerGraphBuilder prefill_tb(prefill_gb);
+
+    auto prefill_result = prefill_tb.build_transformer(prefill_cfg);
+    if (!prefill_result) {
+        std::cerr << "Failed to build prefill graph: " << prefill_result.error().to_string() << "\n";
         return 1;
     }
 
-    auto st = graph.validate();
+    auto st = prefill_graph.validate();
     if (!st.ok()) {
-        std::cerr << "Graph validation failed: " << st.to_string() << "\n";
+        std::cerr << "Prefill graph validation failed: " << st.to_string() << "\n";
         return 1;
     }
 
-    // 4. Allocate tensors and load weights
-    std::cerr << "[4/6] Allocating tensors...\n";
-    RuntimeContext ctx;
-    for (const auto& v : graph.values()) {
+    // 4. Build decode graph (seq_len = 1)
+    std::cerr << "[4/7] Building decode graph (seq_len=1)...\n";
+    TransformerConfig decode_cfg = cfg;
+    decode_cfg.seq_len = 1;
+
+    Graph decode_graph;
+    GraphBuilder decode_gb(decode_graph);
+    TransformerGraphBuilder decode_tb(decode_gb);
+
+    auto decode_result = decode_tb.build_transformer(decode_cfg);
+    if (!decode_result) {
+        std::cerr << "Failed to build decode graph: " << decode_result.error().to_string() << "\n";
+        return 1;
+    }
+
+    st = decode_graph.validate();
+    if (!st.ok()) {
+        std::cerr << "Decode graph validation failed: " << st.to_string() << "\n";
+        return 1;
+    }
+
+    // 5. Allocate tensors and load weights for both graphs
+    std::cerr << "[5/7] Allocating tensors and loading weights...\n";
+
+    // Prefill context
+    RuntimeContext prefill_ctx;
+    for (const auto& v : prefill_graph.values()) {
         auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
         st = t->allocate_cpu();
         if (!st.ok()) {
             std::cerr << "Failed to allocate " << v.name << ": " << st.to_string() << "\n";
             return 1;
         }
-        ctx.emplace(v.id, std::move(t));
+        prefill_ctx.emplace(v.id, std::move(t));
     }
 
-    std::cerr << "[5/6] Loading weights...\n";
-    st = loader.load_weights(*file_result, graph, ctx);
+    st = loader.load_weights(*file_result, prefill_graph, prefill_ctx);
     if (!st.ok()) {
-        std::cerr << "Failed to load weights: " << st.to_string() << "\n";
+        std::cerr << "Failed to load prefill weights: " << st.to_string() << "\n";
         return 1;
     }
 
-    // 5. Autoregressive generation
-    // Key insight: causal attention at position k only depends on tokens 0..k-1.
-    // So a single forward pass gives correct logits for ALL positions.
-    // We run ONE forward pass with the prompt, then iteratively:
-    //   - Read the logit at the last real position
-    //   - Append the sampled token
-    //   - Re-run the full forward pass with the extended sequence
-    // This is O(n^2) but correct without KV-cache.
-    std::cerr << "[6/6] Generating (" << max_new_tokens << " tokens)...\n\n";
+    // Decode context
+    RuntimeContext decode_ctx;
+    for (const auto& v : decode_graph.values()) {
+        auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
+        st = t->allocate_cpu();
+        if (!st.ok()) {
+            std::cerr << "Failed to allocate " << v.name << ": " << st.to_string() << "\n";
+            return 1;
+        }
+        decode_ctx.emplace(v.id, std::move(t));
+    }
 
+    st = loader.load_weights(*file_result, decode_graph, decode_ctx);
+    if (!st.ok()) {
+        std::cerr << "Failed to load decode weights: " << st.to_string() << "\n";
+        return 1;
+    }
+
+    // 6. Initialize shared KV cache
+    auto kv_cache = std::make_shared<KVCache>();
+    kv_cache->init(static_cast<int>(cfg.num_layers),
+                   static_cast<int>(cfg.num_kv_heads),
+                   static_cast<int>(cfg.head_dim),
+                   max_seq_len);
+
+    prefill_ctx.set_kv_cache(kv_cache);
+    decode_ctx.set_kv_cache(kv_cache);
+
+    // 7. Compile executors
     KernelRegistry registry;
     register_cpu_kernels(registry);
     auto backend = std::make_shared<CpuBackend>();
-    CpuExecutor exec(backend, registry);
-    st = exec.compile(graph);
+
+    CpuExecutor prefill_exec(backend, registry);
+    st = prefill_exec.compile(prefill_graph);
     if (!st.ok()) {
-        std::cerr << "Compile failed: " << st.to_string() << "\n";
+        std::cerr << "Prefill compile failed: " << st.to_string() << "\n";
+        return 1;
+    }
+
+    CpuExecutor decode_exec(backend, registry);
+    st = decode_exec.compile(decode_graph);
+    if (!st.ok()) {
+        std::cerr << "Decode compile failed: " << st.to_string() << "\n";
         return 1;
     }
 
@@ -135,67 +184,108 @@ int main(int argc, char* argv[]) {
     samp_cfg.repetition_penalty = 1.1f;
     Sampler sampler(42);
 
-    // Build the full token sequence (prompt + generated)
-    std::vector<int32_t> all_tokens = *encoded;
+    // ===== PREFILL =====
+    std::cerr << "[6/7] Prefilling (" << prompt_len << " tokens)...\n";
 
-    // Qwen3 thinking tokens
+    // Fill input_ids with prompt tokens
+    for (const auto& v : prefill_graph.values()) {
+        if (v.name == "input_ids" && v.kind == ValueKind::Input) {
+            auto* t = prefill_ctx.get(v.id);
+            auto* ptr = reinterpret_cast<int32_t*>(t->data());
+            for (int64_t i = 0; i < prompt_len; ++i) {
+                ptr[i] = (*encoded)[i];
+            }
+        }
+    }
+
+    // Run prefill
+    st = prefill_exec.run(prefill_ctx);
+    if (!st.ok()) {
+        std::cerr << "Prefill failed: " << st.to_string() << "\n";
+        return 1;
+    }
+
+    // Advance cache after prefill
+    kv_cache->set_cached_len(prompt_len);
+
+    // Get logits at last position → sample first token
+    auto* logits_tensor = prefill_ctx.get(*prefill_result);
+    if (!logits_tensor) {
+        std::cerr << "Output tensor not found\n";
+        return 1;
+    }
+
+    auto* logits_data = reinterpret_cast<const float*>(logits_tensor->data());
+    int64_t vocab_size = cfg.vocab_size;
+    const float* last_logits = logits_data + (prompt_len - 1) * vocab_size;
+
+    std::vector<int32_t> all_tokens = *encoded;
+    int32_t first_token = sampler.sample(
+        last_logits, static_cast<int32_t>(vocab_size),
+        samp_cfg, all_tokens);
+
+    if (first_token == tokenizer.eos_token_id()) {
+        std::cerr << "Model produced EOS immediately after prefill\n";
+        return 0;
+    }
+    all_tokens.push_back(first_token);
+
+    // Decode and print first token
     const int32_t think_start_id = 151667;
     const int32_t think_end_id = 151668;
     bool in_thinking = false;
 
-    for (int step = 0; step < max_new_tokens; ++step) {
-        // Fill input_ids with all_tokens, pad rest with last token (repeat)
-        // Using last token instead of EOS avoids attention corruption
-        for (const auto& v : graph.values()) {
+    if (first_token == think_start_id) {
+        in_thinking = true;
+        std::cerr << "[thinking] " << std::flush;
+    } else if (first_token == think_end_id) {
+        in_thinking = false;
+        std::cerr << "\n" << std::flush;
+    } else {
+        auto decoded = tokenizer.decode({first_token});
+        if (decoded) std::cout << *decoded << std::flush;
+    }
+
+    // ===== DECODE LOOP =====
+    std::cerr << "[7/7] Decoding (" << (max_new_tokens - 1) << " more tokens)...\n\n";
+
+    for (int step = 1; step < max_new_tokens; ++step) {
+        // Fill decode input_ids with the last generated token
+        for (const auto& v : decode_graph.values()) {
             if (v.name == "input_ids" && v.kind == ValueKind::Input) {
-                auto* t = ctx.get(v.id);
+                auto* t = decode_ctx.get(v.id);
                 auto* ptr = reinterpret_cast<int32_t*>(t->data());
-                for (int64_t i = 0; i < cfg.seq_len; ++i) {
-                    if (i < (int64_t)all_tokens.size()) {
-                        ptr[i] = all_tokens[i];
-                    } else {
-                        // Pad with the EOS token — since we only read logits at
-                        // position (all_tokens.size()-1), the padding positions
-                        // don't affect our output (causal mask ensures this)
-                        ptr[i] = tokenizer.eos_token_id();
-                    }
-                }
+                ptr[0] = all_tokens.back();
             }
         }
 
-        // Run forward pass
-        st = exec.run(ctx);
+        // Run decode step
+        st = decode_exec.run(decode_ctx);
         if (!st.ok()) {
-            std::cerr << "Forward pass failed at step " << step << ": "
+            std::cerr << "Decode failed at step " << step << ": "
                       << st.to_string() << "\n";
             break;
         }
 
-        // Get logits at the last real position
-        auto* logits_tensor = ctx.get(*result);
-        if (!logits_tensor) {
-            std::cerr << "Output tensor not found\n";
+        // Advance cache after decode
+        kv_cache->advance(1);
+
+        // Get logits
+        auto* dec_logits = decode_ctx.get(*decode_result);
+        if (!dec_logits) {
+            std::cerr << "Decode output tensor not found\n";
             break;
         }
 
-        int64_t last_pos = (int64_t)all_tokens.size() - 1;
-        auto* logits_data = reinterpret_cast<const float*>(logits_tensor->data());
-        int64_t vocab_size = cfg.vocab_size;
-        const float* last_logits = logits_data + last_pos * vocab_size;
-
-        // Sample next token
+        auto* dec_logits_data = reinterpret_cast<const float*>(dec_logits->data());
         int32_t next_token = sampler.sample(
-            last_logits, static_cast<int32_t>(vocab_size),
+            dec_logits_data, static_cast<int32_t>(vocab_size),
             samp_cfg, all_tokens);
 
-        // Check for EOS
-        if (next_token == tokenizer.eos_token_id()) {
-            break;
-        }
+        if (next_token == tokenizer.eos_token_id()) break;
 
         all_tokens.push_back(next_token);
 
-        // Handle Qwen3 thinking mode
         if (next_token == think_start_id) {
             in_thinking = true;
             std::cerr << "[thinking] " << std::flush;
@@ -208,11 +298,8 @@ int main(int argc, char* argv[]) {
         }
         if (in_thinking) continue;
 
-        // Decode and print non-thinking tokens
         auto decoded = tokenizer.decode({next_token});
-        if (decoded) {
-            std::cout << *decoded << std::flush;
-        }
+        if (decoded) std::cout << *decoded << std::flush;
     }
 
     std::cout << "\n\n[Generated " << (all_tokens.size() - encoded->size()) << " tokens total]\n";
