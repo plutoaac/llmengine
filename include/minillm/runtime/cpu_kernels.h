@@ -1,0 +1,45 @@
+#pragma once
+
+// Naive CPU kernel declarations matching mini_op function signatures.
+// Current implementations are scalar (no SIMD); they will be replaced
+// by mini_op SIMD kernels in a future phase.
+
+#include <cstddef>
+
+namespace minillm::cpu {
+
+// GEMM: C[M,N] = A[M,K] @ B[K,N], row-major
+void sgemm(const float* A, const float* B, float* C, int M, int N, int K);
+
+// GEMM with transposed B: C[M,N] = A[M,K] @ B^T[K,N], B stored as [N,K]
+void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K);
+
+// RMSNorm: y = x / rms(x) * gamma
+void rmsnorm(const float* x, const float* gamma, float* y,
+             int rows, int hidden, float eps);
+
+// Embedding: out[seq_len, hidden] = weight[ids[i]]
+void embedding(const float* weight, const int* ids, float* out,
+               int seq_len, int hidden);
+
+// RoPE (on-the-fly, no cache table)
+void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base);
+
+// Scaled dot-product attention: Q/V [heads, seq, head_dim]
+void sdpa(const float* Q, const float* K, const float* V, float* output,
+          int heads, int seq_len, int head_dim, bool causal);
+
+// Softmax: y[rows, cols]
+void softmax(const float* x, float* y, int rows, int cols);
+
+// Elementwise binary: y[i] = a[i] op b[i], n elements
+void add(const float* a, const float* b, float* y, int n);
+void mul(const float* a, const float* b, float* y, int n);
+
+// Elementwise unary
+void silu(const float* x, float* y, int n);
+
+// Fused: y = silu(gate) * up
+void fused_silu_mul(const float* gate, const float* up, float* y, int n);
+
+} // namespace minillm::cpu
