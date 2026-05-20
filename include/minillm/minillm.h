@@ -31,6 +31,7 @@
 #include "minillm/runtime/cpu_kernel_adapter.h"
 #include "minillm/runtime/memory_planner.h"
 #include "minillm/runtime/kv_cache.h"
+#include "minillm/runtime/paged_kv_cache.h"
 #include "minillm/runtime/sampler.h"
 
 #if defined(MINILLM_ENABLE_CUDA)

@@ -63,6 +63,7 @@ add_library(minillm_runtime
     src/runtime/memory_planner.cpp
     src/runtime/sampler.cpp
     src/runtime/kv_cache.cpp
+    src/runtime/paged_kv_cache.cpp
 )
 target_include_directories(minillm_runtime PUBLIC include)
 target_link_libraries(minillm_runtime PUBLIC minillm_graph)
@@ -132,6 +133,7 @@ add_minillm_test(test_graph_builder)
 add_minillm_test(test_runtime)
 add_minillm_test(test_cpu_kernels)
 add_minillm_test(test_memory_planner)
+add_minillm_test(test_paged_kv_cache)
 
 add_minillm_test(test_gguf_parser)
 target_link_libraries(test_gguf_parser PRIVATE minillm_io)

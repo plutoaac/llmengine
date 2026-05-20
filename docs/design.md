@@ -11,6 +11,7 @@ The design goal is to demonstrate the core engineering concepts behind local LLM
 - optional CUDA transformer kernels
 - GGUF model loading
 - KV cache based prefill/decode generation
+- block-table based paged KV cache design
 
 ## System Overview
 
@@ -39,6 +40,8 @@ flowchart TD
     Kernels --> Context
     CudaKernels -.-> Context
     Context --> Cache["KVCache"]
+    Context --> PagedCache["PagedKVCache"]
+    PagedCache --> PagedDecode["paged_attention_decode"]
 ```
 
 The runtime is separated into five layers:
@@ -48,7 +51,7 @@ The runtime is separated into five layers:
 | Core | `Shape`, `DType`, `Device`, `Status`, and physical `Tensor` storage |
 | Graph | Logical `Value` and `Node` descriptors plus graph validation and topological sort |
 | Model | Transformer graph construction using `GraphBuilder` |
-| Runtime | `RuntimeContext`, `CpuExecutor`, optional `CudaExecutor`, backend capability checks, kernel registries, KV cache, sampler |
+| Runtime | `RuntimeContext`, `CpuExecutor`, optional `CudaExecutor`, backend capability checks, kernel registries, KV cache, paged KV cache, sampler |
 | IO | GGUF metadata parsing, tensor loading, weight-name mapping, and tokenizer |
 
 ## Core Types
@@ -373,6 +376,44 @@ Decode:
 
 This keeps cache length updates outside individual attention nodes and prevents double-advancing when a graph has multiple transformer layers.
 
+## Paged KV Cache And PagedAttention
+
+The contiguous `KVCache` is simple and works well for single-batch generation. It stores each layer as one dense `[max_seq_len, num_kv_heads * head_dim]` region. That layout is easy to reason about, but it assumes each request owns one contiguous cache range.
+
+`PagedKVCache` adds the core data structure used by PagedAttention-style runtimes:
+
+```text
+logical token position -> logical block index -> physical block id
+```
+
+Each sequence owns a block table. Blocks are fixed-size token pages, such as 16 or 32 tokens in a production system. Freeing a sequence returns its physical blocks to a free list, so future sequences can reuse them without compacting a large contiguous KV buffer.
+
+```mermaid
+flowchart LR
+    Seq["sequence 7\nlength 5"] --> Table["block table\n[0, 3, 1]"]
+    Table --> B0["block 0\ntokens 0..1"]
+    Table --> B3["block 3\ntokens 2..3"]
+    Table --> B1["block 1\ntoken 4"]
+    Free["free list"] --> B2["block 2"]
+```
+
+The first implementation is a CPU reference path:
+
+- `PagedKVCache::write_tokens()` writes K/V rows into block-table storage.
+- `PagedKVCache::free_sequence()` returns blocks to the allocator.
+- `paged_attention_decode()` reads K/V through the block table.
+- GQA is supported by mapping query heads to KV heads.
+
+The decode attention API expects:
+
+```text
+q:      [num_heads, head_dim]
+output: [num_heads, head_dim]
+cache:  paged K/V rows for one sequence and layer
+```
+
+This is not yet a continuous batching scheduler. It is the reference layer that makes a future scheduler and CUDA PagedAttention kernel easier to add and test.
+
 ## GGUF Loading
 
 The IO layer is split into:
@@ -403,6 +444,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
 | `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion |
 | `test_memory_planner` | graph liveness, buffer reuse planning, skip reasons, report output |
+| `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 
 The important split is:
 
@@ -419,9 +461,9 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 - memory arena planning for intermediate tensors
 - multi-threaded execution
 - continuous batching
-- multi-sequence KV cache slots
+- production scheduler for multi-sequence paged KV slots
 - production-grade tokenizer compatibility
-- CUDA KV cache and CUDA quantized kernels
+- CUDA PagedAttention, CUDA KV cache, and CUDA quantized kernels
 - Metal / Vulkan backends
 
 These are valid future extensions, but they are not required for the project's current purpose.
@@ -444,6 +486,10 @@ CPU execution keeps the project portable and makes the core runtime easier to de
 
 KV cache length is a graph-run-level state change, not an attention-node-level state change. Advancing in the executor means a multi-layer transformer can run all attention nodes and update the cache exactly once.
 
+### Why Add Paged KV Cache?
+
+Paged KV cache demonstrates the memory-management idea behind PagedAttention without requiring a full serving stack. The important concept is the block table: logical sequence positions no longer require physically contiguous KV memory. That makes the module useful for discussing fragmentation, multi-request serving, and long-context memory pressure.
+
 ## Interview Talking Points
 
 This project is useful to discuss:
@@ -453,6 +499,7 @@ This project is useful to discuss:
 - how kernel dispatch works in a backend runtime
 - why Linear commonly uses `A[M,K] x W[N,K]^T`
 - how KV cache changes decode complexity
+- why PagedAttention uses block tables instead of one large contiguous cache per sequence
 - how GGUF metadata and tensor loading fit into inference
 - how a CPU backend can be mirrored by an optional CUDA backend
 - how to test numerical kernels separately from runtime integration
@@ -463,5 +510,6 @@ Good follow-up improvements:
 - add Release-mode benchmark tables
 - integrate the memory planner with a runtime arena allocator
 - add CUDA smoke tests once GPU resources are available
+- add CUDA PagedAttention decode after the CPU reference path
 - add multi-threaded GEMM
 - align an end-to-end Qwen3-0.6B run against llama.cpp for the first few generated tokens

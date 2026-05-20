@@ -11,6 +11,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **CPU backend** for FP32 kernels including `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `RoPE`, `Attention`, `Softmax`, `SwiGLU`, `Embedding`, `Transpose`, and `Reshape`.
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
+- **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, and CPU decode attention over paged K/V.
 - **Graph memory planner** with liveness analysis, intermediate tensor buffer reuse planning, and peak-memory reporting.
 - **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
@@ -36,7 +37,9 @@ flowchart LR
     Executor --> Kernels["CPU kernels"]
     CudaExecutor -.-> CudaKernels["CUDA kernels"]
     Context --> KV["KVCache"]
+    Context --> PagedKV["PagedKVCache"]
     Kernels --> Tensor["Tensor storage"]
+    PagedKV --> PagedAttn["CPU paged decode attention"]
     CudaKernels -.-> Tensor
     Executor --> Sampler["Sampler"]
 ```
@@ -55,6 +58,7 @@ flowchart LR
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16 |
 | Byte-level BPE tokenizer | Experimental |
 | KV cache prefill/decode | Implemented for single-batch generation |
+| Paged KV cache / PagedAttention reference | Implemented for CPU decode |
 | CPU benchmark harness | Implemented |
 | Quantized kernels | Not yet |
 | CUDA KV cache / quantized CUDA kernels | Not yet |
@@ -112,6 +116,17 @@ Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear
 
 The CUDA path does not yet include CUDA KV cache attention, quantized CUDA matmul, or memory-planner-backed CUDA arena allocation.
 
+## Paged KV Cache
+
+`PagedKVCache` is a compact reference implementation of the core idea behind PagedAttention:
+
+- K/V memory is split into fixed-size token blocks.
+- each sequence owns a block table that maps logical token positions to physical blocks.
+- freed sequences return blocks to a reusable free list.
+- `paged_attention_decode()` reads K/V through the block table and supports GQA.
+
+This is intentionally CPU reference code today. It is meant to make the memory-management design clear before adding a CUDA PagedAttention kernel or a continuous batching scheduler.
+
 ## CPU Benchmark
 
 `benchmark_cpu` measures the GEMM paths used by the CPU backend.
@@ -148,6 +163,7 @@ CTest currently runs:
 ./build/test_runtime
 ./build/test_cpu_kernels
 ./build/test_memory_planner
+./build/test_paged_kv_cache
 ./build/test_gguf_parser
 ```
 
@@ -159,6 +175,7 @@ The test suite covers:
 - CPU kernel numerical reference checks
 - graph liveness and memory reuse planning
 - KV cache prefill/decode advancement
+- paged KV block allocation and paged decode attention
 - GGUF parser and weight conversion helpers
 
 ## Project Layout
@@ -167,7 +184,7 @@ The test suite covers:
 include/minillm/
   core/        Tensor, Shape, DType, Device, Status
   graph/       Graph IR, Node, Value, attributes, shape inference
-  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, sampler
+  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, paged KV cache, sampler
   io/          GGUF parser, weight loader, tokenizer
   model/       Transformer graph builder
 
@@ -195,6 +212,7 @@ Key design choices:
 - `CudaExecutor` mirrors the CPU executor when the project is built with `MINILLM_ENABLE_CUDA=ON`.
 - `RuntimeContext` binds `ValueId` to runtime `Tensor` objects and owns intermediate tensors.
 - `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
+- `PagedKVCache` separates logical sequence positions from physical KV blocks and provides a CPU reference paged decode path.
 - `MemoryPlanner` computes intermediate tensor live ranges and assigns non-overlapping values to reusable buffers without changing runtime allocation yet.
 - CUDA currently covers FP32 operator dispatch and tensor allocation. CUDA KV cache, CUDA graph-memory arena integration, and quantized CUDA matmul are intentionally left as future work.
 
@@ -214,6 +232,7 @@ Near-term work with high portfolio value:
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
 - Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
 - Add a small CPU-vs-CUDA operator smoke suite once GPU resources are free.
+- Add a CUDA PagedAttention decode kernel after the CPU reference path is stable.
 - Implement the first quantized weight path, likely `Q8_0`.
 - Add a short CLI-focused demo script for interviews.
 
@@ -221,5 +240,5 @@ Longer-term experiments:
 
 - More optimized GEMM micro-kernels and weight packing.
 - Multi-threaded CPU execution.
-- Prefix cache and multi-sequence KV cache management.
+- Prefix cache, continuous batching, and multi-sequence scheduling.
 - Minimal streaming HTTP API.
