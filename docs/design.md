@@ -165,6 +165,75 @@ decode_ctx.set_kv_cache_advance_tokens(1);
 
 After a successful graph run, `CpuExecutor` calls `advance_kv_cache_step()` exactly once. This avoids advancing once per attention layer.
 
+## Graph Memory Planner
+
+`MemoryPlanner` analyzes a graph without changing execution behavior. It answers a systems question that matters in inference runtimes: which intermediate tensors can share the same memory because their lifetimes do not overlap?
+
+The planner currently targets CPU contiguous tensors and intentionally excludes:
+
+- inputs
+- constants and weights
+- outputs by default
+- dynamic-shape values
+- non-CPU values
+- KV cache storage
+
+This keeps the first implementation predictable and easy to explain.
+
+### Liveness Model
+
+Each graph value gets a live range:
+
+```text
+first_node = node that produces the value
+last_node  = last node that consumes the value
+```
+
+Inputs and constants are tracked for reporting but are not eligible for reuse. Output values are kept out of the reusable pool by default because callers usually need them after graph execution.
+
+```mermaid
+flowchart LR
+    A["Value a\nlive: 0..1"] --> B["Value b\nlive: 1..2"]
+    B --> C["Value c\nlive: 2..3"]
+    A -. "can reuse buffer" .-> C
+```
+
+In this example `a` and `c` can share a buffer because `a.last_node < c.first_node`.
+
+### Buffer Assignment
+
+The planner uses a conservative greedy policy:
+
+1. sort eligible ranges by first use
+2. find an existing buffer with matching dtype/device
+3. require `buffer.last_use < range.first_node`
+4. require the buffer to be large enough
+5. choose the smallest sufficient buffer
+6. otherwise allocate a new logical buffer
+
+The output is a `MemoryPlan` containing:
+
+- one `MemoryLiveRange` per graph value
+- reusable `MemoryBuffer` assignments
+- naive aligned bytes
+- planned peak bytes
+- reuse saving ratio
+
+Example report:
+
+```text
+Graph memory plan:
+  values: 42
+  eligible intermediates: 28
+  skipped values: 14
+  buffers: 11
+  naive bytes: 50331648 (48.00 MiB)
+  planned peak: 20971520 (20.00 MiB)
+  reuse saving: 58.3%
+```
+
+This is not yet an arena allocator. It is the analysis layer that an arena allocator can consume later.
+
 ## CPU Backend
 
 The CPU backend has two parts:
@@ -281,6 +350,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_cpu_kernels` | direct numerical checks for low-level CPU kernels |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
 | `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion |
+| `test_memory_planner` | graph liveness, buffer reuse planning, skip reasons, report output |
 
 The important split is:
 

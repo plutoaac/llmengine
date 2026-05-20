@@ -29,6 +29,7 @@
 #include "minillm/runtime/runtime_context.h"
 #include "minillm/runtime/cpu_kernels.h"
 #include "minillm/runtime/cpu_kernel_adapter.h"
+#include "minillm/runtime/memory_planner.h"
 #include "minillm/runtime/kv_cache.h"
 #include "minillm/runtime/sampler.h"
 

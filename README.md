@@ -10,6 +10,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **Graph IR + executor** with `Value`, `Node`, `GraphBuilder`, topological sort, backend capability checks, and runtime tensor binding.
 - **CPU backend** for FP32 kernels including `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `RoPE`, `Attention`, `Softmax`, `SwiGLU`, `Embedding`, `Transpose`, and `Reshape`.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
+- **Graph memory planner** with liveness analysis, intermediate tensor buffer reuse planning, and peak-memory reporting.
 - **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
 
@@ -41,6 +42,7 @@ flowchart LR
 | Graph IR / GraphBuilder / shape inference | Implemented |
 | CPU executor and kernel registry | Implemented |
 | FP32 CPU kernels | Implemented for core transformer ops |
+| Graph memory planner | Implemented for CPU intermediates |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16 |
 | Byte-level BPE tokenizer | Experimental |
 | KV cache prefill/decode | Implemented for single-batch generation |
@@ -113,6 +115,7 @@ CTest currently runs:
 ./build/test_graph_builder
 ./build/test_runtime
 ./build/test_cpu_kernels
+./build/test_memory_planner
 ./build/test_gguf_parser
 ```
 
@@ -122,6 +125,7 @@ The test suite covers:
 - graph construction and validation
 - CPU executor integration
 - CPU kernel numerical reference checks
+- graph liveness and memory reuse planning
 - KV cache prefill/decode advancement
 - GGUF parser and weight conversion helpers
 
@@ -158,6 +162,7 @@ Key design choices:
 - `CpuExecutor` validates backend support, resolves kernels through `KernelRegistry`, and runs nodes in topological order.
 - `RuntimeContext` binds `ValueId` to runtime `Tensor` objects and owns intermediate tensors.
 - `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
+- `MemoryPlanner` computes intermediate tensor live ranges and assigns non-overlapping values to reusable buffers without changing runtime allocation yet.
 
 ## References
 
@@ -173,7 +178,7 @@ Near-term work with high portfolio value:
 
 - Run and document an end-to-end Qwen3-0.6B GGUF demo.
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
-- Add a simple memory planner for intermediate tensor reuse.
+- Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
 - Implement the first quantized weight path, likely `Q8_0`.
 - Add a short CLI-focused demo script for interviews.
 

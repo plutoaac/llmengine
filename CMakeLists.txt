@@ -51,6 +51,7 @@ add_library(minillm_runtime
     src/runtime/runtime_context.cpp
     src/runtime/cpu_kernels.cpp
     src/runtime/cpu_kernel_adapter.cpp
+    src/runtime/memory_planner.cpp
     src/runtime/sampler.cpp
     src/runtime/kv_cache.cpp
 )
@@ -109,6 +110,7 @@ add_minillm_test(test_graph)
 add_minillm_test(test_graph_builder)
 add_minillm_test(test_runtime)
 add_minillm_test(test_cpu_kernels)
+add_minillm_test(test_memory_planner)
 
 add_minillm_test(test_gguf_parser)
 target_link_libraries(test_gguf_parser PRIVATE minillm_io)
