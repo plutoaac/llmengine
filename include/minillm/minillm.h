@@ -29,6 +29,8 @@
 #include "minillm/runtime/runtime_context.h"
 #include "minillm/runtime/cpu_kernels.h"
 #include "minillm/runtime/cpu_kernel_adapter.h"
+#include "minillm/runtime/kv_cache.h"
+#include "minillm/runtime/sampler.h"
 
 // Model
 #include "minillm/model/transformer_graph_builder.h"
@@ -36,3 +38,5 @@
 // IO
 #include "minillm/io/gguf_format.h"
 #include "minillm/io/gguf_parser.h"
+#include "minillm/io/gguf_weight_loader.h"
+#include "minillm/io/bpe_tokenizer.h"

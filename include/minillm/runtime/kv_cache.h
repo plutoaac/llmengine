@@ -17,10 +17,12 @@ public:
 
     float* k_data(int layer);
     float* v_data(int layer);
+    int num_layers() const { return static_cast<int>(layers_.size()); }
     int kv_hidden() const { return num_kv_heads_ * head_dim_; }
     int cached_len() const { return cached_len_; }
-    void set_cached_len(int len) { cached_len_ = len; }
-    void advance(int n = 1) { cached_len_ += n; }
+    void set_cached_len(int len);
+    void advance(int n = 1) { set_cached_len(cached_len_ + n); }
+    bool can_append(int n) const;
     void reset();
     int max_seq_len() const { return max_seq_len_; }
     bool initialized() const { return max_seq_len_ > 0; }

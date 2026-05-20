@@ -47,4 +47,19 @@ Status RuntimeContext::allocate_intermediates(const Graph& graph) {
     return Status::make_ok();
 }
 
+Status RuntimeContext::advance_kv_cache_step() {
+    if (kv_cache_advance_tokens_ <= 0) {
+        return Status::make_ok();
+    }
+    if (!kv_cache_ || !kv_cache_->initialized()) {
+        return Status::runtime_error("cannot advance an uninitialized KV cache");
+    }
+    if (!kv_cache_->can_append(kv_cache_advance_tokens_)) {
+        return Status::out_of_range("KV cache does not have enough space to advance");
+    }
+
+    kv_cache_->advance(kv_cache_advance_tokens_);
+    return Status::make_ok();
+}
+
 } // namespace minillm

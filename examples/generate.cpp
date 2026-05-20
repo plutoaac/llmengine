@@ -156,6 +156,8 @@ int main(int argc, char* argv[]) {
 
     prefill_ctx.set_kv_cache(kv_cache);
     decode_ctx.set_kv_cache(kv_cache);
+    prefill_ctx.set_kv_cache_advance_tokens(prompt_len);
+    decode_ctx.set_kv_cache_advance_tokens(1);
 
     // 7. Compile executors
     KernelRegistry registry;
@@ -204,9 +206,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Prefill failed: " << st.to_string() << "\n";
         return 1;
     }
-
-    // Advance cache after prefill
-    kv_cache->set_cached_len(prompt_len);
 
     // Get logits at last position → sample first token
     auto* logits_tensor = prefill_ctx.get(*prefill_result);
@@ -266,9 +265,6 @@ int main(int argc, char* argv[]) {
                       << st.to_string() << "\n";
             break;
         }
-
-        // Advance cache after decode
-        kv_cache->advance(1);
 
         // Get logits
         auto* dec_logits = decode_ctx.get(*decode_result);

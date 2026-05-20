@@ -66,9 +66,24 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     st = check_allocated(*ot, "output"); if (!st.ok()) return st;
     st = check_dtype_float(*wt, "weight"); if (!st.ok()) return st;
     st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+    if ((*ids_t)->dtype() != DType::Int32) {
+        return Status::unsupported(
+            "input_ids only supports Int32, got " +
+            std::string(dtype_name((*ids_t)->dtype())));
+    }
 
-    int seq_len = static_cast<int>((*ids_t)->shape().dim(1));
+    auto ids_numel = (*ids_t)->numel();
+    if (!ids_numel) return ids_numel.error();
+    int seq_len = static_cast<int>(*ids_numel);
     int hidden = static_cast<int>((*wt)->shape().dim(1));
+    int vocab_size = static_cast<int>((*wt)->shape().dim(0));
+    const int* ids = int_data(*ids_t);
+    for (int i = 0; i < seq_len; ++i) {
+        if (ids[i] < 0 || ids[i] >= vocab_size) {
+            return Status::out_of_range(
+                "input_ids contains token id out of embedding vocabulary range");
+        }
+    }
     cpu::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
                    seq_len, hidden);
     return Status::make_ok();
@@ -100,6 +115,21 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     int N = static_cast<int>((*wt)->shape().dim(0));
 
     cpu::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot), M, N, K);
+    if (node.inputs().size() >= 3) {
+        auto bt = get_tensor(node.inputs()[2], ctx, "bias");
+        if (!bt) return bt.error();
+        st = check_allocated(*bt, "bias"); if (!st.ok()) return st;
+        st = check_dtype_float(*bt, "bias"); if (!st.ok()) return st;
+        if ((*bt)->shape().rank() != 1 || (*bt)->shape().dim(0) != N) {
+            return Status::shape_mismatch("Linear bias shape must match output features");
+        }
+
+        const float* bias = float_data(*bt);
+        float* out = float_data_mut(*ot);
+        for (int m = 0; m < M; ++m) {
+            cpu::add(out + m * N, bias, out + m * N, N);
+        }
+    }
     return Status::make_ok();
 }
 
@@ -221,6 +251,119 @@ static Status kernel_swiglu(const Node& node, RuntimeContext& ctx) {
     return Status::make_ok();
 }
 
+static Status kernel_softmax(const Node& node, RuntimeContext& ctx) {
+    auto xt = get_tensor(node.inputs()[0], ctx, "x");
+    if (!xt) return xt.error();
+    auto ot = get_tensor(node.outputs()[0], ctx, "output");
+    if (!ot) return ot.error();
+
+    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
+    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    st = check_dtype_float(*xt, "x"); if (!st.ok()) return st;
+    st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+
+    int64_t axis = -1;
+    if (auto attr = node.get_attr("axis")) {
+        if (auto* p = std::get_if<int64_t>(&*attr)) axis = *p;
+    }
+
+    const auto& shape = (*xt)->shape();
+    const int64_t rank = static_cast<int64_t>(shape.rank());
+    if (rank <= 0) {
+        return Status::shape_mismatch("Softmax expects rank >= 1");
+    }
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= rank) {
+        return Status::out_of_range("Softmax axis out of range");
+    }
+    if (axis != rank - 1) {
+        return Status::unsupported("CPU Softmax currently supports the last axis only");
+    }
+
+    int cols = static_cast<int>(shape.dim(static_cast<size_t>(axis)));
+    int rows = 1;
+    for (int64_t i = 0; i < axis; ++i) {
+        rows *= static_cast<int>(shape.dim(static_cast<size_t>(i)));
+    }
+    cpu::softmax(float_data(*xt), float_data_mut(*ot), rows, cols);
+    return Status::make_ok();
+}
+
+static Status kernel_reshape(const Node& node, RuntimeContext& ctx) {
+    auto xt = get_tensor(node.inputs()[0], ctx, "x");
+    if (!xt) return xt.error();
+    auto ot = get_tensor(node.outputs()[0], ctx, "output");
+    if (!ot) return ot.error();
+
+    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
+    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    if ((*xt)->dtype() != (*ot)->dtype()) {
+        return Status::unsupported("Reshape requires matching input/output dtypes");
+    }
+
+    auto in_numel = (*xt)->numel();
+    if (!in_numel) return in_numel.error();
+    auto out_numel = (*ot)->numel();
+    if (!out_numel) return out_numel.error();
+    if (*in_numel != *out_numel) {
+        return Status::shape_mismatch("Reshape input/output element counts differ");
+    }
+
+    auto bytes = (*xt)->nbytes();
+    if (!bytes) return bytes.error();
+    auto out_bytes = (*ot)->nbytes();
+    if (!out_bytes) return out_bytes.error();
+    if (*bytes != *out_bytes) {
+        return Status::shape_mismatch("Reshape input/output byte sizes differ");
+    }
+    std::memcpy((*ot)->data(), (*xt)->data(), *bytes);
+    return Status::make_ok();
+}
+
+static Status kernel_transpose(const Node& node, RuntimeContext& ctx) {
+    auto xt = get_tensor(node.inputs()[0], ctx, "x");
+    if (!xt) return xt.error();
+    auto ot = get_tensor(node.outputs()[0], ctx, "output");
+    if (!ot) return ot.error();
+
+    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
+    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    st = check_dtype_float(*xt, "x"); if (!st.ok()) return st;
+    st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+
+    int64_t axis0 = -2;
+    int64_t axis1 = -1;
+    if (auto attr = node.get_attr("axis0")) {
+        if (auto* p = std::get_if<int64_t>(&*attr)) axis0 = *p;
+    }
+    if (auto attr = node.get_attr("axis1")) {
+        if (auto* p = std::get_if<int64_t>(&*attr)) axis1 = *p;
+    }
+
+    const auto& shape = (*xt)->shape();
+    const int64_t rank = static_cast<int64_t>(shape.rank());
+    if (rank <= 0) {
+        return Status::shape_mismatch("Transpose expects rank >= 1");
+    }
+    if (axis0 < 0) axis0 += rank;
+    if (axis1 < 0) axis1 += rank;
+    if (axis0 < 0 || axis0 >= rank || axis1 < 0 || axis1 >= rank) {
+        return Status::out_of_range("Transpose axes out of range");
+    }
+
+    auto in_numel = (*xt)->numel();
+    if (!in_numel) return in_numel.error();
+    auto out_numel = (*ot)->numel();
+    if (!out_numel) return out_numel.error();
+    if (*in_numel != *out_numel) {
+        return Status::shape_mismatch("Transpose input/output element counts differ");
+    }
+
+    cpu::transpose(float_data(*xt), float_data_mut(*ot), shape.dims().data(),
+                   static_cast<int>(rank), static_cast<int>(axis0), static_cast<int>(axis1));
+    return Status::make_ok();
+}
+
 static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
     auto xt = get_tensor(node.inputs()[0], ctx, "x");
     if (!xt) return xt.error();
@@ -301,6 +444,14 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     int nh = static_cast<int>(num_heads);
     int nkv = static_cast<int>(num_kv_heads);
     int hd = static_cast<int>(head_dim);
+    if (nh <= 0 || nkv <= 0 || hd <= 0) {
+        return Status::invalid_argument(
+            "attention requires positive num_heads, num_kv_heads, and head_dim");
+    }
+    if (nh % nkv != 0) {
+        return Status::invalid_argument(
+            "attention num_heads must be divisible by num_kv_heads");
+    }
     int group_size = nh / nkv;
 
     // Q: [batch, seq, num_heads * head_dim]
@@ -310,6 +461,14 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     int seq_len = static_cast<int>((*qt)->shape().dim(1));
     int q_hidden = static_cast<int>((*qt)->shape().dim(2));
     int kv_hidden_size = static_cast<int>((*kt)->shape().dim(2));
+    if (q_hidden != nh * hd) {
+        return Status::shape_mismatch(
+            "attention q hidden size does not match num_heads * head_dim");
+    }
+    if (kv_hidden_size != nkv * hd) {
+        return Status::shape_mismatch(
+            "attention k/v hidden size does not match num_kv_heads * head_dim");
+    }
 
     const float* q_data = float_data(*qt);
     const float* k_data = float_data(*kt);
@@ -361,13 +520,29 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
 
     // =================== CACHE PATH ===================
     int li = static_cast<int>(layer_idx);
+    if (batch != 1) {
+        return Status::unsupported("KV cache attention currently supports batch size 1");
+    }
+    if (seq_len <= 0) {
+        return Status::invalid_argument("KV cache attention requires seq_len > 0");
+    }
+    if (li < 0 || li >= cache->num_layers()) {
+        return Status::out_of_range("KV cache layer index out of range");
+    }
     float* cache_k = cache->k_data(li);
     float* cache_v = cache->v_data(li);
     int cached_len = cache->cached_len();
+    if (cached_len < 0 || cached_len > cache->max_seq_len()) {
+        return Status::out_of_range("KV cache cached_len is out of range");
+    }
     int kv_h = nkv * hd;  // kv_hidden per position
 
     // ---- PREFILL: cached_len == 0 ----
     if (cached_len == 0) {
+        if (!cache->can_append(seq_len)) {
+            return Status::out_of_range("KV cache does not have enough space for prefill");
+        }
+
         // Copy K/V rows into cache: [seq, nkv*hd] -> cache[0..seq_len-1]
         for (int b = 0; b < batch; ++b) {
             for (int s = 0; s < seq_len; ++s) {
@@ -429,6 +604,13 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     // ---- DECODE: cached_len > 0, seq_len should be 1 ----
     // Copy new K/V row into cache at position cached_len
     {
+        if (seq_len != 1) {
+            return Status::invalid_argument("KV cache decode requires seq_len == 1");
+        }
+        if (!cache->can_append(1)) {
+            return Status::out_of_range("KV cache does not have enough space for decode");
+        }
+
         for (int b = 0; b < batch; ++b) {
             const float* k_row = k_data + b * seq_len * kv_hidden_size;
             const float* v_row = v_data + b * seq_len * kv_hidden_size;
@@ -513,6 +695,9 @@ void register_cpu_kernels(KernelRegistry& registry) {
     registry.register_kernel(DeviceType::CPU, OpType::Mul, kernel_mul);
     registry.register_kernel(DeviceType::CPU, OpType::SiLU, kernel_silu);
     registry.register_kernel(DeviceType::CPU, OpType::SwiGLU, kernel_swiglu);
+    registry.register_kernel(DeviceType::CPU, OpType::Softmax, kernel_softmax);
+    registry.register_kernel(DeviceType::CPU, OpType::Reshape, kernel_reshape);
+    registry.register_kernel(DeviceType::CPU, OpType::Transpose, kernel_transpose);
     registry.register_kernel(DeviceType::CPU, OpType::RoPE, kernel_rope);
     registry.register_kernel(DeviceType::CPU, OpType::Attention, kernel_attention);
     registry.register_kernel(DeviceType::CPU, OpType::QKNorm, kernel_qk_norm);

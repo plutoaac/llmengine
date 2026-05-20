@@ -125,6 +125,10 @@ Status CpuExecutor::run(RuntimeContext& ctx) {
                 " (" + std::string((*nd)->name()) + "): " + st.to_string());
         }
     }
+    auto st = ctx.advance_kv_cache_step();
+    if (!st.ok()) {
+        return Status::runtime_error("KV cache advance failed: " + st.to_string());
+    }
     return Status::make_ok();
 }
 

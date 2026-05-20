@@ -11,6 +11,9 @@ Sampler::Sampler(uint32_t seed) : rng_(seed) {}
 int32_t Sampler::sample(const float* logits, int32_t vocab_size,
                          const SamplingConfig& cfg,
                          const std::vector<int32_t>& input_ids) {
+    if (!logits || vocab_size <= 0) {
+        return -1;
+    }
 
     // Make a mutable copy for modifications
     std::vector<float> probs(logits, logits + vocab_size);
@@ -122,6 +125,9 @@ int32_t Sampler::sample(const float* logits, int32_t vocab_size,
 std::vector<std::pair<int32_t, float>> Sampler::get_top_tokens(
     const float* logits, int32_t vocab_size,
     const SamplingConfig& cfg, int32_t top_n) {
+    if (!logits || vocab_size <= 0 || top_n <= 0) {
+        return {};
+    }
 
     // Apply temperature
     std::vector<float> scaled(logits, logits + vocab_size);

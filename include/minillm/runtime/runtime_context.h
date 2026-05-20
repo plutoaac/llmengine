@@ -32,6 +32,9 @@ public:
     KVCache* kv_cache() const { return kv_cache_.get(); }
     void set_kv_cache(std::shared_ptr<KVCache> cache) { kv_cache_ = std::move(cache); }
     std::shared_ptr<KVCache> shared_kv_cache() { return kv_cache_; }
+    void set_kv_cache_advance_tokens(int tokens) { kv_cache_advance_tokens_ = tokens; }
+    int kv_cache_advance_tokens() const { return kv_cache_advance_tokens_; }
+    Status advance_kv_cache_step();
 
 private:
     // ValueId.value -> Tensor*
@@ -40,6 +43,7 @@ private:
     std::vector<std::unique_ptr<Tensor>> owned_;
     // KV cache (shared between prefill and decode contexts)
     std::shared_ptr<KVCache> kv_cache_;
+    int kv_cache_advance_tokens_ = 0;
 };
 
 } // namespace minillm

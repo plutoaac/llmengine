@@ -5,10 +5,19 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Enable SIMD instructions (AVX2/FMA on supported hosts)
-add_compile_options(-march=native)
-
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(MINILLM_ENABLE_NATIVE_ARCH "Enable host-native CPU code generation when supported" ON)
+
+if(MINILLM_ENABLE_NATIVE_ARCH AND NOT MSVC)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=native" MINILLM_HAS_MARCH_NATIVE)
+    if(MINILLM_HAS_MARCH_NATIVE)
+        add_compile_options(-march=native)
+    endif()
+endif()
+
+include(CTest)
 
 # Core library
 add_library(minillm_core
@@ -81,16 +90,25 @@ target_link_libraries(forward_tiny_llama_gguf PRIVATE minillm_io)
 add_executable(generate examples/generate.cpp)
 target_link_libraries(generate PRIVATE minillm_io)
 
+# Example: CPU kernel benchmark
+add_executable(benchmark_cpu examples/benchmark_cpu.cpp)
+target_link_libraries(benchmark_cpu PRIVATE minillm_runtime)
+
 # Tests
 function(add_minillm_test test_name)
     add_executable(${test_name} tests/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE minillm_model)
+    if(BUILD_TESTING)
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endif()
 endfunction()
 
 add_minillm_test(test_shape)
 add_minillm_test(test_tensor)
 add_minillm_test(test_graph)
 add_minillm_test(test_graph_builder)
+add_minillm_test(test_runtime)
+add_minillm_test(test_cpu_kernels)
 
 add_minillm_test(test_gguf_parser)
 target_link_libraries(test_gguf_parser PRIVATE minillm_io)

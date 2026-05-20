@@ -24,7 +24,7 @@
 #endif
 
 #ifndef MINILLM_SIMD_WIDTH
-#define MINILLM_SIMD_WIDTH 4
+#define MINILLM_SIMD_WIDTH 1
 #endif
 
 // SIMD vector type and portable operations
@@ -53,7 +53,11 @@ using vfloat = __m256;
 #define VF_MIN(a,b)   _mm256_min_ps(a,b)
 #define VF_SET1(s)    _mm256_set1_ps(s)
 #define VF_SETZERO()  _mm256_setzero_ps()
-#define VF_FMADD(a,b,c) _mm256_fmadd_ps(a,b,c)
+#if defined(__FMA__)
+    #define VF_FMADD(a,b,c) _mm256_fmadd_ps(a,b,c)
+#else
+    #define VF_FMADD(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
+#endif
 #elif defined(MINILLM_SIMD_SSE2)
 using vfloat = __m128;
 #define VF_LOAD(p)    _mm_loadu_ps(p)
@@ -67,6 +71,19 @@ using vfloat = __m128;
 #define VF_SET1(s)    _mm_set1_ps(s)
 #define VF_SETZERO()  _mm_setzero_ps()
 #define VF_FMADD(a,b,c) _mm_add_ps(_mm_mul_ps(a,b),c)
+#else
+using vfloat = float;
+#define VF_LOAD(p)    (*(p))
+#define VF_STORE(p,v) (*(p) = (v))
+#define VF_ADD(a,b)   ((a) + (b))
+#define VF_SUB(a,b)   ((a) - (b))
+#define VF_MUL(a,b)   ((a) * (b))
+#define VF_DIV(a,b)   ((a) / (b))
+#define VF_MAX(a,b)   ((a) > (b) ? (a) : (b))
+#define VF_MIN(a,b)   ((a) < (b) ? (a) : (b))
+#define VF_SET1(s)    (s)
+#define VF_SETZERO()  (0.0f)
+#define VF_FMADD(a,b,c) ((a) * (b) + (c))
 #endif
 
 namespace minillm::simd {

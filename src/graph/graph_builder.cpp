@@ -73,6 +73,15 @@ std::expected<ValueId, Status> GraphBuilder::linear(
     if (!wv) return std::unexpected(wv.error());
     auto out_shape = infer_linear_shape((*xv)->shape, (*wv)->shape);
     if (!out_shape) return std::unexpected(out_shape.error());
+    if (bias) {
+        auto bv = get_value(*bias);
+        if (!bv) return std::unexpected(bv.error());
+        if ((*bv)->shape.rank() != 1 || (*bv)->shape.dim(0) != (*wv)->shape.dim(0)) {
+            return std::unexpected(Status::shape_mismatch(
+                "Linear bias must have shape [" + std::to_string((*wv)->shape.dim(0)) +
+                "], got " + (*bv)->shape.to_string()));
+        }
+    }
     auto out = make_intermediate(name + ".out", std::move(*out_shape),
                                  (*wv)->dtype, (*wv)->device);
     if (!out) return std::unexpected(out.error());
@@ -242,6 +251,64 @@ std::expected<ValueId, Status> GraphBuilder::qk_norm(
         (*nd)->set_attr("eps", eps);
         (*nd)->set_attr("num_heads", num_heads);
         (*nd)->set_attr("head_dim", head_dim);
+    }
+    return out;
+}
+
+std::expected<ValueId, Status> GraphBuilder::softmax(
+    ValueId x, int64_t axis, std::string name) {
+    auto xv = get_value(x);
+    if (!xv) return std::unexpected(xv.error());
+    auto out_shape = infer_same_shape_unary((*xv)->shape);
+    if (!out_shape) return std::unexpected(out_shape.error());
+    auto out = make_intermediate(name + ".out", std::move(*out_shape),
+                                 (*xv)->dtype, (*xv)->device);
+    if (!out) return std::unexpected(out.error());
+    auto nid = graph_.add_node(OpType::Softmax, std::move(name),
+                               std::vector<ValueId>{x},
+                               std::vector<ValueId>{*out});
+    if (!nid) return std::unexpected(nid.error());
+    if (auto nd = graph_.mutable_node(*nid); nd) {
+        (*nd)->set_attr("axis", axis);
+    }
+    return out;
+}
+
+std::expected<ValueId, Status> GraphBuilder::reshape(
+    ValueId x, Shape target_shape, std::string name) {
+    auto xv = get_value(x);
+    if (!xv) return std::unexpected(xv.error());
+    auto out_shape = infer_reshape_shape((*xv)->shape, target_shape);
+    if (!out_shape) return std::unexpected(out_shape.error());
+    auto out = make_intermediate(name + ".out", *out_shape,
+                                 (*xv)->dtype, (*xv)->device);
+    if (!out) return std::unexpected(out.error());
+    auto nid = graph_.add_node(OpType::Reshape, std::move(name),
+                               std::vector<ValueId>{x},
+                               std::vector<ValueId>{*out});
+    if (!nid) return std::unexpected(nid.error());
+    if (auto nd = graph_.mutable_node(*nid); nd) {
+        (*nd)->set_attr("shape", *out_shape);
+    }
+    return out;
+}
+
+std::expected<ValueId, Status> GraphBuilder::transpose(
+    ValueId x, int64_t axis0, int64_t axis1, std::string name) {
+    auto xv = get_value(x);
+    if (!xv) return std::unexpected(xv.error());
+    auto out_shape = infer_transpose_shape((*xv)->shape, axis0, axis1);
+    if (!out_shape) return std::unexpected(out_shape.error());
+    auto out = make_intermediate(name + ".out", std::move(*out_shape),
+                                 (*xv)->dtype, (*xv)->device);
+    if (!out) return std::unexpected(out.error());
+    auto nid = graph_.add_node(OpType::Transpose, std::move(name),
+                               std::vector<ValueId>{x},
+                               std::vector<ValueId>{*out});
+    if (!nid) return std::unexpected(nid.error());
+    if (auto nd = graph_.mutable_node(*nid); nd) {
+        (*nd)->set_attr("axis0", axis0);
+        (*nd)->set_attr("axis1", axis1);
     }
     return out;
 }

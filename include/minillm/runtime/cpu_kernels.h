@@ -5,6 +5,7 @@
 // by mini_op SIMD kernels in a future phase.
 
 #include <cstddef>
+#include <cstdint>
 
 namespace minillm::cpu {
 
@@ -37,6 +38,9 @@ void sdpa_decode(const float* Q, const float* K, const float* V, float* output,
 
 // Softmax: y[rows, cols]
 void softmax(const float* x, float* y, int rows, int cols);
+
+// Generic contiguous transpose over two axes.
+void transpose(const float* x, float* y, const int64_t* dims, int rank, int axis0, int axis1);
 
 // Elementwise binary: y[i] = a[i] op b[i], n elements
 void add(const float* a, const float* b, float* y, int n);

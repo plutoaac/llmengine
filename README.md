@@ -1,107 +1,185 @@
 # MiniLLMEngine
 
-A C++23 lightweight LLM inference engine for learning and experimentation. The current phase focuses on **Tensor abstractions** and **computation graph IR**, laying the groundwork for future GGUF loading, CPU SIMD backends, KV Cache, and RPC serving.
+MiniLLMEngine is a C++23 CPU-first LLM inference engine built as a compact AI infrastructure project. It implements the core pieces of a modern local inference runtime: tensor metadata, graph IR, shape inference, CPU kernel dispatch, GGUF parsing, weight loading, sampling, and KV cache based generation.
 
-## References
+The goal is not to clone llama.cpp. The goal is to show the engineering ideas behind an inference engine in a smaller codebase that is easy to read, test, explain, and extend.
 
-- **[Genllm](https://github.com/Aimol-l/Genllm)** — C++23 modular LLM inference framework: GGUF parsing, DAG computation graph IR, CPU/CUDA backends, memory pool, RoPE cache, paged attention, model factory.
-- **[llama.cpp / ggml](https://github.com/ggerganov/llama.cpp)** — Tensor + op graph + context memory low-level abstraction.
-- **[mini_op](https://github.com/plutoaac/mini_op)** — Future CPU SIMD kernel source (matmul, rmsnorm, rope, attention, elementwise, fused ops).
+## Highlights
 
-Note: This project is an independent learning implementation, not a fork of any of the above.
+- **C++23 inference runtime** with strongly typed graph IDs, `std::expected` error handling, and a small public umbrella header.
+- **Graph IR + executor** with `Value`, `Node`, `GraphBuilder`, topological sort, backend capability checks, and runtime tensor binding.
+- **CPU backend** for FP32 kernels including `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `RoPE`, `Attention`, `Softmax`, `SwiGLU`, `Embedding`, `Transpose`, and `Reshape`.
+- **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
+- **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, and common Llama/Qwen weight-name mapping.
+- **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
 
-## Current Capabilities
+## Architecture
 
-- **Tensor / Shape / DType / Device** — Core tensor abstraction with dynamic dims, FP32/FP16/BF16/Int32/Int64/UInt8/Int8/Bool dtypes, CPU/CUDA/Metal device stubs.
-- **Graph / Value / Node / Attribute** — DAG computation graph IR with strongly-typed IDs (ValueId, NodeId) and per-node attributes.
-- **GraphBuilder** — Fluent API for constructing computation graphs with automatic shape inference.
-- **Shape Inference** — MatMul, Linear, Add, Embedding, RMSNorm, RoPE, SiLU, SwiGLU, Attention shape propagation with dynamic dim support.
-- **Transformer Graph Builder** — Builds a tiny decoder-only transformer block graph (Llama-style).
-- **MockExecutor** — Validates, topologically sorts, and walks the graph without numerical computation.
-- **CPU Backend Stub** — Declares supported ops; does not perform real computation yet.
-- **KernelRegistry** — Pluggable kernel dispatch; currently supports mock kernels, designed for mini_op integration.
+```mermaid
+flowchart LR
+    GGUF["GGUF file"] --> Parser["GGUFParser"]
+    Parser --> Loader["WeightLoader"]
+    Loader --> Context["RuntimeContext"]
 
-## Not In Current Scope
+    Builder["GraphBuilder"] --> Graph["Graph IR"]
+    Graph --> Executor["CpuExecutor"]
+    Registry["KernelRegistry"] --> Executor
+    Backend["CpuBackend"] --> Executor
+    Context --> Executor
 
-- GGUF file parsing
-- Tokenizer
-- Real numerical kernels (SIMD or otherwise)
-- CUDA / Metal execution
-- Quantization (Q4/Q8/GGML quantized dtypes)
-- KV Cache
-- Batch scheduling
-- Paged attention
+    Executor --> Kernels["CPU kernels"]
+    Context --> KV["KVCache"]
+    Kernels --> Tensor["Tensor storage"]
+    Executor --> Sampler["Sampler"]
+```
 
-## Build
+## What Is Implemented
 
-Requires a C++23 compiler (GCC 13+, Clang 17+, MSVC 19.35+).
+| Area | Status |
+|------|--------|
+| Tensor / Shape / DType / Device | Implemented |
+| Graph IR / GraphBuilder / shape inference | Implemented |
+| CPU executor and kernel registry | Implemented |
+| FP32 CPU kernels | Implemented for core transformer ops |
+| GGUF metadata and tensor loading | Implemented for F32/F16/BF16 |
+| Byte-level BPE tokenizer | Experimental |
+| KV cache prefill/decode | Implemented for single-batch generation |
+| CPU benchmark harness | Implemented |
+| Quantized kernels | Not yet |
+| CUDA / Metal / Vulkan | Out of scope |
+| Continuous batching / server runtime | Out of scope |
+
+## Quick Start
+
+Requirements:
+
+- CMake 3.22+
+- C++23 compiler, such as GCC 13+, Clang 17+, or MSVC 19.35+
+
+Build:
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ```
 
-## Run Example
+Run all tests:
 
 ```bash
-./build/examples/build_tiny_llama_graph
+ctest --test-dir build --output-on-failure
 ```
 
-This builds a tiny Llama-style decoder block graph, validates it, dumps the full IR, then runs a mock execution pass.
-
-## Run Tests
+Run examples:
 
 ```bash
-./build/tests/test_shape
-./build/tests/test_tensor
-./build/tests/test_graph
-./build/tests/test_graph_builder
+./build/build_tiny_llama_graph
+./build/forward_tiny_llama
+./build/forward_tiny_llama_gguf /path/to/model.gguf
+./build/generate /path/to/model.gguf "Hello"
 ```
 
-## Graph IR Design
+## CPU Benchmark
 
-| Concept | Role |
-|---------|------|
-| **Value** | Logical tensor descriptor (shape, dtype, device, kind). Does not hold data. |
-| **Node** | Computation operator with inputs/outputs (ValueIds) and attributes. |
-| **Graph** | DAG of Values and Nodes. Supports validation and topological sort. |
-| **GraphBuilder** | Constructs Values + Nodes with automatic shape inference. |
-| **Executor** | Compiles (validate + topo sort + backend check) and runs the graph. |
-| **Backend** | Declares which OpTypes a device supports. |
-| **KernelRegistry** | Maps (DeviceType, OpType) to kernel functions; future dispatch to mini_op. |
+`benchmark_cpu` measures the GEMM paths used by the CPU backend.
 
-Key design decisions:
-- **Value** is a logical tensor; **Tensor** is a physical data container. The Executor binds a Tensor to a ValueId at runtime.
-- **ValueId / NodeId** are strongly typed — no raw `int` mixing.
-- Dynamic dims (`-1`) propagate through shape inference; `numel()` and `allocate_cpu()` reject dynamic shapes.
-- Attributes on Nodes carry op-specific metadata (RMSNorm eps, RoPE num_heads/head_dim, Attention causal flag).
+```bash
+./build/benchmark_cpu [M] [N] [K] [iters]
+```
 
-## OpType to mini_op Mapping (Future)
+The `sgemm_nt` case matches the common transformer Linear layout:
 
-When the CPU kernel adapter is implemented, the following mapping will connect Graph ops to mini_op SIMD kernels:
+```text
+A[M,K] x W[N,K]^T -> C[M,N]
+```
 
-| OpType | mini_op Kernel |
-|--------|---------------|
-| `Linear` / `MatMul` | `cpu_gemm` |
-| `RMSNorm` | `cpu_llm_ops::rms_norm` |
-| `RoPE` | `cpu_rope` |
-| `Attention` | `cpu_attention` |
-| `Softmax` | `cpu_llm_ops::softmax` / `cpu_attention::softmax` |
-| `Embedding` | `cpu_llm_ops::embedding` |
-| `Add` / `Mul` / `SiLU` | `cpu_elementwise` |
-| `SwiGLU` | `cpu_fused_ops::fused_silu_mul` |
-| `Transpose` | `cpu_transpose` |
+Example smoke run from a Debug build:
+
+```text
+./build/benchmark_cpu 1 512 512 5
+sgemm_nt     shape=[1,512,512] iters=5 avg_ms=0.0750 gflops=6.99
+sgemm        shape=[1,512,512] iters=5 avg_ms=0.1473 gflops=3.56
+```
+
+Use `-DCMAKE_BUILD_TYPE=Release` for meaningful performance numbers.
+
+## Tests
+
+CTest currently runs:
+
+```bash
+./build/test_shape
+./build/test_tensor
+./build/test_graph
+./build/test_graph_builder
+./build/test_runtime
+./build/test_cpu_kernels
+./build/test_gguf_parser
+```
+
+The test suite covers:
+
+- shape and tensor allocation behavior
+- graph construction and validation
+- CPU executor integration
+- CPU kernel numerical reference checks
+- KV cache prefill/decode advancement
+- GGUF parser and weight conversion helpers
+
+## Project Layout
+
+```text
+include/minillm/
+  core/        Tensor, Shape, DType, Device, Status
+  graph/       Graph IR, Node, Value, attributes, shape inference
+  runtime/     Backend, executor, CPU kernels, KV cache, sampler
+  io/          GGUF parser, weight loader, tokenizer
+  model/       Transformer graph builder
+
+src/
+  core/        Core runtime data structures
+  graph/       Graph implementation and builder logic
+  runtime/     CPU backend and execution path
+  io/          GGUF and tokenizer implementation
+  model/       Decoder-only graph construction
+
+examples/      CLI demos and benchmark
+tests/         Unit and integration tests
+docs/          Design notes
+```
+
+## Design Notes
+
+For a deeper explanation of the architecture, see [docs/design.md](docs/design.md).
+
+Key design choices:
+
+- `Value` is a logical tensor descriptor. `Tensor` owns or references runtime storage.
+- `GraphBuilder` performs shape inference when building nodes.
+- `CpuExecutor` validates backend support, resolves kernels through `KernelRegistry`, and runs nodes in topological order.
+- `RuntimeContext` binds `ValueId` to runtime `Tensor` objects and owns intermediate tensors.
+- `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
+
+## References
+
+This project is an independent learning implementation inspired by:
+
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+- [Genllm](https://github.com/Aimol-l/Genllm)
+- [mini_op](https://github.com/plutoaac/mini_op)
 
 ## Roadmap
 
-| Phase | Goal |
-|-------|------|
-| 1 | Tensor + Graph IR + MockExecutor *(current)* |
-| 2 | CPU kernel adapter — integrate mini_op SIMD ops |
-| 3 | GGUF metadata / tensor loader |
-| 4 | Llama/Qwen decoder-only model graph builder |
-| 5 | Tokenizer + greedy generation |
-| 6 | KV Cache + prefill/decode separation |
-| 7 | Streaming generation + mini_RPC serving |
-| 8 | Benchmark tokens/s, TTFT, memory usage |
-| 9 | CUDA backend / quantization / paged attention |
+Near-term work with high portfolio value:
+
+- Run and document an end-to-end Qwen3-0.6B GGUF demo.
+- Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
+- Add a simple memory planner for intermediate tensor reuse.
+- Implement the first quantized weight path, likely `Q8_0`.
+- Add a short CLI-focused demo script for interviews.
+
+Longer-term experiments:
+
+- More optimized GEMM micro-kernels and weight packing.
+- Multi-threaded CPU execution.
+- Prefix cache and multi-sequence KV cache management.
+- Minimal streaming HTTP API.

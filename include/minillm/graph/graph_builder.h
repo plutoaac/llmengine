@@ -65,6 +65,15 @@ public:
         int64_t num_heads, int64_t head_dim,
         std::string name);
 
+    std::expected<ValueId, Status> softmax(
+        ValueId x, int64_t axis, std::string name);
+
+    std::expected<ValueId, Status> reshape(
+        ValueId x, Shape target_shape, std::string name);
+
+    std::expected<ValueId, Status> transpose(
+        ValueId x, int64_t axis0, int64_t axis1, std::string name);
+
     std::expected<ValueId, Status> output(
         ValueId x, std::string name);
 

@@ -1,5 +1,7 @@
 #include "minillm/graph/shape_infer.h"
 
+#include <algorithm>
+
 namespace minillm {
 
 std::expected<Shape, Status> infer_matmul_shape(const Shape& a, const Shape& b) {
@@ -75,6 +77,75 @@ std::expected<Shape, Status> infer_embedding_shape(const Shape& input_ids, const
         out_dims.push_back(input_ids.dim(i));
     }
     out_dims.push_back(weight.dim(1));
+    return Shape(std::move(out_dims));
+}
+
+std::expected<Shape, Status> infer_reshape_shape(const Shape& input, const Shape& target) {
+    int infer_axis = -1;
+    int64_t known_product = 1;
+    for (size_t i = 0; i < target.rank(); ++i) {
+        int64_t dim = target.dim(i);
+        if (dim == -1) {
+            if (infer_axis >= 0) {
+                return std::unexpected(Status::shape_mismatch(
+                    "Reshape target can contain at most one inferred dim: " +
+                    target.to_string()));
+            }
+            infer_axis = static_cast<int>(i);
+        } else if (dim <= 0) {
+            return std::unexpected(Status::shape_mismatch(
+                "Reshape target dims must be positive or -1: " +
+                target.to_string()));
+        } else {
+            known_product *= dim;
+        }
+    }
+
+    if (input.has_dynamic_dim()) {
+        return target;
+    }
+
+    auto input_numel = input.numel();
+    if (!input_numel) return std::unexpected(input_numel.error());
+
+    std::vector<int64_t> out_dims = target.dims();
+    if (infer_axis >= 0) {
+        if (known_product == 0 || static_cast<int64_t>(*input_numel) % known_product != 0) {
+            return std::unexpected(Status::shape_mismatch(
+                "Reshape cannot infer target dim for " + input.to_string() +
+                " -> " + target.to_string()));
+        }
+        out_dims[static_cast<size_t>(infer_axis)] =
+            static_cast<int64_t>(*input_numel) / known_product;
+        return Shape(std::move(out_dims));
+    }
+
+    auto target_numel = target.numel();
+    if (!target_numel) return std::unexpected(target_numel.error());
+    if (*input_numel != *target_numel) {
+        return std::unexpected(Status::shape_mismatch(
+            "Reshape element count mismatch: " + input.to_string() +
+            " -> " + target.to_string()));
+    }
+    return target;
+}
+
+std::expected<Shape, Status> infer_transpose_shape(const Shape& input, int64_t axis0, int64_t axis1) {
+    const int64_t rank = static_cast<int64_t>(input.rank());
+    if (rank <= 0) {
+        return std::unexpected(Status::shape_mismatch(
+            "Transpose expects rank >= 1, got " + input.to_string()));
+    }
+
+    if (axis0 < 0) axis0 += rank;
+    if (axis1 < 0) axis1 += rank;
+    if (axis0 < 0 || axis0 >= rank || axis1 < 0 || axis1 >= rank) {
+        return std::unexpected(Status::out_of_range(
+            "Transpose axes out of range for shape " + input.to_string()));
+    }
+
+    std::vector<int64_t> out_dims = input.dims();
+    std::swap(out_dims[static_cast<size_t>(axis0)], out_dims[static_cast<size_t>(axis1)]);
     return Shape(std::move(out_dims));
 }
 

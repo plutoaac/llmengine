@@ -53,6 +53,22 @@ void test_linear_shape_mismatch() {
     std::cout << "  PASS test_linear_shape_mismatch\n";
 }
 
+void test_linear_bias_shape_mismatch() {
+    Graph g;
+    GraphBuilder gb(g);
+    auto x = gb.input("x", Shape({1, 2, 4}), DType::Float32);
+    assert(x);
+    auto w = gb.constant("w", Shape({3, 4}), DType::Float32);
+    assert(w);
+    auto b = gb.constant("b", Shape({2}), DType::Float32);
+    assert(b);
+
+    auto out = gb.linear(*x, *w, *b, "linear");
+    assert(!out);
+    assert(out.error().code() == ErrorCode::ShapeMismatch);
+    std::cout << "  PASS test_linear_bias_shape_mismatch\n";
+}
+
 void test_add_shape_match() {
     Graph g;
     GraphBuilder gb(g);
@@ -128,15 +144,57 @@ void test_final_logits_shape() {
     std::cout << "  PASS test_final_logits_shape\n";
 }
 
+void test_softmax_reshape_transpose_shapes() {
+    Graph g;
+    GraphBuilder gb(g);
+    auto x = gb.input("x", Shape({2, 3, 4}), DType::Float32);
+    assert(x);
+
+    auto probs = gb.softmax(*x, -1, "softmax");
+    assert(probs);
+    auto probs_v = g.value(*probs);
+    assert(probs_v);
+    assert((*probs_v)->shape == Shape({2, 3, 4}));
+
+    auto flat = gb.reshape(*probs, Shape({6, -1}), "reshape");
+    assert(flat);
+    auto flat_v = g.value(*flat);
+    assert(flat_v);
+    assert((*flat_v)->shape == Shape({6, 4}));
+
+    auto transposed = gb.transpose(*flat, 0, 1, "transpose");
+    assert(transposed);
+    auto transposed_v = g.value(*transposed);
+    assert(transposed_v);
+    assert((*transposed_v)->shape == Shape({4, 6}));
+
+    std::cout << "  PASS test_softmax_reshape_transpose_shapes\n";
+}
+
+void test_reshape_element_mismatch() {
+    Graph g;
+    GraphBuilder gb(g);
+    auto x = gb.input("x", Shape({2, 3, 4}), DType::Float32);
+    assert(x);
+
+    auto out = gb.reshape(*x, Shape({5, 5}), "bad_reshape");
+    assert(!out);
+    assert(out.error().code() == ErrorCode::ShapeMismatch);
+    std::cout << "  PASS test_reshape_element_mismatch\n";
+}
+
 int main() {
     std::cout << "test_graph_builder:\n";
     test_embedding_shape_inference();
     test_linear_shape_inference();
     test_linear_shape_mismatch();
+    test_linear_bias_shape_mismatch();
     test_add_shape_match();
     test_add_shape_mismatch();
     test_tiny_decoder_graph_validate();
     test_final_logits_shape();
+    test_softmax_reshape_transpose_shapes();
+    test_reshape_element_mismatch();
     std::cout << "All tests passed!\n";
     return 0;
 }

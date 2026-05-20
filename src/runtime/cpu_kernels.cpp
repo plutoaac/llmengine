@@ -59,35 +59,62 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
 // ===========================================================================
 
 void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
-    std::memset(C, 0, static_cast<size_t>(M) * N * sizeof(float));
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + m * K;
+        float* c_row = C + m * N;
 
-    constexpr int TILE = 64;
-    for (int m = 0; m < M; m += TILE) {
-        for (int n = 0; n < N; n += TILE) {
-            for (int k = 0; k < K; k += TILE) {
-                int tm = std::min(TILE, M - m);
-                int tn = std::min(TILE, N - n);
-                int tk = std::min(TILE, K - k);
+        int n = 0;
+        for (; n + 3 < N; n += 4) {
+            const float* b0 = B + (n + 0) * K;
+            const float* b1 = B + (n + 1) * K;
+            const float* b2 = B + (n + 2) * K;
+            const float* b3 = B + (n + 3) * K;
 
-                for (int ii = 0; ii < tm; ++ii) {
-                    const float* a_row = A + (m + ii) * K + k;
-                    float* c_row = C + (m + ii) * N + n;
+            vfloat vdot0 = VF_SETZERO();
+            vfloat vdot1 = VF_SETZERO();
+            vfloat vdot2 = VF_SETZERO();
+            vfloat vdot3 = VF_SETZERO();
 
-                    for (int nn = 0; nn < tn; ++nn) {
-                        const float* b_row = B + (n + nn) * K + k;
-
-                        vfloat vdot = VF_SETZERO();
-                        float dot = 0.0f;
-                        int kk = 0;
-                        for (; kk + MINILLM_SIMD_WIDTH <= tk; kk += MINILLM_SIMD_WIDTH)
-                            vdot = VF_FMADD(VF_LOAD(a_row + kk), VF_LOAD(b_row + kk), vdot);
-                        dot = hsum(vdot);
-                        for (; kk < tk; ++kk)
-                            dot += a_row[kk] * b_row[kk];
-                        c_row[nn] += dot;
-                    }
-                }
+            int k = 0;
+            for (; k + MINILLM_SIMD_WIDTH <= K; k += MINILLM_SIMD_WIDTH) {
+                vfloat va = VF_LOAD(a_row + k);
+                vdot0 = VF_FMADD(va, VF_LOAD(b0 + k), vdot0);
+                vdot1 = VF_FMADD(va, VF_LOAD(b1 + k), vdot1);
+                vdot2 = VF_FMADD(va, VF_LOAD(b2 + k), vdot2);
+                vdot3 = VF_FMADD(va, VF_LOAD(b3 + k), vdot3);
             }
+
+            float dot0 = hsum(vdot0);
+            float dot1 = hsum(vdot1);
+            float dot2 = hsum(vdot2);
+            float dot3 = hsum(vdot3);
+            for (; k < K; ++k) {
+                float a = a_row[k];
+                dot0 += a * b0[k];
+                dot1 += a * b1[k];
+                dot2 += a * b2[k];
+                dot3 += a * b3[k];
+            }
+
+            c_row[n + 0] = dot0;
+            c_row[n + 1] = dot1;
+            c_row[n + 2] = dot2;
+            c_row[n + 3] = dot3;
+        }
+
+        for (; n < N; ++n) {
+            const float* b_row = B + n * K;
+            vfloat vdot = VF_SETZERO();
+            int k = 0;
+            for (; k + MINILLM_SIMD_WIDTH <= K; k += MINILLM_SIMD_WIDTH) {
+                vdot = VF_FMADD(VF_LOAD(a_row + k), VF_LOAD(b_row + k), vdot);
+            }
+
+            float dot = hsum(vdot);
+            for (; k < K; ++k) {
+                dot += a_row[k] * b_row[k];
+            }
+            c_row[n] = dot;
         }
     }
 }
@@ -381,6 +408,57 @@ void softmax(const float* x, float* y, int rows, int cols) {
         for (; c + MINILLM_SIMD_WIDTH <= cols; c += MINILLM_SIMD_WIDTH)
             VF_STORE(y_row + c, VF_MUL(VF_LOAD(y_row + c), vinv));
         for (; c < cols; ++c) y_row[c] /= sum;
+    }
+}
+
+// ===========================================================================
+// Generic contiguous transpose
+// ===========================================================================
+
+void transpose(const float* x, float* y, const int64_t* dims, int rank, int axis0, int axis1) {
+    if (axis0 == axis1) {
+        size_t total = 1;
+        for (int i = 0; i < rank; ++i) total *= static_cast<size_t>(dims[i]);
+        std::memcpy(y, x, total * sizeof(float));
+        return;
+    }
+
+    std::vector<size_t> in_strides(static_cast<size_t>(rank), 1);
+    std::vector<size_t> out_dims(static_cast<size_t>(rank));
+    std::vector<size_t> out_strides(static_cast<size_t>(rank), 1);
+
+    for (int i = 0; i < rank; ++i) {
+        out_dims[static_cast<size_t>(i)] = static_cast<size_t>(dims[i]);
+    }
+    std::swap(out_dims[static_cast<size_t>(axis0)], out_dims[static_cast<size_t>(axis1)]);
+
+    for (int i = rank - 2; i >= 0; --i) {
+        in_strides[static_cast<size_t>(i)] =
+            in_strides[static_cast<size_t>(i + 1)] * static_cast<size_t>(dims[i + 1]);
+        out_strides[static_cast<size_t>(i)] =
+            out_strides[static_cast<size_t>(i + 1)] * out_dims[static_cast<size_t>(i + 1)];
+    }
+
+    size_t total = out_dims.empty() ? 0 : out_dims[0] * out_strides[0];
+    std::vector<size_t> out_index(static_cast<size_t>(rank));
+    std::vector<size_t> in_index(static_cast<size_t>(rank));
+
+    for (size_t linear = 0; linear < total; ++linear) {
+        size_t rem = linear;
+        for (int i = 0; i < rank; ++i) {
+            const size_t stride = out_strides[static_cast<size_t>(i)];
+            out_index[static_cast<size_t>(i)] = rem / stride;
+            rem %= stride;
+        }
+
+        in_index = out_index;
+        std::swap(in_index[static_cast<size_t>(axis0)], in_index[static_cast<size_t>(axis1)]);
+
+        size_t src = 0;
+        for (int i = 0; i < rank; ++i) {
+            src += in_index[static_cast<size_t>(i)] * in_strides[static_cast<size_t>(i)];
+        }
+        y[linear] = x[src];
     }
 }
 
