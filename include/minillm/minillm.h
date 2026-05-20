@@ -33,6 +33,12 @@
 #include "minillm/runtime/kv_cache.h"
 #include "minillm/runtime/sampler.h"
 
+#if defined(MINILLM_ENABLE_CUDA)
+#include "minillm/runtime/cuda_backend.h"
+#include "minillm/runtime/cuda_kernel_adapter.h"
+#include "minillm/runtime/cuda_kernels.h"
+#endif
+
 // Model
 #include "minillm/model/transformer_graph_builder.h"
 

@@ -11,7 +11,7 @@ TransformerGraphBuilder::TransformerGraphBuilder(GraphBuilder& builder)
 std::expected<ValueId, Status> TransformerGraphBuilder::build_tiny_decoder_block(
     const TransformerConfig& cfg) {
 
-    auto dev = Device::cpu();
+    auto dev = cfg.device;
 
     // --- Inputs & weights (constants) ---
     auto input_ids = builder_.input("input_ids",
@@ -129,7 +129,7 @@ std::expected<ValueId, Status> TransformerGraphBuilder::build_tiny_decoder_block
 std::expected<ValueId, Status> TransformerGraphBuilder::build_transformer(
     const TransformerConfig& cfg) {
 
-    auto dev = Device::cpu();
+    auto dev = cfg.device;
 
     // --- Inputs ---
     auto input_ids = builder_.input("input_ids",

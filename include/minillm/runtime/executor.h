@@ -47,4 +47,20 @@ private:
     std::vector<NodeId> execution_order_;
 };
 
+#if defined(MINILLM_ENABLE_CUDA)
+class CudaExecutor final : public Executor {
+public:
+    CudaExecutor(std::shared_ptr<Backend> backend, KernelRegistry& registry);
+
+    Status compile(const Graph& graph) override;
+    Status run(RuntimeContext& ctx) override;
+
+private:
+    const Graph* graph_{nullptr};
+    std::shared_ptr<Backend> backend_;
+    KernelRegistry& registry_;
+    std::vector<NodeId> execution_order_;
+};
+#endif
+
 } // namespace minillm

@@ -8,12 +8,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MINILLM_ENABLE_NATIVE_ARCH "Enable host-native CPU code generation when supported" ON)
+option(MINILLM_ENABLE_CUDA "Build optional CUDA backend and FP32 CUDA kernels" OFF)
+
+if(MINILLM_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS OFF)
+endif()
 
 if(MINILLM_ENABLE_NATIVE_ARCH AND NOT MSVC)
     include(CheckCXXCompilerFlag)
     check_cxx_compiler_flag("-march=native" MINILLM_HAS_MARCH_NATIVE)
     if(MINILLM_HAS_MARCH_NATIVE)
-        add_compile_options(-march=native)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
     endif()
 endif()
 
@@ -57,6 +66,18 @@ add_library(minillm_runtime
 )
 target_include_directories(minillm_runtime PUBLIC include)
 target_link_libraries(minillm_runtime PUBLIC minillm_graph)
+
+if(MINILLM_ENABLE_CUDA)
+    target_sources(minillm_runtime PRIVATE
+        src/runtime/cuda_backend.cpp
+        src/runtime/cuda_kernel_adapter.cpp
+        src/runtime/cuda_kernels.cu
+    )
+    target_compile_definitions(minillm_core PUBLIC MINILLM_ENABLE_CUDA=1)
+    target_compile_definitions(minillm_runtime PUBLIC MINILLM_ENABLE_CUDA=1)
+    target_link_libraries(minillm_core PUBLIC CUDA::cudart)
+    target_link_libraries(minillm_runtime PUBLIC CUDA::cudart)
+endif()
 
 # Model library
 add_library(minillm_model

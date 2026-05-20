@@ -39,7 +39,12 @@ Status RuntimeContext::allocate_intermediates(const Graph& graph) {
                 " " + v.shape.to_string());
         }
         auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
-        auto st = t->allocate_cpu();
+        Status st;
+        if (v.device.type == DeviceType::CUDA) {
+            st = t->allocate_cuda();
+        } else {
+            st = t->allocate_cpu();
+        }
         if (!st.ok()) return st;
         bindings_[v.id.value] = t.get();
         owned_.push_back(std::move(t));

@@ -8,6 +8,7 @@ The design goal is to demonstrate the core engineering concepts behind local LLM
 - runtime tensor binding and memory ownership
 - backend capability checks and kernel dispatch
 - CPU transformer kernels
+- optional CUDA transformer kernels
 - GGUF model loading
 - KV cache based prefill/decode generation
 
@@ -26,11 +27,17 @@ flowchart TD
 
     Values --> Context
     Context --> Executor["CpuExecutor"]
+    Context -.-> CudaExecutor["CudaExecutor"]
     Nodes --> Executor
+    Nodes -.-> CudaExecutor
     Registry["KernelRegistry"] --> Executor
+    Registry -. "CUDA registrations" .-> CudaExecutor
     Backend["CpuBackend"] --> Executor
+    CudaBackend["CudaBackend"] -.-> CudaExecutor
     Executor --> Kernels["CPU kernels"]
+    CudaExecutor -.-> CudaKernels["CUDA kernels"]
     Kernels --> Context
+    CudaKernels -.-> Context
     Context --> Cache["KVCache"]
 ```
 
@@ -41,7 +48,7 @@ The runtime is separated into five layers:
 | Core | `Shape`, `DType`, `Device`, `Status`, and physical `Tensor` storage |
 | Graph | Logical `Value` and `Node` descriptors plus graph validation and topological sort |
 | Model | Transformer graph construction using `GraphBuilder` |
-| Runtime | `RuntimeContext`, `CpuExecutor`, `CpuBackend`, `KernelRegistry`, CPU kernels, KV cache, sampler |
+| Runtime | `RuntimeContext`, `CpuExecutor`, optional `CudaExecutor`, backend capability checks, kernel registries, KV cache, sampler |
 | IO | GGUF metadata parsing, tensor loading, weight-name mapping, and tokenizer |
 
 ## Core Types
@@ -58,7 +65,7 @@ Important behavior:
 
 ### Tensor
 
-`Tensor` is the physical runtime container. It owns a CPU byte buffer and carries:
+`Tensor` is the physical runtime container. It owns a CPU byte buffer by default and can own CUDA device memory when the project is built with `MINILLM_ENABLE_CUDA=ON`. It carries:
 
 - name
 - shape
@@ -67,6 +74,8 @@ Important behavior:
 - storage
 
 The graph never stores tensor data. It only stores logical `Value` descriptors. Runtime data is attached later through `RuntimeContext`.
+
+The CUDA storage path is deliberately explicit: `allocate_cpu()` and `allocate_cuda()` select the memory owner, and `data()` returns the pointer for the active storage. This keeps the CPU code path simple while allowing a CUDA executor to reuse the same `Tensor` abstraction.
 
 ### Status
 
@@ -130,6 +139,8 @@ Execution is split into compile and run.
 4. checks that a CPU kernel exists in `KernelRegistry`
 5. stores the execution order
 
+`CudaExecutor::compile()` follows the same contract but checks `DeviceType::CUDA` kernel registrations. It is compiled only when CUDA support is enabled.
+
 ### Run
 
 `CpuExecutor::run()`:
@@ -141,6 +152,8 @@ Execution is split into compile and run.
 5. advances the shared KV cache once if the context requested it
 
 The executor does not own tensor memory. It only reads bindings from `RuntimeContext`.
+
+`CudaExecutor::run()` mirrors this flow and launches CUDA kernels through the same registry abstraction. The low-level CUDA wrappers return launch errors without forcing a device-wide synchronize, so callers can decide when they want hard synchronization for tests or profiling.
 
 ## RuntimeContext
 
@@ -164,6 +177,8 @@ decode_ctx.set_kv_cache_advance_tokens(1);
 ```
 
 After a successful graph run, `CpuExecutor` calls `advance_kv_cache_step()` exactly once. This avoids advancing once per attention layer.
+
+Intermediate allocation is device-aware: a graph value tagged with `Device::cuda(index)` allocates CUDA storage, while the default CPU graph allocates CPU storage. This preserves the CPU-first behavior and gives CUDA experiments a narrow integration point.
 
 ## Graph Memory Planner
 
@@ -259,6 +274,43 @@ Implemented CPU ops include:
 - `Softmax`
 - `Reshape`
 - `Transpose`
+
+## Optional CUDA Backend
+
+The CUDA backend follows the same three-layer shape as the CPU runtime:
+
+| Layer | File | Purpose |
+|-------|------|---------|
+| Capability | `cuda_backend.cpp` | Declares which graph ops CUDA can execute |
+| Adapter | `cuda_kernel_adapter.cpp` | Checks graph tensors, dtypes, devices, and shapes |
+| Kernels | `cuda_kernels.cu` | Launches raw CUDA kernels |
+
+This mirrors the CPU split, so adding a new CUDA op means adding the low-level kernel, then registering the graph-level adapter in `register_cuda_kernels()`.
+
+Current CUDA scope:
+
+- FP32 `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`
+- FP32 `Add`, `Mul`, `SiLU`, `SwiGLU`
+- FP32 `RoPE`, no-cache `Attention`, `Softmax`
+- FP32 `Transpose`
+- dtype-preserving CUDA `Reshape` through device-to-device copy
+
+The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and no-cache attention supports GQA by mapping query heads to KV heads.
+
+The CUDA path is experimental and disabled by default:
+
+```bash
+cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DMINILLM_ENABLE_CUDA=ON
+cmake --build build-cuda -j
+```
+
+What is not implemented yet:
+
+- CUDA KV cache prefill/decode attention
+- CUDA quantized matmul
+- CUDA arena allocation driven by `MemoryPlanner`
+- host-to-device weight loading in `GGUFWeightLoader`
+- CUDA numerical tests and benchmarks
 
 ## GEMM Design
 
@@ -369,7 +421,8 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 - continuous batching
 - multi-sequence KV cache slots
 - production-grade tokenizer compatibility
-- CUDA / Metal / Vulkan backends
+- CUDA KV cache and CUDA quantized kernels
+- Metal / Vulkan backends
 
 These are valid future extensions, but they are not required for the project's current purpose.
 
@@ -401,12 +454,14 @@ This project is useful to discuss:
 - why Linear commonly uses `A[M,K] x W[N,K]^T`
 - how KV cache changes decode complexity
 - how GGUF metadata and tensor loading fit into inference
+- how a CPU backend can be mirrored by an optional CUDA backend
 - how to test numerical kernels separately from runtime integration
 
 Good follow-up improvements:
 
 - add Q8_0 weight loading and matmul
 - add Release-mode benchmark tables
-- add a simple memory planner
+- integrate the memory planner with a runtime arena allocator
+- add CUDA smoke tests once GPU resources are available
 - add multi-threaded GEMM
 - align an end-to-end Qwen3-0.6B run against llama.cpp for the first few generated tokens

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 
+#include "minillm/core/device.h"
 #include "minillm/core/dtype.h"
 #include "minillm/core/status.h"
 #include "minillm/graph/value.h"
@@ -24,6 +25,7 @@ struct TransformerConfig {
     double rms_norm_eps = 1e-6;
     bool use_qk_norm = false;
     DType dtype = DType::Float32;
+    Device device = Device::cpu();
 };
 
 class TransformerGraphBuilder {

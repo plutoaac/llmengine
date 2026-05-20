@@ -20,6 +20,12 @@ class Tensor {
 public:
     Tensor() = default;
     Tensor(std::string name, Shape shape, DType dtype, Device device = Device::cpu());
+    ~Tensor();
+
+    Tensor(const Tensor&) = delete;
+    Tensor& operator=(const Tensor&) = delete;
+    Tensor(Tensor&& other) noexcept;
+    Tensor& operator=(Tensor&& other) noexcept;
 
     const std::string& name() const;
     const Shape& shape() const;
@@ -34,6 +40,8 @@ public:
     const void* data() const;
 
     Status allocate_cpu();
+    Status allocate_cuda();
+    Status release();
     Status allocate_cpu_bytes(size_t bytes);
 
 private:
@@ -42,6 +50,8 @@ private:
     DType dtype_{DType::Unknown};
     Device device_{Device::cpu()};
     std::vector<std::byte> storage_;
+    void* cuda_storage_{nullptr};
+    size_t cuda_bytes_{0};
 };
 
 } // namespace minillm
