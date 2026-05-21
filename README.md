@@ -11,7 +11,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **CPU backend** for FP32 kernels including `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `RoPE`, `Attention`, `Softmax`, `SwiGLU`, `Embedding`, `Transpose`, and `Reshape`.
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
-- **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, CPU decode attention, and CUDA paged decode over device block tables.
+- **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, a small multi-sequence scheduler, CPU decode attention, and CUDA paged decode over device block tables.
 - **Graph memory planner** with liveness analysis, intermediate tensor buffer reuse planning, and peak-memory reporting.
 - **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
@@ -38,8 +38,11 @@ flowchart LR
     CudaExecutor -.-> CudaKernels["CUDA kernels"]
     Context --> KV["KVCache"]
     Context --> PagedKV["PagedKVCache"]
+    PagedKV --> Scheduler["PagedAttentionScheduler"]
     Kernels --> Tensor["Tensor storage"]
     PagedKV --> PagedAttn["CPU paged decode attention"]
+    Scheduler --> PagedBatch["padded block-table batch"]
+    PagedBatch -.-> CudaPaged["CUDA batched paged decode"]
     CudaKernels -.-> Tensor
     Executor --> Sampler["Sampler"]
 ```
@@ -58,10 +61,10 @@ flowchart LR
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16 |
 | Byte-level BPE tokenizer | Experimental |
 | KV cache prefill/decode | Implemented for single-batch generation |
-| Paged KV cache / PagedAttention reference | Implemented for CPU decode |
+| Paged KV cache / PagedAttention reference | Implemented for CPU decode and toy multi-sequence scheduling |
 | CPU benchmark harness | Implemented |
 | Quantized kernels | Not yet |
-| CUDA PagedAttention decode | Implemented for single-sequence decode |
+| CUDA PagedAttention decode | Implemented for single-sequence and batched decode |
 | CUDA contiguous KV cache / quantized CUDA kernels | Not yet |
 | Metal / Vulkan | Out of scope |
 | Continuous batching / server runtime | Out of scope |
@@ -113,11 +116,11 @@ CUDA support is an optional experimental module, inspired by the operator struct
 - `register_cuda_kernels()` bridges graph nodes to `.cu` launch wrappers.
 - `Tensor::allocate_cuda()` owns CUDA device memory while preserving the same runtime `Tensor` API.
 
-Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, PagedAttention-style decode, `Softmax`, `Reshape`, and `Transpose`.
+Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, single-sequence and batched PagedAttention-style decode, `Softmax`, `Reshape`, and `Transpose`.
 
 `test_cuda_kernels` validates raw CUDA kernels against CPU references and also checks a small `CudaExecutor` graph with `Linear` + bias.
 
-The CUDA path does not yet include contiguous CUDA KV cache prefill/decode integration, quantized CUDA matmul, or memory-planner-backed CUDA arena allocation.
+The CUDA path does not yet include contiguous CUDA KV cache prefill/decode integration, quantized CUDA matmul, production scheduler policies, or memory-planner-backed CUDA arena allocation.
 
 ## Paged KV Cache
 
@@ -126,10 +129,12 @@ The CUDA path does not yet include contiguous CUDA KV cache prefill/decode integ
 - K/V memory is split into fixed-size token blocks.
 - each sequence owns a block table that maps logical token positions to physical blocks.
 - freed sequences return blocks to a reusable free list.
+- `PagedAttentionScheduler` keeps a small active sequence set and emits padded batch metadata: sequence IDs, sequence lengths, and flattened block tables.
 - `paged_attention_decode()` reads K/V through the block table and supports GQA.
 - `cuda::paged_attention_decode()` runs the same decode pattern on device-resident K/V pages and a device block table.
+- `cuda::paged_attention_decode_batch()` consumes scheduler-style batch metadata and decodes multiple active sequences in one launch.
 
-The first CUDA implementation covers single-sequence decode. It is the kernel-level foundation for later continuous batching and scheduler work.
+The scheduler is intentionally small: it is not a production request queue, but it demonstrates the core bridge between paged KV allocation and batched GPU decode.
 
 ## CPU Benchmark
 
@@ -168,6 +173,7 @@ CTest currently runs:
 ./build/test_cpu_kernels
 ./build/test_memory_planner
 ./build/test_paged_kv_cache
+./build/test_paged_attention_scheduler
 ./build/test_gguf_parser
 ```
 
@@ -185,8 +191,8 @@ The test suite covers:
 - CPU kernel numerical reference checks
 - graph liveness and memory reuse planning
 - KV cache prefill/decode advancement
-- paged KV block allocation and paged decode attention
-- CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, paged decode, and executor dispatch
+- paged KV block allocation, scheduler batch metadata, and paged decode attention
+- CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
 - GGUF parser and weight conversion helpers
 
 ## Project Layout
@@ -223,9 +229,9 @@ Key design choices:
 - `CudaExecutor` mirrors the CPU executor when the project is built with `MINILLM_ENABLE_CUDA=ON`.
 - `RuntimeContext` binds `ValueId` to runtime `Tensor` objects and owns intermediate tensors.
 - `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
-- `PagedKVCache` separates logical sequence positions from physical KV blocks and provides a CPU reference paged decode path.
+- `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
 - `MemoryPlanner` computes intermediate tensor live ranges and assigns non-overlapping values to reusable buffers without changing runtime allocation yet.
-- CUDA currently covers FP32 operator dispatch and tensor allocation. CUDA KV cache, CUDA graph-memory arena integration, and quantized CUDA matmul are intentionally left as future work.
+- CUDA currently covers FP32 operator dispatch, tensor allocation, and raw paged decode kernels. CUDA graph-memory arena integration, production batching policy, and quantized CUDA matmul are intentionally left as future work.
 
 ## References
 
@@ -243,7 +249,7 @@ Near-term work with high portfolio value:
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
 - Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
 - Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.
-- Integrate CUDA PagedAttention with a small multi-sequence scheduler.
+- Connect `PagedAttentionScheduler` to a real decode loop with request admission and finished-sequence eviction.
 - Implement the first quantized weight path, likely `Q8_0`.
 - Add a short CLI-focused demo script for interviews.
 

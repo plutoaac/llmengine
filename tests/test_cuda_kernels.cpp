@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <iostream>
@@ -440,6 +441,95 @@ void test_cuda_paged_attention_decode_gqa() {
     std::cout << "  PASS test_cuda_paged_attention_decode_gqa\n";
 }
 
+void test_cuda_paged_attention_decode_batch_gqa() {
+    const int batch_size = 2;
+    const int max_blocks_per_sequence = 3;
+    const int num_heads = 4;
+    const int num_kv_heads = 2;
+    const int head_dim = 2;
+    const int block_size = 2;
+    const int max_blocks = 5;
+    const int kv_hidden = num_kv_heads * head_dim;
+    const std::vector<int> sequence_lengths{5, 3};
+    const std::vector<int> block_tables{
+        2, 0, 3,
+        1, 4, -1,
+    };
+
+    const std::vector<float> q{
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        0.5f, 0.5f,
+        -0.5f, 1.0f,
+
+        0.25f, 1.0f,
+        1.0f, -0.25f,
+        -1.0f, 0.5f,
+        0.75f, 0.25f,
+    };
+    std::vector<float> k_cache(
+        static_cast<size_t>(max_blocks) * block_size * kv_hidden, -99.0f);
+    std::vector<float> v_cache(k_cache.size(), 99.0f);
+
+    for (int b = 0; b < batch_size; ++b) {
+        const int seq_len = sequence_lengths[static_cast<size_t>(b)];
+        const int* table =
+            block_tables.data() + static_cast<size_t>(b) * max_blocks_per_sequence;
+        for (int pos = 0; pos < seq_len; ++pos) {
+            const int physical_block = table[pos / block_size];
+            const int block_offset = pos % block_size;
+            for (int h = 0; h < num_kv_heads; ++h) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const size_t dst =
+                        (static_cast<size_t>(physical_block) * block_size + block_offset) *
+                        kv_hidden + static_cast<size_t>(h) * head_dim + d;
+                    k_cache[dst] = 0.07f * static_cast<float>((b + 1) * (pos + 1)) +
+                                   0.13f * static_cast<float>(h + 1) +
+                                   0.03f * static_cast<float>(d);
+                    v_cache[dst] = static_cast<float>(
+                        100 * (b + 1) + 10 * (h + 1) + pos * 3 + d);
+                }
+            }
+        }
+    }
+
+    DeviceBuffer<float> dq(q.size()), dk(k_cache.size()), dv(v_cache.size()),
+        dout(static_cast<size_t>(batch_size) * num_heads * head_dim);
+    DeviceBuffer<int> dtables(block_tables.size()), dlengths(sequence_lengths.size());
+    dq.copy_from(q);
+    dk.copy_from(k_cache);
+    dv.copy_from(v_cache);
+    dtables.copy_from(block_tables);
+    dlengths.copy_from(sequence_lengths);
+
+    check_status(cuda::paged_attention_decode_batch(
+        dq.get(), dk.get(), dv.get(), dtables.get(), dlengths.get(), dout.get(),
+        batch_size, max_blocks_per_sequence, num_heads, num_kv_heads,
+        head_dim, block_size));
+    sync_ok();
+
+    auto out = dout.copy_to_host();
+    for (int b = 0; b < batch_size; ++b) {
+        const size_t q_offset = static_cast<size_t>(b) * num_heads * head_dim;
+        std::vector<float> q_seq(q.begin() + static_cast<std::ptrdiff_t>(q_offset),
+                                 q.begin() + static_cast<std::ptrdiff_t>(
+                                     q_offset + num_heads * head_dim));
+        std::vector<int> table(
+            block_tables.begin() + static_cast<std::ptrdiff_t>(
+                static_cast<size_t>(b) * max_blocks_per_sequence),
+            block_tables.begin() + static_cast<std::ptrdiff_t>(
+                static_cast<size_t>(b + 1) * max_blocks_per_sequence));
+        auto expected = reference_paged_decode(
+            q_seq, k_cache, v_cache, table, sequence_lengths[static_cast<size_t>(b)],
+            num_heads, num_kv_heads, head_dim, block_size);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            assert_near(out[q_offset + i], expected[i], 1e-3f);
+        }
+    }
+
+    std::cout << "  PASS test_cuda_paged_attention_decode_batch_gqa\n";
+}
+
 void test_cuda_executor_linear_bias() {
     Graph graph;
     GraphBuilder gb(graph);
@@ -502,6 +592,7 @@ int main() {
     test_cuda_norm_embedding_rope_softmax_transpose();
     test_cuda_sdpa_gqa();
     test_cuda_paged_attention_decode_gqa();
+    test_cuda_paged_attention_decode_batch_gqa();
     test_cuda_executor_linear_bias();
     std::cout << "All tests passed!\n";
     return 0;
