@@ -53,7 +53,7 @@ flowchart LR
 | CPU executor and kernel registry | Implemented |
 | FP32 CPU kernels | Implemented for core transformer ops |
 | Optional CUDA executor/backend | Experimental, disabled by default |
-| FP32 CUDA kernels | Experimental for core transformer ops |
+| FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU intermediates |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16 |
 | Byte-level BPE tokenizer | Experimental |
@@ -86,7 +86,7 @@ cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DMINILLM_ENABLE_CUDA=ON
 cmake --build build-cuda -j
 ```
 
-CUDA is off by default. The normal build remains CPU-only and does not require a CUDA toolkit or GPU.
+CUDA is off by default. The normal build remains CPU-only and does not require a CUDA toolkit or GPU. The CUDA build defaults to `sm_86` for Ampere GPUs such as RTX 30-series; pass `-DCMAKE_CUDA_ARCHITECTURES=...` to target another GPU.
 
 Run all tests:
 
@@ -113,6 +113,8 @@ CUDA support is an optional experimental module, inspired by the operator struct
 - `Tensor::allocate_cuda()` owns CUDA device memory while preserving the same runtime `Tensor` API.
 
 Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, `Softmax`, `Reshape`, and `Transpose`.
+
+`test_cuda_kernels` validates raw CUDA kernels against CPU references and also checks a small `CudaExecutor` graph with `Linear` + bias.
 
 The CUDA path does not yet include CUDA KV cache attention, quantized CUDA matmul, or memory-planner-backed CUDA arena allocation.
 
@@ -167,6 +169,12 @@ CTest currently runs:
 ./build/test_gguf_parser
 ```
 
+CUDA builds add:
+
+```bash
+./build-cuda/test_cuda_kernels
+```
+
 The test suite covers:
 
 - shape and tensor allocation behavior
@@ -176,6 +184,7 @@ The test suite covers:
 - graph liveness and memory reuse planning
 - KV cache prefill/decode advancement
 - paged KV block allocation and paged decode attention
+- CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, and executor dispatch
 - GGUF parser and weight conversion helpers
 
 ## Project Layout
@@ -231,7 +240,7 @@ Near-term work with high portfolio value:
 - Run and document an end-to-end Qwen3-0.6B GGUF demo.
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
 - Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
-- Add a small CPU-vs-CUDA operator smoke suite once GPU resources are free.
+- Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.
 - Add a CUDA PagedAttention decode kernel after the CPU reference path is stable.
 - Implement the first quantized weight path, likely `Q8_0`.
 - Add a short CLI-focused demo script for interviews.

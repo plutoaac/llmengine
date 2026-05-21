@@ -1,4 +1,4 @@
-build/
+build*/
 *.gguf
 *.o
 *.a

@@ -1,4 +1,24 @@
 cmake_minimum_required(VERSION 3.22)
+
+option(MINILLM_ENABLE_CUDA "Build optional CUDA backend and FP32 CUDA kernels" OFF)
+
+if(MINILLM_ENABLE_CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING
+            "CUDA architectures to build for")
+    endif()
+    if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
+        find_program(MINILLM_CUDA_HOST_CXX g++-12)
+        if(NOT MINILLM_CUDA_HOST_CXX)
+            find_program(MINILLM_CUDA_HOST_CXX g++-11)
+        endif()
+        if(MINILLM_CUDA_HOST_CXX)
+            set(CMAKE_CUDA_HOST_COMPILER "${MINILLM_CUDA_HOST_CXX}" CACHE FILEPATH
+                "Host compiler used by nvcc")
+        endif()
+    endif()
+endif()
+
 project(MiniLLMEngine LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -8,7 +28,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MINILLM_ENABLE_NATIVE_ARCH "Enable host-native CPU code generation when supported" ON)
-option(MINILLM_ENABLE_CUDA "Build optional CUDA backend and FP32 CUDA kernels" OFF)
 
 if(MINILLM_ENABLE_CUDA)
     enable_language(CUDA)
@@ -137,3 +156,11 @@ add_minillm_test(test_paged_kv_cache)
 
 add_minillm_test(test_gguf_parser)
 target_link_libraries(test_gguf_parser PRIVATE minillm_io)
+
+if(MINILLM_ENABLE_CUDA)
+    add_executable(test_cuda_kernels tests/test_cuda_kernels.cpp)
+    target_link_libraries(test_cuda_kernels PRIVATE minillm_model CUDA::cudart)
+    if(BUILD_TESTING)
+        add_test(NAME test_cuda_kernels COMMAND test_cuda_kernels)
+    endif()
+endif()

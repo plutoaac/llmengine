@@ -307,13 +307,23 @@ cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DMINILLM_ENABLE_CUDA=ON
 cmake --build build-cuda -j
 ```
 
+By default the CUDA build targets `sm_86`, which matches the RTX 30-series GPU used for validation. Other machines can override this with `-DCMAKE_CUDA_ARCHITECTURES=...`.
+
+The `test_cuda_kernels` executable validates:
+
+- elementwise ops and fused SwiGLU
+- `sgemm`, `sgemm_nt`, and Linear bias add
+- RMSNorm, Embedding, RoPE, Softmax, and Transpose
+- no-cache SDPA with GQA
+- `CudaExecutor` dispatch on a small graph
+
 What is not implemented yet:
 
 - CUDA KV cache prefill/decode attention
 - CUDA quantized matmul
 - CUDA arena allocation driven by `MemoryPlanner`
 - host-to-device weight loading in `GGUFWeightLoader`
-- CUDA numerical tests and benchmarks
+- CUDA performance benchmarks
 
 ## GEMM Design
 
@@ -445,6 +455,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion |
 | `test_memory_planner` | graph liveness, buffer reuse planning, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
+| `test_cuda_kernels` | CUDA kernels and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
 
 The important split is:
 
@@ -509,7 +520,7 @@ Good follow-up improvements:
 - add Q8_0 weight loading and matmul
 - add Release-mode benchmark tables
 - integrate the memory planner with a runtime arena allocator
-- add CUDA smoke tests once GPU resources are available
+- add Release-mode CUDA benchmark tables
 - add CUDA PagedAttention decode after the CPU reference path
 - add multi-threaded GEMM
 - align an end-to-end Qwen3-0.6B run against llama.cpp for the first few generated tokens
