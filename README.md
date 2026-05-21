@@ -11,7 +11,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **CPU backend** for FP32 kernels including `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `RoPE`, `Attention`, `Softmax`, `SwiGLU`, `Embedding`, `Transpose`, and `Reshape`.
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
-- **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, and CPU decode attention over paged K/V.
+- **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, CPU decode attention, and CUDA paged decode over device block tables.
 - **Graph memory planner** with liveness analysis, intermediate tensor buffer reuse planning, and peak-memory reporting.
 - **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
@@ -61,7 +61,8 @@ flowchart LR
 | Paged KV cache / PagedAttention reference | Implemented for CPU decode |
 | CPU benchmark harness | Implemented |
 | Quantized kernels | Not yet |
-| CUDA KV cache / quantized CUDA kernels | Not yet |
+| CUDA PagedAttention decode | Implemented for single-sequence decode |
+| CUDA contiguous KV cache / quantized CUDA kernels | Not yet |
 | Metal / Vulkan | Out of scope |
 | Continuous batching / server runtime | Out of scope |
 
@@ -112,11 +113,11 @@ CUDA support is an optional experimental module, inspired by the operator struct
 - `register_cuda_kernels()` bridges graph nodes to `.cu` launch wrappers.
 - `Tensor::allocate_cuda()` owns CUDA device memory while preserving the same runtime `Tensor` API.
 
-Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, `Softmax`, `Reshape`, and `Transpose`.
+Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, PagedAttention-style decode, `Softmax`, `Reshape`, and `Transpose`.
 
 `test_cuda_kernels` validates raw CUDA kernels against CPU references and also checks a small `CudaExecutor` graph with `Linear` + bias.
 
-The CUDA path does not yet include CUDA KV cache attention, quantized CUDA matmul, or memory-planner-backed CUDA arena allocation.
+The CUDA path does not yet include contiguous CUDA KV cache prefill/decode integration, quantized CUDA matmul, or memory-planner-backed CUDA arena allocation.
 
 ## Paged KV Cache
 
@@ -126,8 +127,9 @@ The CUDA path does not yet include CUDA KV cache attention, quantized CUDA matmu
 - each sequence owns a block table that maps logical token positions to physical blocks.
 - freed sequences return blocks to a reusable free list.
 - `paged_attention_decode()` reads K/V through the block table and supports GQA.
+- `cuda::paged_attention_decode()` runs the same decode pattern on device-resident K/V pages and a device block table.
 
-This is intentionally CPU reference code today. It is meant to make the memory-management design clear before adding a CUDA PagedAttention kernel or a continuous batching scheduler.
+The first CUDA implementation covers single-sequence decode. It is the kernel-level foundation for later continuous batching and scheduler work.
 
 ## CPU Benchmark
 
@@ -184,7 +186,7 @@ The test suite covers:
 - graph liveness and memory reuse planning
 - KV cache prefill/decode advancement
 - paged KV block allocation and paged decode attention
-- CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, and executor dispatch
+- CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, paged decode, and executor dispatch
 - GGUF parser and weight conversion helpers
 
 ## Project Layout
@@ -241,7 +243,7 @@ Near-term work with high portfolio value:
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
 - Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
 - Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.
-- Add a CUDA PagedAttention decode kernel after the CPU reference path is stable.
+- Integrate CUDA PagedAttention with a small multi-sequence scheduler.
 - Implement the first quantized weight path, likely `Q8_0`.
 - Add a short CLI-focused demo script for interviews.
 

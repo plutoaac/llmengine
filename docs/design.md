@@ -295,10 +295,11 @@ Current CUDA scope:
 - FP32 `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`
 - FP32 `Add`, `Mul`, `SiLU`, `SwiGLU`
 - FP32 `RoPE`, no-cache `Attention`, `Softmax`
+- FP32 single-sequence PagedAttention decode over device block tables
 - FP32 `Transpose`
 - dtype-preserving CUDA `Reshape` through device-to-device copy
 
-The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and no-cache attention supports GQA by mapping query heads to KV heads.
+The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads.
 
 The CUDA path is experimental and disabled by default:
 
@@ -315,11 +316,13 @@ The `test_cuda_kernels` executable validates:
 - `sgemm`, `sgemm_nt`, and Linear bias add
 - RMSNorm, Embedding, RoPE, Softmax, and Transpose
 - no-cache SDPA with GQA
+- paged decode attention with a non-contiguous block table
 - `CudaExecutor` dispatch on a small graph
 
 What is not implemented yet:
 
-- CUDA KV cache prefill/decode attention
+- CUDA contiguous KV cache prefill/decode attention
+- batched CUDA PagedAttention for multiple active sequences
 - CUDA quantized matmul
 - CUDA arena allocation driven by `MemoryPlanner`
 - host-to-device weight loading in `GGUFWeightLoader`
@@ -422,7 +425,7 @@ output: [num_heads, head_dim]
 cache:  paged K/V rows for one sequence and layer
 ```
 
-This is not yet a continuous batching scheduler. It is the reference layer that makes a future scheduler and CUDA PagedAttention kernel easier to add and test.
+The CUDA implementation mirrors this decode path for one active sequence using device-resident K/V pages and a device block table. It is not yet a continuous batching scheduler, but it validates the kernel-level memory access pattern needed for one.
 
 ## GGUF Loading
 
@@ -455,7 +458,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion |
 | `test_memory_planner` | graph liveness, buffer reuse planning, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
-| `test_cuda_kernels` | CUDA kernels and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
+| `test_cuda_kernels` | CUDA kernels, CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
 
 The important split is:
 
@@ -474,7 +477,7 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 - continuous batching
 - production scheduler for multi-sequence paged KV slots
 - production-grade tokenizer compatibility
-- CUDA PagedAttention, CUDA KV cache, and CUDA quantized kernels
+- batched CUDA PagedAttention, CUDA contiguous KV cache, and CUDA quantized kernels
 - Metal / Vulkan backends
 
 These are valid future extensions, but they are not required for the project's current purpose.
@@ -513,6 +516,7 @@ This project is useful to discuss:
 - why PagedAttention uses block tables instead of one large contiguous cache per sequence
 - how GGUF metadata and tensor loading fit into inference
 - how a CPU backend can be mirrored by an optional CUDA backend
+- how CUDA paged decode reads K/V through a device block table
 - how to test numerical kernels separately from runtime integration
 
 Good follow-up improvements:
@@ -521,6 +525,6 @@ Good follow-up improvements:
 - add Release-mode benchmark tables
 - integrate the memory planner with a runtime arena allocator
 - add Release-mode CUDA benchmark tables
-- add CUDA PagedAttention decode after the CPU reference path
+- connect CUDA PagedAttention decode to a toy multi-sequence scheduler
 - add multi-threaded GEMM
 - align an end-to-end Qwen3-0.6B run against llama.cpp for the first few generated tokens

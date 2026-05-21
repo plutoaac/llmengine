@@ -26,5 +26,9 @@ Status transpose(const float* x, float* y, const int64_t* dims,
 Status sdpa(const float* q, const float* k, const float* v, float* out,
             int batch, int q_len, int num_heads, int num_kv_heads,
             int head_dim, bool causal);
+Status paged_attention_decode(const float* q, const float* k_cache,
+                              const float* v_cache, const int* block_table,
+                              float* out, int seq_len, int num_heads,
+                              int num_kv_heads, int head_dim, int block_size);
 
 } // namespace minillm::cuda

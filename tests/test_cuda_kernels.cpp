@@ -127,6 +127,52 @@ static std::vector<float> reference_sdpa(
     return out;
 }
 
+static std::vector<float> reference_paged_decode(
+    const std::vector<float>& q, const std::vector<float>& k_cache,
+    const std::vector<float>& v_cache, const std::vector<int>& block_table,
+    int seq_len, int num_heads, int num_kv_heads, int head_dim, int block_size) {
+    std::vector<float> out(static_cast<size_t>(num_heads) * head_dim, 0.0f);
+    const int group_size = num_heads / num_kv_heads;
+    const int kv_hidden = num_kv_heads * head_dim;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    for (int h = 0; h < num_heads; ++h) {
+        const int kv_h = h / group_size;
+        const float* q_vec = q.data() + h * head_dim;
+        std::vector<float> scores(static_cast<size_t>(seq_len));
+
+        for (int pos = 0; pos < seq_len; ++pos) {
+            const int physical_block = block_table[static_cast<size_t>(pos / block_size)];
+            const int block_offset = pos % block_size;
+            const size_t base =
+                (static_cast<size_t>(physical_block) * block_size + block_offset) * kv_hidden +
+                static_cast<size_t>(kv_h) * head_dim;
+            const float* k_vec = k_cache.data() + base;
+
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += q_vec[d] * k_vec[d];
+            }
+            scores[static_cast<size_t>(pos)] = dot * scale;
+        }
+
+        auto probs = reference_softmax(scores);
+        float* out_vec = out.data() + h * head_dim;
+        for (int pos = 0; pos < seq_len; ++pos) {
+            const int physical_block = block_table[static_cast<size_t>(pos / block_size)];
+            const int block_offset = pos % block_size;
+            const size_t base =
+                (static_cast<size_t>(physical_block) * block_size + block_offset) * kv_hidden +
+                static_cast<size_t>(kv_h) * head_dim;
+            const float* v_vec = v_cache.data() + base;
+            for (int d = 0; d < head_dim; ++d) {
+                out_vec[d] += probs[static_cast<size_t>(pos)] * v_vec[d];
+            }
+        }
+    }
+    return out;
+}
+
 void test_cuda_elementwise() {
     const std::vector<float> a{1.0f, -2.0f, 3.5f, 0.0f, 5.0f};
     const std::vector<float> b{2.0f, 4.0f, -1.5f, 7.0f, 0.5f};
@@ -334,6 +380,66 @@ void test_cuda_sdpa_gqa() {
     std::cout << "  PASS test_cuda_sdpa_gqa\n";
 }
 
+void test_cuda_paged_attention_decode_gqa() {
+    const int seq_len = 5;
+    const int num_heads = 4;
+    const int num_kv_heads = 2;
+    const int head_dim = 2;
+    const int block_size = 2;
+    const int max_blocks = 4;
+    const int kv_hidden = num_kv_heads * head_dim;
+    const std::vector<int> block_table{2, 0, 3};
+
+    const std::vector<float> q{
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        0.5f, 0.5f,
+        -0.5f, 1.0f,
+    };
+    std::vector<float> k_cache(
+        static_cast<size_t>(max_blocks) * block_size * kv_hidden, -99.0f);
+    std::vector<float> v_cache(k_cache.size(), 99.0f);
+
+    for (int pos = 0; pos < seq_len; ++pos) {
+        const int physical_block = block_table[static_cast<size_t>(pos / block_size)];
+        const int block_offset = pos % block_size;
+        for (int h = 0; h < num_kv_heads; ++h) {
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t dst =
+                    (static_cast<size_t>(physical_block) * block_size + block_offset) *
+                    kv_hidden + static_cast<size_t>(h) * head_dim + d;
+                k_cache[dst] = 0.1f * static_cast<float>(pos + 1) +
+                               0.2f * static_cast<float>(h + 1) +
+                               0.05f * static_cast<float>(d);
+                v_cache[dst] = static_cast<float>(10 * (h + 1) + pos * 3 + d);
+            }
+        }
+    }
+
+    DeviceBuffer<float> dq(q.size()), dk(k_cache.size()), dv(v_cache.size()),
+        dout(static_cast<size_t>(num_heads) * head_dim);
+    DeviceBuffer<int> dtable(block_table.size());
+    dq.copy_from(q);
+    dk.copy_from(k_cache);
+    dv.copy_from(v_cache);
+    dtable.copy_from(block_table);
+
+    check_status(cuda::paged_attention_decode(
+        dq.get(), dk.get(), dv.get(), dtable.get(), dout.get(), seq_len,
+        num_heads, num_kv_heads, head_dim, block_size));
+    sync_ok();
+
+    auto out = dout.copy_to_host();
+    auto expected = reference_paged_decode(q, k_cache, v_cache, block_table,
+                                           seq_len, num_heads, num_kv_heads,
+                                           head_dim, block_size);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        assert_near(out[i], expected[i], 1e-3f);
+    }
+
+    std::cout << "  PASS test_cuda_paged_attention_decode_gqa\n";
+}
+
 void test_cuda_executor_linear_bias() {
     Graph graph;
     GraphBuilder gb(graph);
@@ -395,6 +501,7 @@ int main() {
     test_cuda_gemm_and_bias();
     test_cuda_norm_embedding_rope_softmax_transpose();
     test_cuda_sdpa_gqa();
+    test_cuda_paged_attention_decode_gqa();
     test_cuda_executor_linear_bias();
     std::cout << "All tests passed!\n";
     return 0;
