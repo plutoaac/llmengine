@@ -52,7 +52,8 @@ public:
 
     std::expected<ValueId, Status> rope(
         ValueId x, int64_t num_heads, int64_t head_dim,
-        std::string name);
+        double rope_base = 10000.0,
+        std::string name = "");
 
     std::expected<ValueId, Status> attention(
         ValueId q, ValueId k, ValueId v, bool causal,

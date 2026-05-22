@@ -35,8 +35,8 @@ struct GGUFTensorInfo {
     std::vector<int64_t> dimensions; // row-major (reversed from GGUF column-major)
     uint64_t offset{0};              // relative to data region start
 
-    size_t num_elements() const;
-    size_t bytes() const;
+    std::expected<size_t, Status> num_elements() const;
+    std::expected<size_t, Status> bytes() const;
 };
 
 struct GGUFFile {

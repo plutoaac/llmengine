@@ -1,8 +1,21 @@
 #include "minillm/core/shape.h"
+#include <climits>
+#include <limits>
+#include <stdexcept>
 
 namespace minillm {
 
-Shape::Shape(std::vector<int64_t> dims) : dims_(std::move(dims)) {}
+Shape::Shape(std::vector<int64_t> dims) : dims_(std::move(dims)) {
+    for (auto d : dims_) {
+        if (d < 0 && d != -1) {
+            throw std::invalid_argument(
+                "Shape dimension must be >= 0 or -1 (dynamic), got: " + std::to_string(d));
+        }
+        if (d == 0) {
+            throw std::invalid_argument("Shape dimension must not be zero");
+        }
+    }
+}
 
 size_t Shape::rank() const { return dims_.size(); }
 
@@ -26,6 +39,10 @@ std::expected<size_t, Status> Shape::numel() const {
     }
     size_t n = 1;
     for (auto d : dims_) {
+        if (d > 0 && n > std::numeric_limits<size_t>::max() / static_cast<size_t>(d)) {
+            return std::unexpected(Status::invalid_argument(
+                "numel overflow for shape: " + to_string()));
+        }
         n *= static_cast<size_t>(d);
     }
     return n;

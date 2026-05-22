@@ -4,6 +4,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <limits>
 
 #if defined(MINILLM_ENABLE_CUDA)
 #include <cuda_runtime.h>
@@ -53,13 +54,19 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
         return Status::runtime_error("tensor not allocated: " + tensor.name());
     }
 
-    const size_t raw_bytes = ti.bytes();
+    auto raw_bytes_exp = ti.bytes();
+    if (!raw_bytes_exp) return raw_bytes_exp.error();
+    const size_t raw_bytes = *raw_bytes_exp;
+
     std::vector<std::byte> raw_buf(raw_bytes);
     auto st = GGUFParser::read_tensor_data(
         gguf_path, file.data_offset, ti.offset, raw_buf.data(), raw_bytes);
     if (!st.ok()) return st;
 
-    const size_t num_el = ti.num_elements();
+    auto num_el_exp = ti.num_elements();
+    if (!num_el_exp) return num_el_exp.error();
+    const size_t num_el = *num_el_exp;
+
     if (tensor.device().type == DeviceType::CUDA) {
 #if defined(MINILLM_ENABLE_CUDA)
         std::vector<float> staging(num_el);
@@ -130,7 +137,7 @@ static float f16_to_f32(uint16_t bits) {
     if (exp == 0) {
         if (mant == 0) return sign ? -0.0f : 0.0f;
         // Subnormal: normalize
-        int shift = __builtin_clz(mant) - 21;
+        int shift = std::countl_zero(mant) - 21;
         mant <<= shift;
         exp = 1 - shift;
         uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | ((mant & 0x3FF) << 13);
@@ -229,6 +236,9 @@ std::expected<TransformerConfig, Status> WeightLoader::extract_config(
         }
     }
 
+    // RoPE base frequency
+    cfg.rope_base = read_int("attention.rope.freq_base", 10000);
+
     return cfg;
 }
 
@@ -261,7 +271,19 @@ std::expected<std::string, Status> WeightLoader::gguf_name_to_value_name(
     if (gguf_name.starts_with("blk.")) {
         auto dot_pos = gguf_name.find('.', 4);
         if (dot_pos != std::string::npos) {
-            int layer_idx = std::stoi(gguf_name.substr(4, dot_pos - 4));
+            std::string idx_str = gguf_name.substr(4, dot_pos - 4);
+            int layer_idx = 0;
+            try {
+                size_t pos = 0;
+                layer_idx = std::stoi(idx_str, &pos);
+                if (pos != idx_str.size()) {
+                    return std::unexpected(Status::invalid_argument(
+                        "non-numeric layer index in GGUF tensor: " + gguf_name));
+                }
+            } catch (const std::exception&) {
+                return std::unexpected(Status::invalid_argument(
+                    "invalid layer index in GGUF tensor: " + gguf_name));
+            }
             std::string suffix = gguf_name.substr(dot_pos + 1);
             for (const auto& [gguf_suffix, value_name] : layer_suffixes) {
                 if (suffix == gguf_suffix) {

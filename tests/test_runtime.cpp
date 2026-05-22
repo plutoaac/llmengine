@@ -73,6 +73,24 @@ void test_sampler_top_tokens() {
     std::cout << "  PASS test_sampler_top_tokens\n";
 }
 
+void test_sampler_all_negative_infinity() {
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    float logits[] = {neg_inf, neg_inf, neg_inf, neg_inf};
+    SamplingConfig cfg;
+    cfg.greedy = true;
+
+    Sampler sampler(123);
+    assert(sampler.sample(logits, 4, cfg) == 0);
+
+    auto top = sampler.get_top_tokens(logits, 4, cfg, 2);
+    assert(top.size() == 2);
+    for (const auto& item : top) {
+        assert(std::isfinite(item.second));
+        assert(std::abs(item.second - 0.25f) < 1e-6f);
+    }
+    std::cout << "  PASS test_sampler_all_negative_infinity\n";
+}
+
 void test_sampler_invalid_inputs() {
     SamplingConfig cfg;
     Sampler sampler(123);
@@ -419,6 +437,7 @@ int main() {
     std::cout << "test_runtime:\n";
     test_sampler_greedy();
     test_sampler_top_tokens();
+    test_sampler_all_negative_infinity();
     test_sampler_invalid_inputs();
     test_kv_cache_bounds();
     test_kv_cache_executor_advance_and_decode_attention();

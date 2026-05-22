@@ -7,7 +7,6 @@ namespace minillm {
 enum class DeviceType {
     CPU,
     CUDA,
-    Metal,
     Unknown,
 };
 
@@ -17,7 +16,6 @@ struct Device {
 
     static Device cpu() { return {DeviceType::CPU, 0}; }
     static Device cuda(int idx) { return {DeviceType::CUDA, idx}; }
-    static Device metal(int idx) { return {DeviceType::Metal, idx}; }
 
     std::string to_string() const;
     bool operator==(const Device& other) const = default;

@@ -228,14 +228,15 @@ In this example `a` and `c` can share a buffer because `a.last_node < c.first_no
 
 ### Buffer Assignment
 
-The planner uses a conservative greedy policy:
+The planner uses a conservative best-fit policy:
 
 1. sort eligible ranges by first use
-2. find an existing buffer with matching dtype/device
-3. require `buffer.last_use < range.first_node`
-4. require the buffer to be large enough
-5. choose the smallest sufficient buffer
-6. otherwise allocate a new logical buffer
+2. keep live buffers ordered by `last_use`
+3. move newly-free buffers into per-pool free sets keyed by dtype and device
+4. use `lower_bound` to find the smallest buffer large enough for the current range
+5. otherwise allocate a new logical buffer
+
+This keeps matching at O(n log n) instead of scanning all previous buffers for every range.
 
 The output is a `MemoryPlan` containing:
 
@@ -259,7 +260,7 @@ Graph memory plan:
   reuse saving: 58.3%
 ```
 
-`RuntimeContext::allocate_intermediates_planned()` consumes this plan. For each logical buffer it allocates one aligned CPU arena block, then creates normal `Tensor` objects whose data pointers reference that block. Values with non-overlapping live ranges can therefore have different shapes but the same backing pointer. Constants and model weights are still externally bound, and outputs are kept separately by default so callers can safely read them after execution.
+`RuntimeContext::allocate_intermediates_planned()` consumes this plan. Buffers with the same dtype and device are placed into one contiguous arena, then normal `Tensor` objects point at `arena_base + buffer.offset`. Values with non-overlapping live ranges can therefore have different shapes but the same backing pointer. Constants and model weights are still externally bound, and outputs are kept separately by default so callers can safely read them after execution.
 
 ## CPU Backend
 
@@ -508,6 +509,8 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU arena binding, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
+| `test_transformer_graph_builder` | transformer weight naming and RoPE base propagation |
+| `test_bpe_tokenizer` | tokenizer initialization and boundary behavior |
 | `test_cuda_kernels` | CUDA kernels, single/batched CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
 
 The important split is:
@@ -515,6 +518,7 @@ The important split is:
 - kernel tests catch numerical bugs in primitive ops
 - runtime tests catch graph/context/executor integration bugs
 - GGUF tests catch model loading regressions
+- tokenizer and model-builder tests protect the GGUF-to-graph integration surface
 
 ## Current Limitations
 
@@ -566,6 +570,7 @@ This project is useful to discuss:
 - why PagedAttention uses block tables instead of one large contiguous cache per sequence
 - how a scheduler turns multiple paged KV block tables into one batch for decode
 - how GGUF metadata and tensor loading fit into inference
+- how parser bounds checks prevent malformed model files from turning into unsafe allocations
 - how a CPU backend can be mirrored by an optional CUDA backend
 - how CUDA paged decode reads K/V through device block tables
 - how CUDA generation uses a device-side contiguous KV cache for prefill/decode

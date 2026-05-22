@@ -284,11 +284,17 @@ void sdpa(const float* Q, const float* K, const float* V, float* output,
             }
 
             // Normalize
-            vfloat vinv = VF_SET1(1.0f / sum);
-            ki = 0;
-            for (; ki + MINILLM_SIMD_WIDTH <= kv_len; ki += MINILLM_SIMD_WIDTH)
-                VF_STORE(row + ki, VF_MUL(VF_LOAD(row + ki), vinv));
-            for (; ki < kv_len; ++ki) row[ki] /= sum;
+            if (!std::isfinite(sum) || sum <= 0.0f) {
+                // All positions masked: uniform distribution
+                float uniform = 1.0f / static_cast<float>(kv_len);
+                for (int j = 0; j < kv_len; ++j) row[j] = uniform;
+            } else {
+                vfloat vinv = VF_SET1(1.0f / sum);
+                ki = 0;
+                for (; ki + MINILLM_SIMD_WIDTH <= kv_len; ki += MINILLM_SIMD_WIDTH)
+                    VF_STORE(row + ki, VF_MUL(VF_LOAD(row + ki), vinv));
+                for (; ki < kv_len; ++ki) row[ki] /= sum;
+            }
         }
 
         // attn @ V
@@ -349,9 +355,15 @@ void sdpa_decode(const float* Q, const float* K, const float* V, float* output,
             scores[ki] = std::exp(scores[ki] - max_val);
             sum += scores[ki];
         }
-        float inv_sum = 1.0f / sum;
-        for (int ki = 0; ki < kv_len; ++ki)
-            scores[ki] *= inv_sum;
+        // Softmax normalize
+        if (!std::isfinite(sum) || sum <= 0.0f) {
+            float uniform = 1.0f / static_cast<float>(kv_len);
+            for (int ki = 0; ki < kv_len; ++ki) scores[ki] = uniform;
+        } else {
+            float inv_sum = 1.0f / sum;
+            for (int ki = 0; ki < kv_len; ++ki)
+                scores[ki] *= inv_sum;
+        }
 
         // Weighted sum of V
         float* o_vec = output + h * head_dim;
@@ -403,11 +415,16 @@ void softmax(const float* x, float* y, int rows, int cols) {
         }
 
         // Normalize
-        vfloat vinv = VF_SET1(1.0f / sum);
-        c = 0;
-        for (; c + MINILLM_SIMD_WIDTH <= cols; c += MINILLM_SIMD_WIDTH)
-            VF_STORE(y_row + c, VF_MUL(VF_LOAD(y_row + c), vinv));
-        for (; c < cols; ++c) y_row[c] /= sum;
+        if (!std::isfinite(sum) || sum <= 0.0f) {
+            float uniform = 1.0f / static_cast<float>(cols);
+            for (int j = 0; j < cols; ++j) y_row[j] = uniform;
+        } else {
+            vfloat vinv = VF_SET1(1.0f / sum);
+            c = 0;
+            for (; c + MINILLM_SIMD_WIDTH <= cols; c += MINILLM_SIMD_WIDTH)
+                VF_STORE(y_row + c, VF_MUL(VF_LOAD(y_row + c), vinv));
+            for (; c < cols; ++c) y_row[c] /= sum;
+        }
     }
 }
 

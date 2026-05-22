@@ -401,7 +401,11 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         for (int h = 0; h < num_heads; ++h) {
             const float* x_head = x_data + s * hidden + h * head_dim;
             float* o_head = o_data + s * hidden + h * head_dim;
-            cpu::apply_rope(x_head, o_head, 1, static_cast<int>(head_dim), 10000.0f, pos_offset + s);
+            float rope_base = 10000.0f;
+            if (auto rb_attr = node.get_attr("rope_base"); rb_attr) {
+                if (auto* rb = std::get_if<double>(&*rb_attr)) rope_base = static_cast<float>(*rb);
+            }
+            cpu::apply_rope(x_head, o_head, 1, static_cast<int>(head_dim), rope_base, pos_offset + s);
         }
     }
     return Status::make_ok();

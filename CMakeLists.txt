@@ -159,6 +159,10 @@ add_minillm_test(test_paged_attention_scheduler)
 add_minillm_test(test_gguf_parser)
 target_link_libraries(test_gguf_parser PRIVATE minillm_io)
 
+add_minillm_test(test_transformer_graph_builder)
+add_minillm_test(test_bpe_tokenizer)
+target_link_libraries(test_bpe_tokenizer PRIVATE minillm_io)
+
 if(MINILLM_ENABLE_CUDA)
     add_executable(test_cuda_kernels tests/test_cuda_kernels.cpp)
     target_link_libraries(test_cuda_kernels PRIVATE minillm_model CUDA::cudart)

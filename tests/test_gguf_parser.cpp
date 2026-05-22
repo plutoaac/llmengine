@@ -413,13 +413,15 @@ void test_read_tensor_data() {
     ASSERT_TRUE(result.has_value());
 
     auto& ti = result->tensor_infos[0];
-    ASSERT_EQ(ti.num_elements(), size_t(6));
-    ASSERT_EQ(ti.bytes(), size_t(24));
+    ASSERT_TRUE(ti.num_elements().has_value());
+    ASSERT_EQ(*ti.num_elements(), size_t(6));
+    ASSERT_TRUE(ti.bytes().has_value());
+    ASSERT_EQ(*ti.bytes(), size_t(24));
 
     std::vector<float> read_buf(6);
     auto st = GGUFParser::read_tensor_data(
         path, result->data_offset, ti.offset,
-        read_buf.data(), ti.bytes());
+        read_buf.data(), *ti.bytes());
     ASSERT_TRUE(st.ok());
 
     for (size_t i = 0; i < 6; ++i) {
@@ -542,7 +544,8 @@ void test_f16_tensor_read() {
 
     // Read raw data and dequantize
     auto& ti = result->tensor_infos[0];
-    size_t raw_bytes = ti.bytes();
+    ASSERT_TRUE(ti.bytes().has_value());
+    size_t raw_bytes = *ti.bytes();
     std::vector<std::byte> raw_buf(raw_bytes);
     auto st = GGUFParser::read_tensor_data(
         path, result->data_offset, ti.offset, raw_buf.data(), raw_bytes);
@@ -575,9 +578,10 @@ void test_bf16_tensor_read() {
     ASSERT_EQ(result->tensor_infos[0].dtype, GgmlDataType::BF16);
 
     auto& ti = result->tensor_infos[0];
-    std::vector<std::byte> raw_buf(ti.bytes());
+    ASSERT_TRUE(ti.bytes().has_value());
+    std::vector<std::byte> raw_buf(*ti.bytes());
     auto st = GGUFParser::read_tensor_data(
-        path, result->data_offset, ti.offset, raw_buf.data(), ti.bytes());
+        path, result->data_offset, ti.offset, raw_buf.data(), *ti.bytes());
     ASSERT_TRUE(st.ok());
 
     std::vector<float> f32_out(4);

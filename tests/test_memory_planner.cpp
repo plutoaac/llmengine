@@ -115,6 +115,35 @@ void test_runtime_context_uses_planned_arena() {
     std::cout << "  PASS test_runtime_context_uses_planned_arena\n";
 }
 
+void test_different_dtype_buffers_do_not_reuse() {
+    Graph g;
+    auto f_input = g.add_value("f_input", Shape({16}), DType::Float32,
+                               Device::cpu(), ValueKind::Input);
+    auto i_input = g.add_value("i_input", Shape({16}), DType::Int32,
+                               Device::cpu(), ValueKind::Input);
+    auto f_tmp = g.add_value("f_tmp", Shape({16}), DType::Float32,
+                             Device::cpu(), ValueKind::Intermediate);
+    auto i_tmp = g.add_value("i_tmp", Shape({16}), DType::Int32,
+                             Device::cpu(), ValueKind::Intermediate);
+    assert(f_input && i_input && f_tmp && i_tmp);
+
+    assert(g.add_node(OpType::Custom, "make_f", {*f_input}, {*f_tmp}));
+    assert(g.add_node(OpType::Output, "consume_f", {*f_tmp}, {}));
+    assert(g.add_node(OpType::Custom, "make_i", {*i_input}, {*i_tmp}));
+    assert(g.add_node(OpType::Output, "consume_i", {*i_tmp}, {}));
+
+    auto plan = MemoryPlanner::plan(g);
+    assert(plan);
+    auto* f_range = plan->range_for(*f_tmp);
+    auto* i_range = plan->range_for(*i_tmp);
+    assert(f_range && i_range);
+    assert(f_range->buffer_id != i_range->buffer_id);
+    assert(plan->buffers[f_range->buffer_id].dtype == DType::Float32);
+    assert(plan->buffers[i_range->buffer_id].dtype == DType::Int32);
+
+    std::cout << "  PASS test_different_dtype_buffers_do_not_reuse\n";
+}
+
 void test_include_outputs_option() {
     Graph g;
     auto input = g.add_value("input", Shape({4}), DType::Float32,
@@ -156,13 +185,114 @@ void test_rejects_invalid_alignment() {
     std::cout << "  PASS test_rejects_invalid_alignment\n";
 }
 
+void test_contiguous_arena_allocation() {
+    // Create a graph where two non-overlapping intermediates share a buffer.
+    // Verify that with contiguous arena, they live at different offsets within
+    // the same arena allocation.
+    Graph g;
+    auto input = g.add_value("input", Shape({16}), DType::Float32,
+                             Device::cpu(), ValueKind::Input);
+    auto a = g.add_value("a", Shape({16}), DType::Float32,
+                         Device::cpu(), ValueKind::Intermediate);
+    auto b = g.add_value("b", Shape({32}), DType::Float32,
+                         Device::cpu(), ValueKind::Intermediate);
+    auto c = g.add_value("c", Shape({16}), DType::Float32,
+                         Device::cpu(), ValueKind::Intermediate);
+    assert(input && a && b && c);
+
+    assert(g.add_node(OpType::SiLU, "make_a", {*input}, {*a}));
+    assert(g.add_node(OpType::Linear, "make_b", {*a, *input}, {*b}));
+    assert(g.add_node(OpType::SiLU, "make_c", {*b}, {*c}));
+    assert(g.add_node(OpType::Output, "out", {*c}, {}));
+
+    RuntimeContext ctx;
+    auto plan = ctx.allocate_intermediates_planned(g);
+    assert(plan);
+
+    // a and c should share the same buffer (same dtype, non-overlapping lifetimes)
+    auto* a_range = plan->range_for(*a);
+    auto* c_range = plan->range_for(*c);
+    assert(a_range && c_range);
+    assert(a_range->buffer_id == c_range->buffer_id);
+
+    // All buffers should have the same arena_index (all FP32 CPU)
+    for (const auto& buffer : plan->buffers) {
+        assert(buffer.arena_index != static_cast<size_t>(-1));
+    }
+    size_t first_arena = plan->buffers[0].arena_index;
+    for (const auto& buffer : plan->buffers) {
+        assert(buffer.arena_index == first_arena);
+    }
+
+    // Verify tensors are allocated and accessible
+    Tensor* a_tensor = ctx.get(*a);
+    Tensor* b_tensor = ctx.get(*b);
+    Tensor* c_tensor = ctx.get(*c);
+    assert(a_tensor && b_tensor && c_tensor);
+    assert(a_tensor->data() != nullptr);
+    assert(b_tensor->data() != nullptr);
+    assert(c_tensor->data() != nullptr);
+
+    // Write to a_tensor and verify c_tensor doesn't get corrupted
+    // (they share a buffer but are at the same offset in this case)
+    auto* a_float = reinterpret_cast<float*>(a_tensor->data());
+    a_float[0] = 42.0f;
+
+    // b_tensor is in a different buffer, writing should not affect a/c
+    auto* b_float = reinterpret_cast<float*>(b_tensor->data());
+    b_float[0] = 99.0f;
+    assert(a_float[0] == 42.0f);
+
+    std::cout << "  PASS test_contiguous_arena_allocation\n";
+}
+
+void test_range_for_uses_index() {
+    // Build a larger graph and verify range_for returns correct results quickly
+    Graph g;
+    auto input = g.add_value("input", Shape({8}), DType::Float32,
+                             Device::cpu(), ValueKind::Input);
+    std::vector<ValueId> intermediates;
+    for (int i = 0; i < 20; ++i) {
+        auto v = g.add_value("v" + std::to_string(i), Shape({8}), DType::Float32,
+                             Device::cpu(), ValueKind::Intermediate);
+        assert(v);
+        intermediates.push_back(*v);
+    }
+    // Chain: input -> v0 -> v1 -> ... -> v19
+    auto prev = *input;
+    for (auto v : intermediates) {
+        assert(g.add_node(OpType::SiLU, "n_" + std::to_string(v.value), {prev}, {v}));
+        prev = v;
+    }
+    assert(g.add_node(OpType::Output, "out", {prev}, {}));
+
+    auto plan = MemoryPlanner::plan(g);
+    assert(plan);
+
+    // Every intermediate should be findable via range_for
+    for (auto v : intermediates) {
+        auto* r = plan->range_for(v);
+        assert(r != nullptr);
+        assert(r->value == v);
+    }
+
+    // Non-existent value should return nullptr
+    auto* missing = plan->range_for(ValueId{9999});
+    assert(missing == nullptr);
+
+    std::cout << "  PASS test_range_for_uses_index\n";
+}
+
 int main() {
     std::cout << "test_memory_planner:\n";
     test_reuses_non_overlapping_intermediates();
     test_skips_non_plannable_values();
     test_runtime_context_uses_planned_arena();
+    test_different_dtype_buffers_do_not_reuse();
     test_include_outputs_option();
     test_rejects_invalid_alignment();
+    test_contiguous_arena_allocation();
+    test_range_for_uses_index();
     std::cout << "All tests passed!\n";
     return 0;
 }

@@ -40,17 +40,28 @@ int32_t Sampler::sample(const float* logits, int32_t vocab_size,
     // Find max for numerical stability
     float max_val = *std::max_element(probs.begin(), probs.end());
 
-    // Compute exp(logit - max) and sum
     std::vector<float> exp_vals(vocab_size);
-    float sum = 0.0f;
-    for (int32_t i = 0; i < vocab_size; ++i) {
-        exp_vals[i] = std::exp(probs[i] - max_val);
-        sum += exp_vals[i];
-    }
+    if (!std::isfinite(max_val)) {
+        float uniform = 1.0f / static_cast<float>(vocab_size);
+        for (float& v : exp_vals) v = uniform;
+    } else {
+        // Compute exp(logit - max) and sum
+        float sum = 0.0f;
+        for (int32_t i = 0; i < vocab_size; ++i) {
+            exp_vals[i] = std::exp(probs[i] - max_val);
+            sum += exp_vals[i];
+        }
 
-    // Normalize
-    float inv_sum = 1.0f / sum;
-    for (float& v : exp_vals) v *= inv_sum;
+        // Normalize
+        if (!std::isfinite(sum) || sum <= 0.0f) {
+            // All logits were -inf or degenerate: uniform distribution
+            float uniform = 1.0f / static_cast<float>(vocab_size);
+            for (float& v : exp_vals) v = uniform;
+        } else {
+            float inv_sum = 1.0f / sum;
+            for (float& v : exp_vals) v *= inv_sum;
+        }
+    }
 
     // Build indexed array for sorting
     struct TokenProb { int32_t id; float prob; };
@@ -110,13 +121,20 @@ int32_t Sampler::sample(const float* logits, int32_t vocab_size,
     // Stochastic: renormalize and sample
     float renorm_sum = 0.0f;
     for (const auto& c : candidates) renorm_sum += c.prob;
-    float inv_renorm = 1.0f / renorm_sum;
+    if (renorm_sum <= 0.0f) {
+        // All candidates have zero probability: uniform over candidates
+        float uniform = 1.0f / static_cast<float>(candidates.size());
+        for (auto& c : candidates) c.prob = uniform;
+    } else {
+        float inv_renorm = 1.0f / renorm_sum;
+        for (auto& c : candidates) c.prob *= inv_renorm;
+    }
 
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng_);
     float cumsum = 0.0f;
     for (const auto& c : candidates) {
-        cumsum += c.prob * inv_renorm;
+        cumsum += c.prob;
         if (cumsum >= r) return c.id;
     }
     return candidates.back().id;
@@ -136,21 +154,32 @@ std::vector<std::pair<int32_t, float>> Sampler::get_top_tokens(
         for (float& v : scaled) v *= inv_temp;
     }
 
-    // Softmax
     float max_val = *std::max_element(scaled.begin(), scaled.end());
     std::vector<float> exp_vals(vocab_size);
-    float sum = 0.0f;
-    for (int32_t i = 0; i < vocab_size; ++i) {
-        exp_vals[i] = std::exp(scaled[i] - max_val);
-        sum += exp_vals[i];
+    if (!std::isfinite(max_val)) {
+        float uniform = 1.0f / static_cast<float>(vocab_size);
+        for (float& v : exp_vals) v = uniform;
+    } else {
+        // Softmax
+        float sum = 0.0f;
+        for (int32_t i = 0; i < vocab_size; ++i) {
+            exp_vals[i] = std::exp(scaled[i] - max_val);
+            sum += exp_vals[i];
+        }
+        if (!std::isfinite(sum) || sum <= 0.0f) {
+            float uniform = 1.0f / static_cast<float>(vocab_size);
+            for (float& v : exp_vals) v = uniform;
+        } else {
+            float inv_sum = 1.0f / sum;
+            for (float& v : exp_vals) v *= inv_sum;
+        }
     }
-    float inv_sum = 1.0f / sum;
 
     struct TokenProb { int32_t id; float prob; };
     std::vector<TokenProb> candidates;
     candidates.reserve(vocab_size);
     for (int32_t i = 0; i < vocab_size; ++i) {
-        candidates.push_back({i, exp_vals[i] * inv_sum});
+        candidates.push_back({i, exp_vals[i]});
     }
 
     int32_t n = std::min(top_n, vocab_size);

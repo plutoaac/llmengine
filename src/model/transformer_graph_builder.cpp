@@ -22,39 +22,39 @@ std::expected<ValueId, Status> TransformerGraphBuilder::build_tiny_decoder_block
         Shape({cfg.vocab_size, cfg.hidden_size}), cfg.dtype, dev);
     if (!tok_emb_w) return std::unexpected(tok_emb_w.error());
 
-    auto attn_norm_w = builder_.constant("attn_norm.weight",
+    auto attn_norm_w = builder_.constant("layer_0.attn_norm.weight",
         Shape({cfg.hidden_size}), cfg.dtype, dev);
     if (!attn_norm_w) return std::unexpected(attn_norm_w.error());
 
-    auto q_proj_w = builder_.constant("q_proj.weight",
+    auto q_proj_w = builder_.constant("layer_0.q_proj.weight",
         Shape({cfg.num_heads * cfg.head_dim, cfg.hidden_size}), cfg.dtype, dev);
     if (!q_proj_w) return std::unexpected(q_proj_w.error());
 
-    auto k_proj_w = builder_.constant("k_proj.weight",
+    auto k_proj_w = builder_.constant("layer_0.k_proj.weight",
         Shape({cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size}), cfg.dtype, dev);
     if (!k_proj_w) return std::unexpected(k_proj_w.error());
 
-    auto v_proj_w = builder_.constant("v_proj.weight",
+    auto v_proj_w = builder_.constant("layer_0.v_proj.weight",
         Shape({cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size}), cfg.dtype, dev);
     if (!v_proj_w) return std::unexpected(v_proj_w.error());
 
-    auto o_proj_w = builder_.constant("o_proj.weight",
+    auto o_proj_w = builder_.constant("layer_0.o_proj.weight",
         Shape({cfg.hidden_size, cfg.num_heads * cfg.head_dim}), cfg.dtype, dev);
     if (!o_proj_w) return std::unexpected(o_proj_w.error());
 
-    auto ffn_norm_w = builder_.constant("ffn_norm.weight",
+    auto ffn_norm_w = builder_.constant("layer_0.ffn_norm.weight",
         Shape({cfg.hidden_size}), cfg.dtype, dev);
     if (!ffn_norm_w) return std::unexpected(ffn_norm_w.error());
 
-    auto gate_proj_w = builder_.constant("gate_proj.weight",
+    auto gate_proj_w = builder_.constant("layer_0.gate_proj.weight",
         Shape({cfg.intermediate_size, cfg.hidden_size}), cfg.dtype, dev);
     if (!gate_proj_w) return std::unexpected(gate_proj_w.error());
 
-    auto up_proj_w = builder_.constant("up_proj.weight",
+    auto up_proj_w = builder_.constant("layer_0.up_proj.weight",
         Shape({cfg.intermediate_size, cfg.hidden_size}), cfg.dtype, dev);
     if (!up_proj_w) return std::unexpected(up_proj_w.error());
 
-    auto down_proj_w = builder_.constant("down_proj.weight",
+    auto down_proj_w = builder_.constant("layer_0.down_proj.weight",
         Shape({cfg.hidden_size, cfg.intermediate_size}), cfg.dtype, dev);
     if (!down_proj_w) return std::unexpected(down_proj_w.error());
 
@@ -80,10 +80,10 @@ std::expected<ValueId, Status> TransformerGraphBuilder::build_tiny_decoder_block
     auto v = builder_.linear(*normed, *v_proj_w, std::nullopt, "v_proj");
     if (!v) return std::unexpected(v.error());
 
-    auto q_rope = builder_.rope(*q, cfg.num_heads, cfg.head_dim, "rope_q");
+    auto q_rope = builder_.rope(*q, cfg.num_heads, cfg.head_dim, cfg.rope_base, "rope_q");
     if (!q_rope) return std::unexpected(q_rope.error());
 
-    auto k_rope = builder_.rope(*k, cfg.num_kv_heads, cfg.head_dim, "rope_k");
+    auto k_rope = builder_.rope(*k, cfg.num_kv_heads, cfg.head_dim, cfg.rope_base, "rope_k");
     if (!k_rope) return std::unexpected(k_rope.error());
 
     auto attn_out = builder_.attention(*q_rope, *k_rope, *v, true,
@@ -233,10 +233,10 @@ std::expected<ValueId, Status> TransformerGraphBuilder::build_transformer(
             k = *k_normed;
         }
 
-        auto q_rope = builder_.rope(*q, cfg.num_heads, cfg.head_dim, prefix + "rope_q");
+        auto q_rope = builder_.rope(*q, cfg.num_heads, cfg.head_dim, cfg.rope_base, prefix + "rope_q");
         if (!q_rope) return std::unexpected(q_rope.error());
 
-        auto k_rope = builder_.rope(*k, cfg.num_kv_heads, cfg.head_dim, prefix + "rope_k");
+        auto k_rope = builder_.rope(*k, cfg.num_kv_heads, cfg.head_dim, cfg.rope_base, prefix + "rope_k");
         if (!k_rope) return std::unexpected(k_rope.error());
 
         auto attn_out = builder_.attention(*q_rope, *k_rope, *v, true,

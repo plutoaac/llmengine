@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <iomanip>
 #include <limits>
+#include <set>
 #include <sstream>
+#include <unordered_map>
 
 #include "minillm/core/shape.h"
 #include "minillm/graph/graph.h"
@@ -64,10 +66,9 @@ double MemoryPlan::savings_ratio() const {
 }
 
 const MemoryLiveRange* MemoryPlan::range_for(ValueId id) const {
-    for (const auto& range : ranges) {
-        if (range.value == id) return &range;
-    }
-    return nullptr;
+    auto it = range_index_.find(id.value);
+    if (it == range_index_.end()) return nullptr;
+    return &ranges[it->second];
 }
 
 std::string MemoryPlan::report() const {
@@ -233,25 +234,59 @@ std::expected<MemoryPlan, Status> MemoryPlanner::plan(
                   return a.aligned_bytes > b.aligned_bytes;
               });
 
+    // O(n log n) buffer matching: per-pool free lists with multiset best-fit.
+    // Pool key = (dtype, device_type, device_index).
+    struct PoolKey {
+        DType dtype;
+        DeviceType dev_type;
+        int dev_idx;
+        bool operator==(const PoolKey& o) const {
+            return dtype == o.dtype && dev_type == o.dev_type && dev_idx == o.dev_idx;
+        }
+    };
+    struct PoolKeyHash {
+        size_t operator()(const PoolKey& k) const {
+            return static_cast<size_t>(k.dtype) ^
+                   (static_cast<size_t>(k.dev_type) << 8) ^
+                   (static_cast<size_t>(k.dev_idx) << 16);
+        }
+    };
+
+    // Per-pool: multiset of (buffer_bytes, buffer_index) for best-fit lookup.
+    // Buffers that are still live are tracked separately by last_use.
+    struct PoolState {
+        std::multiset<std::pair<size_t, size_t>> free_set; // (bytes, buffer_idx)
+    };
+    std::unordered_map<PoolKey, PoolState, PoolKeyHash> pools;
+    std::multiset<std::pair<size_t, size_t>> live_by_last_use; // (last_use, buffer_idx)
+
     for (size_t range_idx : eligible_indices) {
         auto& range = plan.ranges[range_idx];
-        size_t best = kNoBuffer;
-        size_t best_waste = std::numeric_limits<size_t>::max();
+        PoolKey key{range.dtype, range.device.type, range.device.index};
+        auto& pool = pools[key];
 
-        for (size_t i = 0; i < plan.buffers.size(); ++i) {
-            auto& buffer = plan.buffers[i];
-            if (!same_pool(buffer, range)) continue;
-            if (buffer.last_use >= range.first_node) continue;
-            if (buffer.bytes < range.aligned_bytes) continue;
-
-            const size_t waste = buffer.bytes - range.aligned_bytes;
-            if (waste < best_waste) {
-                best = i;
-                best_waste = waste;
-            }
+        // Move buffers that became free into their own dtype/device pool.
+        while (!live_by_last_use.empty() &&
+               live_by_last_use.begin()->first < range.first_node) {
+            const size_t bi = live_by_last_use.begin()->second;
+            live_by_last_use.erase(live_by_last_use.begin());
+            const auto& buffer = plan.buffers[bi];
+            PoolKey free_key{buffer.dtype, buffer.device.type, buffer.device.index};
+            pools[free_key].free_set.emplace(buffer.bytes, bi);
         }
 
-        if (best == kNoBuffer) {
+        // Best-fit: find smallest buffer with bytes >= range.aligned_bytes
+        auto it = pool.free_set.lower_bound({range.aligned_bytes, 0});
+        if (it != pool.free_set.end()) {
+            size_t bi = it->second;
+            pool.free_set.erase(it);
+            auto& buffer = plan.buffers[bi];
+            buffer.last_use = range.last_node;
+            buffer.values.push_back(range.value);
+            range.buffer_id = buffer.id;
+            live_by_last_use.emplace(buffer.last_use, bi);
+        } else {
+            // No reusable buffer: allocate new
             MemoryBuffer buffer;
             buffer.id = plan.buffers.size();
             buffer.bytes = range.aligned_bytes;
@@ -260,17 +295,57 @@ std::expected<MemoryPlan, Status> MemoryPlanner::plan(
             buffer.last_use = range.last_node;
             buffer.values.push_back(range.value);
             range.buffer_id = buffer.id;
+            const size_t bi = buffer.id;
             plan.buffers.push_back(std::move(buffer));
-        } else {
-            auto& buffer = plan.buffers[best];
-            buffer.last_use = range.last_node;
-            buffer.values.push_back(range.value);
-            range.buffer_id = buffer.id;
+            live_by_last_use.emplace(range.last_node, bi);
         }
     }
 
     for (const auto& buffer : plan.buffers) {
         plan.planned_bytes += buffer.bytes;
+    }
+
+    // Build range_for index
+    plan.range_index_.reserve(plan.ranges.size());
+    for (size_t i = 0; i < plan.ranges.size(); ++i) {
+        plan.range_index_[plan.ranges[i].value.value] = i;
+    }
+
+    // Assign arena layout: group buffers by (dtype, device), assign contiguous offsets.
+    // Buffers in the same arena share one heap allocation at runtime.
+    struct ArenaKey {
+        DType dtype;
+        DeviceType dev_type;
+        int dev_idx;
+        bool operator==(const ArenaKey& o) const {
+            return dtype == o.dtype && dev_type == o.dev_type && dev_idx == o.dev_idx;
+        }
+    };
+    struct ArenaKeyHash {
+        size_t operator()(const ArenaKey& k) const {
+            return static_cast<size_t>(k.dtype) ^
+                   (static_cast<size_t>(k.dev_type) << 8) ^
+                   (static_cast<size_t>(k.dev_idx) << 16);
+        }
+    };
+
+    std::unordered_map<ArenaKey, std::pair<size_t, size_t>, ArenaKeyHash> arena_info;
+    // arena_info maps pool -> (arena_index, current_offset)
+
+    for (auto& buffer : plan.buffers) {
+        ArenaKey key{buffer.dtype, buffer.device.type, buffer.device.index};
+        auto it = arena_info.find(key);
+        if (it == arena_info.end()) {
+            size_t arena_idx = arena_info.size();
+            buffer.arena_index = arena_idx;
+            buffer.offset = 0;
+            arena_info[key] = {arena_idx, buffer.bytes};
+        } else {
+            auto& [arena_idx, offset] = it->second;
+            buffer.arena_index = arena_idx;
+            buffer.offset = align_up(offset, options.alignment);
+            offset = buffer.offset + buffer.bytes;
+        }
     }
 
     return plan;

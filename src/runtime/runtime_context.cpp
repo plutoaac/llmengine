@@ -94,26 +94,55 @@ Status RuntimeContext::allocate_intermediates_with_plan(
     constexpr size_t kNoBuffer = static_cast<size_t>(-1);
     const size_t alignment = plan.alignment == 0 ? size_t{64} : plan.alignment;
 
-    std::vector<std::byte*> buffer_data(plan.buffers.size(), nullptr);
-    std::vector<size_t> buffer_bytes(plan.buffers.size(), 0);
-
-    for (const auto& buffer : plan.buffers) {
-        if (buffer.id >= plan.buffers.size()) {
-            return Status::out_of_range("memory plan buffer id is out of range");
+    // Collect buffers by arena_index. All buffers in the same arena share one
+    // contiguous heap allocation, reducing malloc overhead and fragmentation.
+    std::unordered_map<size_t, std::vector<size_t>> arena_buffers;
+    size_t max_arena = 0;
+    for (size_t bi = 0; bi < plan.buffers.size(); ++bi) {
+        const auto& buffer = plan.buffers[bi];
+        if (buffer.arena_index == kNoBuffer) {
+            return Status::runtime_error("buffer has no arena assignment: #" +
+                                         std::to_string(buffer.id));
         }
-        if (buffer.bytes > std::numeric_limits<size_t>::max() - alignment) {
+        arena_buffers[buffer.arena_index].push_back(bi);
+        max_arena = std::max(max_arena, buffer.arena_index);
+    }
+
+    // For each arena, compute total size = max(offset + bytes) across its buffers
+    // and allocate one contiguous block.
+    std::vector<std::byte*> arena_bases(max_arena + 1, nullptr);
+    std::vector<size_t> arena_total_bytes(max_arena + 1, 0);
+
+    for (auto& [arena_idx, buffer_indices] : arena_buffers) {
+        size_t total = 0;
+        for (size_t bi : buffer_indices) {
+            const auto& buffer = plan.buffers[bi];
+            total = std::max(total, buffer.offset + buffer.bytes);
+        }
+        if (total > std::numeric_limits<size_t>::max() - alignment) {
             return Status::out_of_range("CPU arena allocation size overflow");
         }
 
         CpuArenaBlock block;
-        block.bytes = buffer.bytes;
-        block.storage = std::make_unique<std::byte[]>(buffer.bytes + alignment);
+        block.bytes = total;
+        block.storage = std::make_unique<std::byte[]>(total + alignment);
         block.data = align_pointer(block.storage.get(), alignment);
-        buffer_data[buffer.id] = block.data;
-        buffer_bytes[buffer.id] = buffer.bytes;
+        arena_bases[arena_idx] = block.data;
+        arena_total_bytes[arena_idx] = total;
         cpu_arenas_.push_back(std::move(block));
     }
 
+    // Map each buffer to its data pointer within the arena
+    std::vector<std::byte*> buffer_data(plan.buffers.size(), nullptr);
+    std::vector<size_t> buffer_avail_bytes(plan.buffers.size(), 0);
+    for (size_t bi = 0; bi < plan.buffers.size(); ++bi) {
+        const auto& buffer = plan.buffers[bi];
+        buffer_data[bi] = arena_bases[buffer.arena_index] + buffer.offset;
+        // avail_bytes for bind_cpu_data = bytes from this offset to arena end
+        buffer_avail_bytes[bi] = arena_total_bytes[buffer.arena_index] - buffer.offset;
+    }
+
+    // Bind planned ranges to arena-backed tensors
     for (const auto& range : plan.ranges) {
         if (!range.eligible || range.buffer_id == kNoBuffer) continue;
         if (range.buffer_id >= buffer_data.size() || !buffer_data[range.buffer_id]) {
@@ -127,12 +156,13 @@ Status RuntimeContext::allocate_intermediates_with_plan(
         auto tensor = std::make_unique<Tensor>(
             (*value)->name, (*value)->shape, (*value)->dtype, (*value)->device);
         auto st = tensor->bind_cpu_data(
-            buffer_data[range.buffer_id], buffer_bytes[range.buffer_id]);
+            buffer_data[range.buffer_id], buffer_avail_bytes[range.buffer_id]);
         if (!st.ok()) return st;
         bindings_[range.value.value] = tensor.get();
         owned_.push_back(std::move(tensor));
     }
 
+    // Fallback: allocate non-planned values individually
     for (const auto& v : graph.values()) {
         if (v.kind == ValueKind::Input || v.kind == ValueKind::Constant) continue;
         if (bindings_.count(v.id.value)) continue;

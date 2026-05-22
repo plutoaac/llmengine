@@ -124,6 +124,20 @@ void test_softmax() {
     std::cout << "  PASS test_softmax\n";
 }
 
+void test_softmax_all_negative_infinity() {
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    const float x[] = {neg_inf, neg_inf, neg_inf, neg_inf};
+    float y[4] = {};
+
+    cpu::softmax(x, y, 1, 4);
+
+    for (float v : y) {
+        assert(std::isfinite(v));
+        assert_near(v, 0.25f);
+    }
+    std::cout << "  PASS test_softmax_all_negative_infinity\n";
+}
+
 void test_rope() {
     const float x[] = {1, 2, 3, 4};
     float y[4] = {};
@@ -207,6 +221,7 @@ int main() {
     test_rmsnorm();
     test_silu_swiglu();
     test_softmax();
+    test_softmax_all_negative_infinity();
     test_rope();
     test_transpose();
     test_sdpa_causal();

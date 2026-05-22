@@ -118,7 +118,7 @@ std::expected<ValueId, Status> GraphBuilder::mul(
     if (!av) return std::unexpected(av.error());
     auto bv = get_value(b);
     if (!bv) return std::unexpected(bv.error());
-    auto out_shape = infer_add_shape((*av)->shape, (*bv)->shape);
+    auto out_shape = infer_elementwise_shape((*av)->shape, (*bv)->shape);
     if (!out_shape) return std::unexpected(out_shape.error());
     auto out = make_intermediate(name + ".out", std::move(*out_shape),
                                  (*av)->dtype, (*av)->device);
@@ -171,7 +171,7 @@ std::expected<ValueId, Status> GraphBuilder::swiglu(
     if (!gv) return std::unexpected(gv.error());
     auto uv = get_value(up);
     if (!uv) return std::unexpected(uv.error());
-    auto out_shape = infer_add_shape((*gv)->shape, (*uv)->shape);
+    auto out_shape = infer_elementwise_shape((*gv)->shape, (*uv)->shape);
     if (!out_shape) return std::unexpected(out_shape.error());
     auto out = make_intermediate(name + ".out", std::move(*out_shape),
                                  (*gv)->dtype, (*gv)->device);
@@ -184,7 +184,7 @@ std::expected<ValueId, Status> GraphBuilder::swiglu(
 }
 
 std::expected<ValueId, Status> GraphBuilder::rope(
-    ValueId x, int64_t num_heads, int64_t head_dim, std::string name) {
+    ValueId x, int64_t num_heads, int64_t head_dim, double rope_base, std::string name) {
     auto xv = get_value(x);
     if (!xv) return std::unexpected(xv.error());
     auto out_shape = infer_same_shape_unary((*xv)->shape);
@@ -199,6 +199,7 @@ std::expected<ValueId, Status> GraphBuilder::rope(
     if (auto nd = graph_.mutable_node(*nid); nd) {
         (*nd)->set_attr("num_heads", num_heads);
         (*nd)->set_attr("head_dim", head_dim);
+        (*nd)->set_attr("rope_base", rope_base);
     }
     return out;
 }
@@ -317,9 +318,9 @@ std::expected<ValueId, Status> GraphBuilder::output(
     ValueId x, std::string name) {
     auto xv = get_value(x);
     if (!xv) return std::unexpected(xv.error());
-    if (auto val = graph_.mutable_value(x); val) {
-        (*val)->kind = ValueKind::Output;
-    }
+    auto val = graph_.mutable_value(x);
+    if (!val) return std::unexpected(val.error());
+    (*val)->kind = ValueKind::Output;
     return x;
 }
 

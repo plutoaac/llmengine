@@ -70,25 +70,29 @@ bool Tensor::is_allocated() const {
 void* Tensor::data() {
     if (external_data_) return external_data_;
     if (cuda_storage_) return cuda_storage_;
+    if (storage_.empty()) return nullptr;
     return storage_.data();
 }
 
 const void* Tensor::data() const {
     if (external_data_) return external_data_;
     if (cuda_storage_) return cuda_storage_;
+    if (storage_.empty()) return nullptr;
     return storage_.data();
 }
 
 Status Tensor::allocate_cpu() {
-    auto st = release();
-    if (!st.ok()) return st;
     if (shape_.has_dynamic_dim()) {
         return Status::invalid_argument(
             "cannot allocate tensor with dynamic shape: " + shape_.to_string());
     }
     auto nb = nbytes();
     if (!nb) return nb.error();
-    storage_.resize(*nb);
+    // Allocate new storage before releasing old to maintain exception safety
+    std::vector<std::byte> new_storage(*nb);
+    auto st = release();
+    if (!st.ok()) return st;
+    storage_ = std::move(new_storage);
     device_ = Device::cpu();
     return Status::make_ok();
 }

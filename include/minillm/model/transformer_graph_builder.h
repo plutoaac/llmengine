@@ -23,6 +23,7 @@ struct TransformerConfig {
     int64_t num_kv_heads = 12;
     int64_t head_dim = 64;
     double rms_norm_eps = 1e-6;
+    double rope_base = 10000.0;
     bool use_qk_norm = false;
     DType dtype = DType::Float32;
     Device device = Device::cpu();

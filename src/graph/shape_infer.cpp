@@ -45,6 +45,23 @@ std::expected<Shape, Status> infer_linear_shape(const Shape& x, const Shape& wei
     return Shape(std::move(out_dims));
 }
 
+std::expected<Shape, Status> infer_elementwise_shape(const Shape& a, const Shape& b) {
+    if (a.rank() != b.rank()) {
+        return std::unexpected(Status::shape_mismatch(
+            "Elementwise op requires same rank: " + a.to_string() +
+            " vs " + b.to_string()));
+    }
+    for (size_t i = 0; i < a.rank(); ++i) {
+        auto da = a.dim(i), db = b.dim(i);
+        if (da >= 0 && db >= 0 && da != db) {
+            return std::unexpected(Status::shape_mismatch(
+                "Elementwise dim mismatch at axis " + std::to_string(i) + ": " +
+                a.to_string() + " vs " + b.to_string()));
+        }
+    }
+    return a;
+}
+
 std::expected<Shape, Status> infer_add_shape(const Shape& a, const Shape& b) {
     if (a.rank() != b.rank()) {
         return std::unexpected(Status::shape_mismatch(

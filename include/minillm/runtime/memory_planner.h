@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <expected>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "minillm/core/device.h"
@@ -40,6 +41,8 @@ struct MemoryBuffer {
     DType dtype = DType::Unknown;
     Device device = Device::cpu();
     size_t last_use = 0;
+    size_t arena_index = static_cast<size_t>(-1);
+    size_t offset = 0;
     std::vector<ValueId> values;
 };
 
@@ -55,6 +58,11 @@ struct MemoryPlan {
     double savings_ratio() const;
     const MemoryLiveRange* range_for(ValueId id) const;
     std::string report() const;
+
+private:
+    // O(1) lookup: ValueId.value -> index into ranges
+    std::unordered_map<size_t, size_t> range_index_;
+    friend class MemoryPlanner;
 };
 
 class MemoryPlanner {

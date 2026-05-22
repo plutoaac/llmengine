@@ -2,17 +2,35 @@
 
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 namespace minillm {
 
-size_t GGUFTensorInfo::num_elements() const {
+std::expected<size_t, Status> GGUFTensorInfo::num_elements() const {
     size_t n = 1;
-    for (auto d : dimensions) n *= static_cast<size_t>(d);
+    for (auto d : dimensions) {
+        if (d <= 0) {
+            return std::unexpected(Status::invalid_argument(
+                "invalid non-positive dimension for tensor: " + name));
+        }
+        if (n > std::numeric_limits<size_t>::max() / static_cast<size_t>(d)) {
+            return std::unexpected(Status::invalid_argument(
+                "numel overflow for tensor: " + name));
+        }
+        n *= static_cast<size_t>(d);
+    }
     return n;
 }
 
-size_t GGUFTensorInfo::bytes() const {
-    return num_elements() * ggml_dtype_size(dtype);
+std::expected<size_t, Status> GGUFTensorInfo::bytes() const {
+    auto ne = num_elements();
+    if (!ne) return std::unexpected(ne.error());
+    size_t elem_size = ggml_dtype_size(dtype);
+    if (*ne > std::numeric_limits<size_t>::max() / elem_size) {
+        return std::unexpected(Status::invalid_argument(
+            "byte size overflow for tensor: " + name));
+    }
+    return *ne * elem_size;
 }
 
 std::expected<MetadataValue, Status> get_metadata(
@@ -96,6 +114,15 @@ std::expected<double, Status> GGUFParser::read_f64_le(std::ifstream& f) {
 std::expected<std::string, Status> GGUFParser::read_string(std::ifstream& f) {
     auto len = read_u64_le(f);
     if (!len) return std::unexpected(len.error());
+    constexpr uint64_t max_string_len = 64 * 1024 * 1024; // 64 MiB safety limit
+    if (*len > max_string_len) {
+        return std::unexpected(Status::invalid_argument(
+            "GGUF string too long: " + std::to_string(*len) + " bytes"));
+    }
+    if (*len > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        return std::unexpected(Status::invalid_argument(
+            "GGUF string length overflows streamsize: " + std::to_string(*len)));
+    }
     std::string str(static_cast<size_t>(*len), '\0');
     if (*len > 0 && !f.read(str.data(), static_cast<std::streamsize>(*len)))
         return std::unexpected(Status::io_error("failed to read string"));
@@ -144,6 +171,11 @@ std::expected<MetadataValue, Status> GGUFParser::read_metadata_value(
         if (!elem_type_val) return std::unexpected(elem_type_val.error());
         auto array_len = read_u64_le(f);
         if (!array_len) return std::unexpected(array_len.error());
+        constexpr uint64_t max_array_len = 16 * 1024 * 1024; // 16M elements safety limit
+        if (*array_len > max_array_len) {
+            return std::unexpected(Status::invalid_argument(
+                "GGUF metadata array too long: " + std::to_string(*array_len)));
+        }
         std::vector<MetadataValue> arr;
         arr.reserve(static_cast<size_t>(*array_len));
         for (uint64_t i = 0; i < *array_len; ++i) {
@@ -178,6 +210,11 @@ GGUFParser::parse_metadata(std::ifstream& f, uint64_t kv_count) {
 
 std::expected<std::vector<GGUFTensorInfo>, Status>
 GGUFParser::parse_tensor_infos(std::ifstream& f, uint64_t tensor_count) {
+    constexpr uint64_t max_tensor_count = 1024 * 1024; // safety limit
+    if (tensor_count > max_tensor_count) {
+        return std::unexpected(Status::invalid_argument(
+            "GGUF tensor count too large: " + std::to_string(tensor_count)));
+    }
     std::vector<GGUFTensorInfo> infos;
     infos.reserve(static_cast<size_t>(tensor_count));
     for (uint64_t i = 0; i < tensor_count; ++i) {
@@ -189,12 +226,22 @@ GGUFParser::parse_tensor_infos(std::ifstream& f, uint64_t tensor_count) {
         auto dims_val = read_u32_le(f);
         if (!dims_val) return std::unexpected(dims_val.error());
         uint32_t dims = *dims_val;
+        constexpr uint32_t max_tensor_dims = 8;
+        if (dims == 0 || dims > max_tensor_dims) {
+            return std::unexpected(Status::invalid_argument(
+                "GGUF tensor has invalid dimension count: " + std::to_string(dims)));
+        }
 
         info.dimensions.resize(dims);
         // GGUF stores dims in column-major order; reverse to row-major
         for (uint32_t d = 0; d < dims; ++d) {
             auto dim = read_u64_le(f);
             if (!dim) return std::unexpected(dim.error());
+            if (*dim == 0 ||
+                *dim > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                return std::unexpected(Status::invalid_argument(
+                    "GGUF tensor has invalid dimension: " + std::to_string(*dim)));
+            }
             info.dimensions[dims - d - 1] = static_cast<int64_t>(*dim);
         }
 
@@ -260,7 +307,12 @@ std::expected<GGUFFile, Status> GGUFParser::parse(const std::string& filename) {
         if (auto* v = std::get_if<uint32_t>(&align_it->second)) alignment = *v;
     }
 
-    uint64_t raw_offset = static_cast<uint64_t>(f.tellg());
+    auto tell_pos = f.tellg();
+    if (tell_pos == std::streampos(-1)) {
+        return std::unexpected(Status::io_error(
+            "failed to determine stream position after parsing GGUF header"));
+    }
+    uint64_t raw_offset = static_cast<uint64_t>(tell_pos);
     file.data_offset = raw_offset +
         (alignment - raw_offset % alignment) % alignment;
 

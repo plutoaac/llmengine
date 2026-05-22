@@ -12,8 +12,8 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
 - **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, a small multi-sequence scheduler, CPU decode attention, and CUDA paged decode over device block tables.
-- **Graph memory planner** with liveness analysis, CPU intermediate arena reuse, and peak-memory reporting.
-- **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
+- **Graph memory planner** with liveness analysis, O(n log n) best-fit buffer reuse, contiguous CPU arena pools, and peak-memory reporting.
+- **GGUF support** for bounds-checked metadata parsing, tensor table reading, F32/F16/BF16 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
 
 ## Architecture
@@ -57,8 +57,8 @@ flowchart LR
 | FP32 CPU kernels | Implemented for core transformer ops |
 | Optional CUDA executor/backend | Experimental, disabled by default |
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
-| Graph memory planner | Implemented for CPU intermediates, with runtime arena binding |
-| GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with shared weight storage |
+| Graph memory planner | Implemented for CPU intermediates, with O(n log n) matching and contiguous arena binding |
+| GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with parser safety checks and shared weight storage |
 | Byte-level BPE tokenizer | Experimental |
 | KV cache prefill/decode | Implemented for single-batch generation |
 | Paged KV cache / PagedAttention reference | Implemented for CPU decode and toy multi-sequence scheduling |
@@ -184,6 +184,8 @@ CTest currently runs:
 ./build/test_paged_kv_cache
 ./build/test_paged_attention_scheduler
 ./build/test_gguf_parser
+./build/test_transformer_graph_builder
+./build/test_bpe_tokenizer
 ```
 
 CUDA builds add:
@@ -199,6 +201,8 @@ The test suite covers:
 - CPU executor integration
 - CPU kernel numerical reference checks
 - graph liveness, memory reuse planning, and CPU arena binding
+- transformer graph weight naming and RoPE metadata propagation
+- tokenizer boundary behavior and GGUF parser safety checks
 - KV cache prefill/decode advancement
 - paged KV block allocation, scheduler batch metadata, and paged decode attention
 - CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
