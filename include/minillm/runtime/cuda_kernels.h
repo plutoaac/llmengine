@@ -36,5 +36,9 @@ Status paged_attention_decode_batch(const float* q, const float* k_cache,
                                     int batch_size, int max_blocks_per_sequence,
                                     int num_heads, int num_kv_heads,
                                     int head_dim, int block_size);
+Status kv_cache_attention_decode(const float* q, const float* k_cache,
+                                 const float* v_cache, float* out,
+                                 int kv_len, int num_heads, int num_kv_heads,
+                                 int head_dim);
 
 } // namespace minillm::cuda

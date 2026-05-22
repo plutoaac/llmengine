@@ -106,6 +106,7 @@ Run examples:
 ./build/forward_tiny_llama_gguf /path/to/model.gguf
 ./build/generate /path/to/model.gguf "Hello"
 ./build-cuda/forward_tiny_llama_gguf_cuda /path/to/model.gguf
+./build-cuda/generate_cuda /path/to/model.gguf "Hello" 2
 ```
 
 ## CUDA Status
@@ -117,6 +118,7 @@ CUDA support is an optional experimental module, inspired by the operator struct
 - `register_cuda_kernels()` bridges graph nodes to `.cu` launch wrappers.
 - `Tensor::allocate_cuda()` owns CUDA device memory while preserving the same runtime `Tensor` API.
 - `WeightLoader` can stage F32/F16/BF16 GGUF weights through CPU memory and copy them into CUDA tensors.
+- `KVCache::init_cuda()` stores contiguous decode K/V cache on device and lets CUDA Attention run prefill/decode.
 
 Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, single-sequence and batched PagedAttention-style decode, `Softmax`, `Reshape`, and `Transpose`.
 
@@ -124,7 +126,9 @@ Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear
 
 `forward_tiny_llama_gguf_cuda` is a real GPU smoke test for GGUF models: it builds the transformer graph on `Device::cuda(0)`, loads GGUF weights into CUDA tensors, runs a no-cache forward pass, and copies logits back for validation.
 
-The CUDA path does not yet include CUDA KV cache prefill/decode integration for generation, quantized CUDA matmul, production scheduler policies, or memory-planner-backed CUDA arena allocation.
+`generate_cuda` extends that path to single-batch generation with a CUDA contiguous KV cache. It runs prompt prefill, advances the shared cache once per graph run, then decodes one token at a time on GPU while sampling on CPU from copied logits.
+
+The CUDA path does not yet include quantized CUDA matmul, production scheduler policies, CUDA paged-cache integration in the full generation loop, weight sharing between prefill/decode graphs, or memory-planner-backed CUDA arena allocation.
 
 ## Paged KV Cache
 
@@ -199,6 +203,7 @@ The test suite covers:
 - CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
 - GGUF parser and weight conversion helpers
 - GGUF CUDA forward smoke path through `forward_tiny_llama_gguf_cuda`
+- CUDA single-batch GGUF generation smoke path through `generate_cuda`
 
 ## Project Layout
 
@@ -236,7 +241,7 @@ Key design choices:
 - `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
 - `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
 - `MemoryPlanner` computes intermediate tensor live ranges and assigns non-overlapping values to reusable buffers without changing runtime allocation yet.
-- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, and raw paged decode kernels. CUDA graph-memory arena integration, production batching policy, generation-time CUDA KV cache, and quantized CUDA matmul are intentionally left as future work.
+- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, and raw paged decode kernels. CUDA graph-memory arena integration, production batching policy, full paged-cache generation, and quantized CUDA matmul are intentionally left as future work.
 
 ## References
 
@@ -250,7 +255,7 @@ This project is an independent learning implementation inspired by:
 
 Near-term work with high portfolio value:
 
-- Run and document end-to-end Qwen3-0.6B CPU generation and CUDA forward smoke demos.
+- Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos.
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
 - Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
 - Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.

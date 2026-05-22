@@ -415,6 +415,52 @@ __global__ void paged_attention_decode_batch_kernel(
     }
 }
 
+template <int BLOCK>
+__global__ void kv_cache_attention_decode_kernel(
+    const float* q, const float* k_cache, const float* v_cache, float* out,
+    int kv_len, int num_heads, int num_kv_heads, int head_dim) {
+    int qh = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int group = num_heads / num_kv_heads;
+    int kvh = qh / group;
+    int kv_hidden = num_kv_heads * head_dim;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+
+    const float* q_vec = q + qh * head_dim;
+    float* out_vec = out + qh * head_dim;
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (int pos = 0; pos < kv_len; ++pos) {
+        size_t base = static_cast<size_t>(pos) * kv_hidden +
+                      static_cast<size_t>(kvh) * head_dim;
+        const float* k_vec = k_cache + base;
+        const float* v_vec = v_cache + base;
+
+        float partial = 0.0f;
+        for (int d = tid; d < head_dim; d += BLOCK) {
+            partial += q_vec[d] * k_vec[d];
+        }
+        float score = block_reduce_sum<BLOCK>(partial) * scale;
+
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+        if (tid < head_dim) {
+            acc = acc * alpha + beta * v_vec[tid];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (tid < head_dim) {
+        out_vec[tid] = acc / l;
+    }
+}
+
 } // namespace
 
 Status sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
@@ -579,6 +625,29 @@ Status paged_attention_decode_batch(const float* q, const float* k_cache,
         batch_size, max_blocks_per_sequence, num_heads, num_kv_heads,
         head_dim, block_size);
     return launch_status("cuda paged attention batch decode launch failed");
+}
+
+Status kv_cache_attention_decode(const float* q, const float* k_cache,
+                                 const float* v_cache, float* out,
+                                 int kv_len, int num_heads, int num_kv_heads,
+                                 int head_dim) {
+    if (kv_len <= 0 || num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0) {
+        return Status::invalid_argument(
+            "cuda KV cache attention decode requires positive lengths and dimensions");
+    }
+    if (num_heads % num_kv_heads != 0) {
+        return Status::invalid_argument(
+            "cuda KV cache attention num_heads must be divisible by num_kv_heads");
+    }
+    if (head_dim > 256) {
+        return Status::unsupported(
+            "cuda KV cache attention currently supports head_dim <= 256");
+    }
+
+    constexpr int block = 256;
+    kv_cache_attention_decode_kernel<block><<<num_heads, block>>>(
+        q, k_cache, v_cache, out, kv_len, num_heads, num_kv_heads, head_dim);
+    return launch_status("cuda KV cache attention decode launch failed");
 }
 
 } // namespace minillm::cuda

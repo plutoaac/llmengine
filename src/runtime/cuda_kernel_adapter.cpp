@@ -507,10 +507,6 @@ Status kernel_rope(const Node& node, RuntimeContext& ctx) {
 }
 
 Status kernel_attention(const Node& node, RuntimeContext& ctx) {
-    if (auto* cache = ctx.kv_cache(); cache && cache->initialized()) {
-        return Status::unsupported("CUDA Attention does not implement KV cache prefill/decode yet");
-    }
-
     auto qt = get_tensor(node.inputs()[0], ctx, "q");
     if (!qt) return qt.error();
     auto kt = get_tensor(node.inputs()[1], ctx, "k");
@@ -573,6 +569,78 @@ Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     }
 
     bool causal = bool_attr(node, "causal", true);
+    KVCache* cache = ctx.kv_cache();
+    if (cache && cache->initialized()) {
+        if (!cache->is_cuda()) {
+            return Status::unsupported("CUDA Attention requires a CUDA KV cache");
+        }
+        if (*batch != 1) {
+            return Status::unsupported("CUDA KV cache attention currently supports batch size 1");
+        }
+        if (cache->kv_hidden() != *kv_hidden) {
+            return Status::shape_mismatch(
+                "CUDA KV cache hidden size does not match attention K/V hidden size");
+        }
+
+        int64_t layer_idx_attr = int_attr(node, "layer_idx", 0);
+        auto layer_idx = checked_dim(layer_idx_attr, "attention layer_idx");
+        if (!layer_idx) return layer_idx.error();
+        if (*layer_idx < 0 || *layer_idx >= cache->num_layers()) {
+            return Status::out_of_range("CUDA KV cache layer index out of range");
+        }
+
+        float* cache_k = cache->k_data(*layer_idx);
+        float* cache_v = cache->v_data(*layer_idx);
+        int cached_len = cache->cached_len();
+        if (cached_len < 0 || cached_len > cache->max_seq_len()) {
+            return Status::out_of_range("CUDA KV cache cached_len is out of range");
+        }
+
+        if (cached_len == 0) {
+            if (!cache->can_append(*q_len)) {
+                return Status::out_of_range(
+                    "CUDA KV cache does not have enough space for prefill");
+            }
+            const size_t bytes =
+                static_cast<size_t>(*q_len) * static_cast<size_t>(*kv_hidden) * sizeof(float);
+            auto st = cuda_status(cudaMemcpy(cache_k, float_data(*kt), bytes,
+                                             cudaMemcpyDeviceToDevice),
+                                  "copy CUDA prefill K into KV cache failed");
+            if (!st.ok()) return st;
+            st = cuda_status(cudaMemcpy(cache_v, float_data(*vt), bytes,
+                                        cudaMemcpyDeviceToDevice),
+                             "copy CUDA prefill V into KV cache failed");
+            if (!st.ok()) return st;
+
+            return cuda::sdpa(float_data(*qt), float_data(*kt), float_data(*vt),
+                              float_data_mut(*ot), *batch, *q_len, *num_heads,
+                              *num_kv_heads, *head_dim, causal);
+        }
+
+        if (*q_len != 1) {
+            return Status::invalid_argument("CUDA KV cache decode requires q_len == 1");
+        }
+        if (!cache->can_append(1)) {
+            return Status::out_of_range("CUDA KV cache does not have enough space for decode");
+        }
+
+        const size_t row_offset =
+            static_cast<size_t>(cached_len) * static_cast<size_t>(*kv_hidden);
+        const size_t bytes = static_cast<size_t>(*kv_hidden) * sizeof(float);
+        auto st = cuda_status(cudaMemcpy(cache_k + row_offset, float_data(*kt), bytes,
+                                         cudaMemcpyDeviceToDevice),
+                              "copy CUDA decode K into KV cache failed");
+        if (!st.ok()) return st;
+        st = cuda_status(cudaMemcpy(cache_v + row_offset, float_data(*vt), bytes,
+                                    cudaMemcpyDeviceToDevice),
+                         "copy CUDA decode V into KV cache failed");
+        if (!st.ok()) return st;
+
+        return cuda::kv_cache_attention_decode(
+            float_data(*qt), cache_k, cache_v, float_data_mut(*ot), cached_len + 1,
+            *num_heads, *num_kv_heads, *head_dim);
+    }
+
     return cuda::sdpa(float_data(*qt), float_data(*kt), float_data(*vt),
                       float_data_mut(*ot), *batch, *q_len, *num_heads,
                       *num_kv_heads, *head_dim, causal);

@@ -530,6 +530,60 @@ void test_cuda_paged_attention_decode_batch_gqa() {
     std::cout << "  PASS test_cuda_paged_attention_decode_batch_gqa\n";
 }
 
+void test_cuda_kv_cache_attention_decode_gqa() {
+    const int kv_len = 4;
+    const int num_heads = 4;
+    const int num_kv_heads = 2;
+    const int head_dim = 2;
+    const int kv_hidden = num_kv_heads * head_dim;
+
+    const std::vector<float> q{
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        0.5f, 0.5f,
+        -0.5f, 1.0f,
+    };
+    std::vector<float> k_cache(static_cast<size_t>(kv_len) * kv_hidden);
+    std::vector<float> v_cache(k_cache.size());
+    for (int pos = 0; pos < kv_len; ++pos) {
+        for (int h = 0; h < num_kv_heads; ++h) {
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t idx =
+                    static_cast<size_t>(pos) * kv_hidden +
+                    static_cast<size_t>(h) * head_dim + d;
+                k_cache[idx] = 0.11f * static_cast<float>(pos + 1) +
+                               0.17f * static_cast<float>(h + 1) +
+                               0.03f * static_cast<float>(d);
+                v_cache[idx] = static_cast<float>(10 * (h + 1) + pos * 4 + d);
+            }
+        }
+    }
+
+    KVCache cache;
+    check_status(cache.init_cuda(1, num_kv_heads, head_dim, kv_len));
+    check_cuda(cudaMemcpy(cache.k_data(0), k_cache.data(),
+                          k_cache.size() * sizeof(float), cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(cache.v_data(0), v_cache.data(),
+                          v_cache.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    DeviceBuffer<float> dq(q.size()), dout(static_cast<size_t>(num_heads) * head_dim);
+    dq.copy_from(q);
+    check_status(cuda::kv_cache_attention_decode(
+        dq.get(), cache.k_data(0), cache.v_data(0), dout.get(),
+        kv_len, num_heads, num_kv_heads, head_dim));
+    sync_ok();
+
+    auto out = dout.copy_to_host();
+    auto expected = reference_paged_decode(
+        q, k_cache, v_cache, std::vector<int>{0}, kv_len, num_heads,
+        num_kv_heads, head_dim, kv_len);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        assert_near(out[i], expected[i], 1e-3f);
+    }
+
+    std::cout << "  PASS test_cuda_kv_cache_attention_decode_gqa\n";
+}
+
 void test_cuda_executor_linear_bias() {
     Graph graph;
     GraphBuilder gb(graph);
@@ -593,6 +647,7 @@ int main() {
     test_cuda_sdpa_gqa();
     test_cuda_paged_attention_decode_gqa();
     test_cuda_paged_attention_decode_batch_gqa();
+    test_cuda_kv_cache_attention_decode_gqa();
     test_cuda_executor_linear_bias();
     std::cout << "All tests passed!\n";
     return 0;

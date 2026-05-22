@@ -303,6 +303,7 @@ Current CUDA scope:
 - FP32 `Transpose`
 - dtype-preserving CUDA `Reshape` through device-to-device copy
 - GGUF F32/F16/BF16 weight staging into CUDA tensors for no-cache forward smoke tests
+- single-batch CUDA generation with a contiguous device KV cache
 
 The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads.
 
@@ -326,13 +327,15 @@ The `test_cuda_kernels` executable validates:
 
 What is not implemented yet:
 
-- CUDA contiguous KV cache prefill/decode attention
+- CUDA paged-cache integration in the full generation loop
 - production serving integration around the toy paged attention scheduler
 - CUDA quantized matmul
 - CUDA arena allocation driven by `MemoryPlanner`
 - CUDA performance benchmarks
 
-The `forward_tiny_llama_gguf_cuda` example is intentionally a forward-only smoke test. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `GGUFWeightLoader` copy weights to device memory, and copies logits back to the host for validation. Generation still uses the CPU path because CUDA attention does not yet implement the contiguous KV cache prefill/decode mode.
+The `forward_tiny_llama_gguf_cuda` example is a forward-only smoke test. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `GGUFWeightLoader` copy weights to device memory, and copies logits back to the host for validation.
+
+The `generate_cuda` example uses the same graph/runtime shape but attaches a CUDA `KVCache`. During prefill, CUDA Attention copies K/V rows into device cache storage and runs no-cache SDPA over the prompt. During decode, it writes the new token's K/V row at `cached_len` and calls a decode kernel over `[cached_len + 1]` contiguous KV rows. The executor still advances cache length once after the full graph run, matching the CPU path.
 
 ## GEMM Design
 
@@ -548,6 +551,7 @@ This project is useful to discuss:
 - how GGUF metadata and tensor loading fit into inference
 - how a CPU backend can be mirrored by an optional CUDA backend
 - how CUDA paged decode reads K/V through device block tables
+- how CUDA generation uses a device-side contiguous KV cache for prefill/decode
 - how GGUF weights can be staged from host parsing into CUDA tensor storage
 - how to test numerical kernels separately from runtime integration
 
