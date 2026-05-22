@@ -27,8 +27,9 @@ bool check_cuda(cudaError_t err, const std::string& what) {
     return false;
 }
 
-Status allocate_all_cuda(const Graph& graph, RuntimeContext& ctx) {
+Status allocate_runtime_tensors_cuda(const Graph& graph, RuntimeContext& ctx) {
     for (const auto& v : graph.values()) {
+        if (v.kind == ValueKind::Constant) continue;
         auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
         Status st;
         if (v.device.type == DeviceType::CUDA) {
@@ -170,18 +171,28 @@ int main(int argc, char* argv[]) {
     st = decode_graph.validate();
     if (!check_status(st, "Decode graph validation failed")) return 1;
 
-    std::cerr << "[5/7] Allocating CUDA tensors and loading weights...\n";
+    std::cerr << "[5/7] Allocating CUDA tensors and loading shared weights...\n";
+    auto shared_weights = loader.load_shared_weights(*file_result, prefill_graph);
+    if (!shared_weights) {
+        std::cerr << "Failed to load shared weights: "
+                  << shared_weights.error().to_string() << "\n";
+        return 1;
+    }
+    std::cerr << "Shared CUDA weights: " << shared_weights->tensor_count()
+              << " tensors, " << (shared_weights->total_bytes() / (1024 * 1024))
+              << " MiB\n";
+
     RuntimeContext prefill_ctx;
-    st = allocate_all_cuda(prefill_graph, prefill_ctx);
+    st = allocate_runtime_tensors_cuda(prefill_graph, prefill_ctx);
     if (!check_status(st, "Failed to allocate prefill tensors")) return 1;
-    st = loader.load_weights(*file_result, prefill_graph, prefill_ctx);
-    if (!check_status(st, "Failed to load prefill weights")) return 1;
+    st = shared_weights->bind(prefill_graph, prefill_ctx);
+    if (!check_status(st, "Failed to bind prefill weights")) return 1;
 
     RuntimeContext decode_ctx;
-    st = allocate_all_cuda(decode_graph, decode_ctx);
+    st = allocate_runtime_tensors_cuda(decode_graph, decode_ctx);
     if (!check_status(st, "Failed to allocate decode tensors")) return 1;
-    st = loader.load_weights(*file_result, decode_graph, decode_ctx);
-    if (!check_status(st, "Failed to load decode weights")) return 1;
+    st = shared_weights->bind(decode_graph, decode_ctx);
+    if (!check_status(st, "Failed to bind decode weights")) return 1;
 
     auto kv_cache = std::make_shared<KVCache>();
     st = kv_cache->init_cuda(static_cast<int>(cfg.num_layers),

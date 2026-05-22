@@ -20,7 +20,106 @@ Status cuda_status(cudaError_t err, const char* what) {
 }
 #endif
 
+std::unordered_map<std::string, std::string> build_value_to_gguf_map(
+    const GGUFFile& file) {
+    std::unordered_map<std::string, std::string> value_to_gguf;
+    for (const auto& ti : file.tensor_infos) {
+        auto mapped = WeightLoader::gguf_name_to_value_name(ti.name);
+        if (mapped) {
+            value_to_gguf[*mapped] = ti.name;
+        }
+    }
+
+    // Handle tied embeddings: if lm_head.weight is not found, map to token_embd.weight.
+    if (value_to_gguf.find("lm_head.weight") == value_to_gguf.end() &&
+        value_to_gguf.find("tok_embeddings.weight") != value_to_gguf.end()) {
+        value_to_gguf["lm_head.weight"] = value_to_gguf["tok_embeddings.weight"];
+    }
+    return value_to_gguf;
+}
+
+std::unordered_map<std::string, const GGUFTensorInfo*> build_gguf_tensor_map(
+    const GGUFFile& file) {
+    std::unordered_map<std::string, const GGUFTensorInfo*> gguf_tensor_map;
+    for (const auto& ti : file.tensor_infos) {
+        gguf_tensor_map[ti.name] = &ti;
+    }
+    return gguf_tensor_map;
+}
+
+Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
+                             const GGUFTensorInfo& ti, Tensor& tensor) {
+    if (!tensor.is_allocated()) {
+        return Status::runtime_error("tensor not allocated: " + tensor.name());
+    }
+
+    const size_t raw_bytes = ti.bytes();
+    std::vector<std::byte> raw_buf(raw_bytes);
+    auto st = GGUFParser::read_tensor_data(
+        gguf_path, file.data_offset, ti.offset, raw_buf.data(), raw_bytes);
+    if (!st.ok()) return st;
+
+    const size_t num_el = ti.num_elements();
+    if (tensor.device().type == DeviceType::CUDA) {
+#if defined(MINILLM_ENABLE_CUDA)
+        std::vector<float> staging(num_el);
+        auto st2 = WeightLoader::dequantize_to_f32(
+            ti.dtype, raw_buf.data(), staging.data(), num_el);
+        if (!st2.ok()) return st2;
+        auto err = cudaMemcpy(tensor.data(), staging.data(),
+                              num_el * sizeof(float), cudaMemcpyHostToDevice);
+        return cuda_status(err, "copy GGUF weight to CUDA tensor failed");
+#else
+        return Status::unsupported(
+            "cannot load GGUF weights into CUDA tensor without CUDA support");
+#endif
+    }
+
+    float* dst = reinterpret_cast<float*>(tensor.data());
+    return WeightLoader::dequantize_to_f32(ti.dtype, raw_buf.data(), dst, num_el);
+}
+
+Status check_compatible_weight(const Tensor& tensor, const Value& value) {
+    if (tensor.shape() != value.shape) {
+        return Status::shape_mismatch(
+            "shared weight shape mismatch for " + value.name +
+            ": tensor " + tensor.shape().to_string() +
+            " vs value " + value.shape.to_string());
+    }
+    if (tensor.dtype() != value.dtype) {
+        return Status::type_error("shared weight dtype mismatch for " + value.name);
+    }
+    if (tensor.device().type != value.device.type ||
+        tensor.device().index != value.device.index) {
+        return Status::runtime_error(
+            "shared weight device mismatch for " + value.name +
+            ": tensor " + tensor.device().to_string() +
+            " vs value " + value.device.to_string());
+    }
+    return Status::make_ok();
+}
+
 } // namespace
+
+// --- SharedWeightStore ---
+
+Tensor* SharedWeightStore::get(const std::string& value_name) const {
+    auto it = aliases_by_value_name_.find(value_name);
+    return it == aliases_by_value_name_.end() ? nullptr : it->second;
+}
+
+Status SharedWeightStore::bind(const Graph& graph, RuntimeContext& ctx) const {
+    for (const auto& v : graph.values()) {
+        if (v.kind != ValueKind::Constant) continue;
+        Tensor* tensor = get(v.name);
+        if (!tensor) continue;
+        auto st = check_compatible_weight(*tensor, v);
+        if (!st.ok()) return st;
+        st = ctx.bind(v.id, tensor);
+        if (!st.ok()) return st;
+    }
+    return Status::make_ok();
+}
 
 // --- F16/BF16 to F32 conversion ---
 
@@ -224,26 +323,8 @@ Status WeightLoader::load_weights(
     const Graph& graph,
     RuntimeContext& ctx) const {
 
-    // Build GGUF name -> GGUFTensorInfo lookup
-    std::unordered_map<std::string, const GGUFTensorInfo*> gguf_tensor_map;
-    for (const auto& ti : file.tensor_infos) {
-        gguf_tensor_map[ti.name] = &ti;
-    }
-
-    // Build reverse map: value_name -> gguf_name
-    std::unordered_map<std::string, std::string> value_to_gguf;
-    for (const auto& ti : file.tensor_infos) {
-        auto mapped = gguf_name_to_value_name(ti.name);
-        if (mapped) {
-            value_to_gguf[*mapped] = ti.name;
-        }
-    }
-
-    // Handle tied embeddings: if lm_head.weight is not found, map to token_embd.weight
-    if (value_to_gguf.find("lm_head.weight") == value_to_gguf.end() &&
-        value_to_gguf.find("tok_embeddings.weight") != value_to_gguf.end()) {
-        value_to_gguf["lm_head.weight"] = value_to_gguf["tok_embeddings.weight"];
-    }
+    auto gguf_tensor_map = build_gguf_tensor_map(file);
+    auto value_to_gguf = build_value_to_gguf_map(file);
 
     for (const auto& v : graph.values()) {
         if (v.kind != ValueKind::Constant) continue;
@@ -257,41 +338,65 @@ Status WeightLoader::load_weights(
             return Status::runtime_error(
                 "tensor not found in RuntimeContext for value: " + v.name);
         }
-        if (!tensor->is_allocated()) {
-            return Status::runtime_error(
-                "tensor not allocated: " + v.name);
-        }
-
-        // Read raw GGUF data into a temporary buffer
-        size_t raw_bytes = ti.bytes();
-        std::vector<std::byte> raw_buf(raw_bytes);
-        auto st = GGUFParser::read_tensor_data(
-            gguf_path_, file.data_offset, ti.offset, raw_buf.data(), raw_bytes);
+        auto st = load_tensor_from_gguf(gguf_path_, file, ti, *tensor);
         if (!st.ok()) return st;
-
-        // Dequantize into the target tensor
-        size_t num_el = ti.num_elements();
-        if (tensor->device().type == DeviceType::CUDA) {
-#if defined(MINILLM_ENABLE_CUDA)
-            std::vector<float> staging(num_el);
-            auto st2 = dequantize_to_f32(ti.dtype, raw_buf.data(), staging.data(), num_el);
-            if (!st2.ok()) return st2;
-            auto err = cudaMemcpy(tensor->data(), staging.data(),
-                                  num_el * sizeof(float), cudaMemcpyHostToDevice);
-            auto st3 = cuda_status(err, "copy GGUF weight to CUDA tensor failed");
-            if (!st3.ok()) return st3;
-#else
-            return Status::unsupported(
-                "cannot load GGUF weights into CUDA tensor without CUDA support");
-#endif
-        } else {
-            float* dst = reinterpret_cast<float*>(tensor->data());
-            auto st2 = dequantize_to_f32(ti.dtype, raw_buf.data(), dst, num_el);
-            if (!st2.ok()) return st2;
-        }
     }
 
     return Status::make_ok();
+}
+
+std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
+    const GGUFFile& file,
+    const Graph& graph) const {
+
+    auto gguf_tensor_map = build_gguf_tensor_map(file);
+    auto value_to_gguf = build_value_to_gguf_map(file);
+    SharedWeightStore store;
+
+    for (const auto& v : graph.values()) {
+        if (v.kind != ValueKind::Constant) continue;
+
+        auto gguf_it = value_to_gguf.find(v.name);
+        if (gguf_it == value_to_gguf.end()) continue;
+
+        const std::string& gguf_name = gguf_it->second;
+        auto info_it = gguf_tensor_map.find(gguf_name);
+        if (info_it == gguf_tensor_map.end()) {
+            return std::unexpected(Status::not_found(
+                "GGUF tensor not found for value: " + v.name));
+        }
+
+        Tensor* shared_tensor = nullptr;
+        auto existing = store.storage_by_gguf_name_.find(gguf_name);
+        if (existing == store.storage_by_gguf_name_.end()) {
+            auto tensor = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
+            Status st;
+            if (v.device.type == DeviceType::CUDA) {
+                st = tensor->allocate_cuda();
+            } else {
+                st = tensor->allocate_cpu();
+            }
+            if (!st.ok()) return std::unexpected(st);
+
+            auto bytes = tensor->nbytes();
+            if (!bytes) return std::unexpected(bytes.error());
+
+            st = load_tensor_from_gguf(gguf_path_, file, *info_it->second, *tensor);
+            if (!st.ok()) return std::unexpected(st);
+
+            shared_tensor = tensor.get();
+            store.total_bytes_ += *bytes;
+            store.storage_by_gguf_name_[gguf_name] = std::move(tensor);
+        } else {
+            shared_tensor = existing->second.get();
+            auto st = check_compatible_weight(*shared_tensor, v);
+            if (!st.ok()) return std::unexpected(st);
+        }
+
+        store.aliases_by_value_name_[v.name] = shared_tensor;
+    }
+
+    return std::move(store);
 }
 
 } // namespace minillm

@@ -10,6 +10,7 @@ The design goal is to demonstrate the core engineering concepts behind local LLM
 - CPU transformer kernels
 - optional CUDA transformer kernels
 - GGUF model loading
+- shared model weights across generation contexts
 - KV cache based prefill/decode generation
 - block-table based paged KV cache design
 - small multi-sequence scheduling over paged KV blocks
@@ -25,7 +26,8 @@ flowchart TD
 
     GGUF["GGUF model"] --> Parser["GGUFParser"]
     Parser --> Loader["WeightLoader"]
-    Loader --> Context["RuntimeContext"]
+    Loader --> SharedWeights["SharedWeightStore"]
+    SharedWeights --> Context["RuntimeContext"]
 
     Values --> Context
     Context --> Executor["CpuExecutor"]
@@ -170,6 +172,8 @@ It supports two ownership modes:
 
 - `bind(ValueId, Tensor*)` for externally owned tensors
 - `emplace(ValueId, unique_ptr<Tensor>)` for context-owned tensors
+
+This split is important for generation. Prefill and decode are built as two graphs with different sequence lengths, but they reference the same model parameters. `SharedWeightStore` loads each GGUF tensor once, records aliases from graph value names to the stored tensor, and then binds those external tensors into both contexts. For tied embeddings, `lm_head.weight` can alias `tok_embeddings.weight` when the GGUF file does not carry a separate output tensor.
 
 It also owns optional runtime state:
 
@@ -333,7 +337,7 @@ What is not implemented yet:
 - CUDA arena allocation driven by `MemoryPlanner`
 - CUDA performance benchmarks
 
-The `forward_tiny_llama_gguf_cuda` example is a forward-only smoke test. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `GGUFWeightLoader` copy weights to device memory, and copies logits back to the host for validation.
+The `forward_tiny_llama_gguf_cuda` example is a forward-only smoke test. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `WeightLoader` copy weights to device memory, and copies logits back to the host for validation.
 
 The `generate_cuda` example uses the same graph/runtime shape but attaches a CUDA `KVCache`. During prefill, CUDA Attention copies K/V rows into device cache storage and runs no-cache SDPA over the prompt. During decode, it writes the new token's K/V row at `cached_len` and calls a decode kernel over `[cached_len + 1]` contiguous KV rows. The executor still advances cache length once after the full graph run, matching the CPU path.
 
@@ -473,6 +477,18 @@ Currently supported weight data types:
 
 When built with `MINILLM_ENABLE_CUDA=ON`, `WeightLoader` can dequantize through a temporary CPU staging buffer and copy the FP32 result into CUDA tensors. This keeps parsing and conversion simple while allowing real GPU forward-pass smoke tests.
 
+For generation, `WeightLoader::load_shared_weights()` returns a `SharedWeightStore` instead of immediately copying into one context. The store owns CPU or CUDA tensors according to the graph device, while each `RuntimeContext` only binds pointers to those tensors:
+
+```text
+GGUF tensor "token_embd.weight"
+    -> stored once as Tensor
+    -> alias "tok_embeddings.weight"
+    -> alias "lm_head.weight" when embeddings are tied
+    -> bound into prefill_ctx and decode_ctx
+```
+
+This removes the largest avoidable memory duplication in the current two-graph generation path. Activations remain separate because prefill and decode have different shapes, while weights and KV cache are shared runtime state.
+
 Quantized GGUF tensors are a future extension.
 
 ## Testing Strategy
@@ -487,7 +503,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_graph_builder` | shape inference and builder-level validation |
 | `test_cpu_kernels` | direct numerical checks for low-level CPU kernels |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
-| `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion |
+| `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion, shared tied-weight binding |
 | `test_memory_planner` | graph liveness, buffer reuse planning, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
@@ -510,7 +526,7 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 - continuous batching and a production request scheduler
 - prefix cache and block sharing across requests
 - production-grade tokenizer compatibility
-- CUDA contiguous KV cache and CUDA quantized kernels
+- CUDA quantized kernels
 - Metal / Vulkan backends
 
 These are valid future extensions, but they are not required for the project's current purpose.
@@ -552,6 +568,7 @@ This project is useful to discuss:
 - how a CPU backend can be mirrored by an optional CUDA backend
 - how CUDA paged decode reads K/V through device block tables
 - how CUDA generation uses a device-side contiguous KV cache for prefill/decode
+- how shared GGUF weights avoid loading parameters once per generation graph
 - how GGUF weights can be staged from host parsing into CUDA tensor storage
 - how to test numerical kernels separately from runtime integration
 

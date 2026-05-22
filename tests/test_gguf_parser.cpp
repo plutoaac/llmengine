@@ -618,6 +618,53 @@ void test_extract_config() {
     ASSERT_EQ(cfg->head_dim, int64_t(8));
 }
 
+void test_shared_weight_store_tied_embeddings() {
+    std::string path = "/tmp/test_minillm_gguf_shared_weights.gguf";
+    {
+        GgufWriter w(path);
+        w.add_meta_string("general.architecture", "llama");
+        w.add_tensor_f32("token_embd.weight", 2, 2, {1.0f, 2.0f, 3.0f, 4.0f});
+        w.write();
+    }
+
+    WeightLoader loader(path);
+    auto file = loader.open();
+    ASSERT_TRUE(file.has_value());
+
+    Graph graph;
+    auto tok = graph.add_value("tok_embeddings.weight", Shape({2, 2}),
+                               DType::Float32, Device::cpu(), ValueKind::Constant);
+    ASSERT_TRUE(tok.has_value());
+    auto lm = graph.add_value("lm_head.weight", Shape({2, 2}),
+                              DType::Float32, Device::cpu(), ValueKind::Constant);
+    ASSERT_TRUE(lm.has_value());
+
+    auto store = loader.load_shared_weights(*file, graph);
+    ASSERT_TRUE(store.has_value());
+    ASSERT_EQ(store->tensor_count(), size_t(1));
+    ASSERT_EQ(store->alias_count(), size_t(2));
+
+    RuntimeContext ctx_a;
+    RuntimeContext ctx_b;
+    auto st = store->bind(graph, ctx_a);
+    ASSERT_TRUE(st.ok());
+    st = store->bind(graph, ctx_b);
+    ASSERT_TRUE(st.ok());
+
+    Tensor* tok_a = ctx_a.get(*tok);
+    Tensor* lm_a = ctx_a.get(*lm);
+    Tensor* tok_b = ctx_b.get(*tok);
+    ASSERT_TRUE(tok_a != nullptr);
+    ASSERT_TRUE(lm_a != nullptr);
+    ASSERT_TRUE(tok_b != nullptr);
+    ASSERT_TRUE(tok_a == lm_a);
+    ASSERT_TRUE(tok_a == tok_b);
+
+    const float* data = reinterpret_cast<const float*>(tok_a->data());
+    ASSERT_TRUE(std::abs(data[0] - 1.0f) < 1e-6f);
+    ASSERT_TRUE(std::abs(data[3] - 4.0f) < 1e-6f);
+}
+
 int main() {
     std::cout << "test_gguf_parser:\n";
 
@@ -635,6 +682,7 @@ int main() {
     TEST(f16_tensor_read);
     TEST(bf16_tensor_read);
     TEST(extract_config);
+    TEST(shared_weight_store_tied_embeddings);
 
     std::cout << (tests_failed == 0 ? "All tests passed!" : "Some tests FAILED!")
               << " (" << tests_passed << " passed, " << tests_failed << " failed)\n";

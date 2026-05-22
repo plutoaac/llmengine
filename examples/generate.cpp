@@ -1,5 +1,6 @@
 #include <cmath>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,22 @@
 #include "minillm/runtime/sampler.h"
 
 using namespace minillm;
+
+namespace {
+
+Status allocate_runtime_tensors_cpu(const Graph& graph, RuntimeContext& ctx) {
+    for (const auto& v : graph.values()) {
+        if (v.kind == ValueKind::Constant) continue;
+        auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
+        auto st = t->allocate_cpu();
+        if (!st.ok()) return st;
+        st = ctx.emplace(v.id, std::move(t));
+        if (!st.ok()) return st;
+    }
+    return Status::make_ok();
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -108,42 +125,41 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 5. Allocate tensors and load weights for both graphs
-    std::cerr << "[5/7] Allocating tensors and loading weights...\n";
+    // 5. Allocate runtime tensors and load shared weights once
+    std::cerr << "[5/7] Allocating tensors and loading shared weights...\n";
+    auto shared_weights = loader.load_shared_weights(*file_result, prefill_graph);
+    if (!shared_weights) {
+        std::cerr << "Failed to load shared weights: "
+                  << shared_weights.error().to_string() << "\n";
+        return 1;
+    }
+    std::cerr << "Shared weights: " << shared_weights->tensor_count()
+              << " tensors, " << (shared_weights->total_bytes() / (1024 * 1024))
+              << " MiB\n";
 
     // Prefill context
     RuntimeContext prefill_ctx;
-    for (const auto& v : prefill_graph.values()) {
-        auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
-        st = t->allocate_cpu();
-        if (!st.ok()) {
-            std::cerr << "Failed to allocate " << v.name << ": " << st.to_string() << "\n";
-            return 1;
-        }
-        prefill_ctx.emplace(v.id, std::move(t));
-    }
-
-    st = loader.load_weights(*file_result, prefill_graph, prefill_ctx);
+    st = allocate_runtime_tensors_cpu(prefill_graph, prefill_ctx);
     if (!st.ok()) {
-        std::cerr << "Failed to load prefill weights: " << st.to_string() << "\n";
+        std::cerr << "Failed to allocate prefill tensors: " << st.to_string() << "\n";
+        return 1;
+    }
+    st = shared_weights->bind(prefill_graph, prefill_ctx);
+    if (!st.ok()) {
+        std::cerr << "Failed to bind prefill weights: " << st.to_string() << "\n";
         return 1;
     }
 
     // Decode context
     RuntimeContext decode_ctx;
-    for (const auto& v : decode_graph.values()) {
-        auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
-        st = t->allocate_cpu();
-        if (!st.ok()) {
-            std::cerr << "Failed to allocate " << v.name << ": " << st.to_string() << "\n";
-            return 1;
-        }
-        decode_ctx.emplace(v.id, std::move(t));
-    }
-
-    st = loader.load_weights(*file_result, decode_graph, decode_ctx);
+    st = allocate_runtime_tensors_cpu(decode_graph, decode_ctx);
     if (!st.ok()) {
-        std::cerr << "Failed to load decode weights: " << st.to_string() << "\n";
+        std::cerr << "Failed to allocate decode tensors: " << st.to_string() << "\n";
+        return 1;
+    }
+    st = shared_weights->bind(decode_graph, decode_ctx);
+    if (!st.ok()) {
+        std::cerr << "Failed to bind decode weights: " << st.to_string() << "\n";
         return 1;
     }
 

@@ -13,7 +13,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
 - **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, a small multi-sequence scheduler, CPU decode attention, and CUDA paged decode over device block tables.
 - **Graph memory planner** with liveness analysis, intermediate tensor buffer reuse planning, and peak-memory reporting.
-- **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, and common Llama/Qwen weight-name mapping.
+- **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
 
 ## Architecture
@@ -58,14 +58,14 @@ flowchart LR
 | Optional CUDA executor/backend | Experimental, disabled by default |
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU intermediates |
-| GGUF metadata and tensor loading | Implemented for F32/F16/BF16 |
+| GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with shared weight storage |
 | Byte-level BPE tokenizer | Experimental |
 | KV cache prefill/decode | Implemented for single-batch generation |
 | Paged KV cache / PagedAttention reference | Implemented for CPU decode and toy multi-sequence scheduling |
 | CPU benchmark harness | Implemented |
 | Quantized kernels | Not yet |
 | CUDA PagedAttention decode | Implemented for single-sequence and batched decode |
-| CUDA contiguous KV cache / quantized CUDA kernels | Not yet |
+| CUDA quantized kernels | Not yet |
 | Metal / Vulkan | Out of scope |
 | Continuous batching / server runtime | Out of scope |
 
@@ -118,6 +118,7 @@ CUDA support is an optional experimental module, inspired by the operator struct
 - `register_cuda_kernels()` bridges graph nodes to `.cu` launch wrappers.
 - `Tensor::allocate_cuda()` owns CUDA device memory while preserving the same runtime `Tensor` API.
 - `WeightLoader` can stage F32/F16/BF16 GGUF weights through CPU memory and copy them into CUDA tensors.
+- `SharedWeightStore` loads each GGUF tensor once and binds the same weight tensors into prefill and decode contexts.
 - `KVCache::init_cuda()` stores contiguous decode K/V cache on device and lets CUDA Attention run prefill/decode.
 
 Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `Add`, `Mul`, `SiLU`, `SwiGLU`, `RoPE`, no-cache `Attention`, single-sequence and batched PagedAttention-style decode, `Softmax`, `Reshape`, and `Transpose`.
@@ -128,7 +129,7 @@ Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear
 
 `generate_cuda` extends that path to single-batch generation with a CUDA contiguous KV cache. It runs prompt prefill, advances the shared cache once per graph run, then decodes one token at a time on GPU while sampling on CPU from copied logits.
 
-The CUDA path does not yet include quantized CUDA matmul, production scheduler policies, CUDA paged-cache integration in the full generation loop, weight sharing between prefill/decode graphs, or memory-planner-backed CUDA arena allocation.
+The CUDA path does not yet include quantized CUDA matmul, production scheduler policies, CUDA paged-cache integration in the full generation loop, or memory-planner-backed CUDA arena allocation.
 
 ## Paged KV Cache
 
@@ -239,6 +240,7 @@ Key design choices:
 - `CudaExecutor` mirrors the CPU executor when the project is built with `MINILLM_ENABLE_CUDA=ON`.
 - `RuntimeContext` binds `ValueId` to runtime `Tensor` objects and owns intermediate tensors.
 - `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
+- `SharedWeightStore` lets prefill and decode contexts reuse one loaded GGUF weight set instead of duplicating model parameters.
 - `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
 - `MemoryPlanner` computes intermediate tensor live ranges and assigns non-overlapping values to reusable buffers without changing runtime allocation yet.
 - CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, and raw paged decode kernels. CUDA graph-memory arena integration, production batching policy, full paged-cache generation, and quantized CUDA matmul are intentionally left as future work.
