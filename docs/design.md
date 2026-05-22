@@ -302,6 +302,7 @@ Current CUDA scope:
 - FP32 single-sequence and batched PagedAttention decode over device block tables
 - FP32 `Transpose`
 - dtype-preserving CUDA `Reshape` through device-to-device copy
+- GGUF F32/F16/BF16 weight staging into CUDA tensors for no-cache forward smoke tests
 
 The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads.
 
@@ -329,8 +330,9 @@ What is not implemented yet:
 - production serving integration around the toy paged attention scheduler
 - CUDA quantized matmul
 - CUDA arena allocation driven by `MemoryPlanner`
-- host-to-device weight loading in `GGUFWeightLoader`
 - CUDA performance benchmarks
+
+The `forward_tiny_llama_gguf_cuda` example is intentionally a forward-only smoke test. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `GGUFWeightLoader` copy weights to device memory, and copies logits back to the host for validation. Generation still uses the CPU path because CUDA attention does not yet implement the contiguous KV cache prefill/decode mode.
 
 ## GEMM Design
 
@@ -466,6 +468,8 @@ Currently supported weight data types:
 - F16 to F32
 - BF16 to F32
 
+When built with `MINILLM_ENABLE_CUDA=ON`, `WeightLoader` can dequantize through a temporary CPU staging buffer and copy the FP32 result into CUDA tensors. This keeps parsing and conversion simple while allowing real GPU forward-pass smoke tests.
+
 Quantized GGUF tensors are a future extension.
 
 ## Testing Strategy
@@ -544,6 +548,7 @@ This project is useful to discuss:
 - how GGUF metadata and tensor loading fit into inference
 - how a CPU backend can be mirrored by an optional CUDA backend
 - how CUDA paged decode reads K/V through device block tables
+- how GGUF weights can be staged from host parsing into CUDA tensor storage
 - how to test numerical kernels separately from runtime integration
 
 Good follow-up improvements:

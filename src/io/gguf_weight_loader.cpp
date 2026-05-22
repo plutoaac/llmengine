@@ -5,7 +5,22 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(MINILLM_ENABLE_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 namespace minillm {
+
+namespace {
+
+#if defined(MINILLM_ENABLE_CUDA)
+Status cuda_status(cudaError_t err, const char* what) {
+    if (err == cudaSuccess) return Status::make_ok();
+    return Status::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+}
+#endif
+
+} // namespace
 
 // --- F16/BF16 to F32 conversion ---
 
@@ -256,9 +271,24 @@ Status WeightLoader::load_weights(
 
         // Dequantize into the target tensor
         size_t num_el = ti.num_elements();
-        float* dst = reinterpret_cast<float*>(tensor->data());
-        auto st2 = dequantize_to_f32(ti.dtype, raw_buf.data(), dst, num_el);
-        if (!st2.ok()) return st2;
+        if (tensor->device().type == DeviceType::CUDA) {
+#if defined(MINILLM_ENABLE_CUDA)
+            std::vector<float> staging(num_el);
+            auto st2 = dequantize_to_f32(ti.dtype, raw_buf.data(), staging.data(), num_el);
+            if (!st2.ok()) return st2;
+            auto err = cudaMemcpy(tensor->data(), staging.data(),
+                                  num_el * sizeof(float), cudaMemcpyHostToDevice);
+            auto st3 = cuda_status(err, "copy GGUF weight to CUDA tensor failed");
+            if (!st3.ok()) return st3;
+#else
+            return Status::unsupported(
+                "cannot load GGUF weights into CUDA tensor without CUDA support");
+#endif
+        } else {
+            float* dst = reinterpret_cast<float*>(tensor->data());
+            auto st2 = dequantize_to_f32(ti.dtype, raw_buf.data(), dst, num_el);
+            if (!st2.ok()) return st2;
+        }
     }
 
     return Status::make_ok();
