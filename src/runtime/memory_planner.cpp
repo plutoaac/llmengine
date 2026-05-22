@@ -77,6 +77,7 @@ std::string MemoryPlan::report() const {
     oss << "  eligible intermediates: " << eligible_value_count << "\n";
     oss << "  skipped values: " << skipped_value_count << "\n";
     oss << "  buffers: " << buffers.size() << "\n";
+    oss << "  alignment: " << alignment << "\n";
     oss << "  naive bytes: " << naive_bytes << " (" << format_bytes(naive_bytes) << ")\n";
     oss << "  planned peak: " << planned_bytes << " (" << format_bytes(planned_bytes) << ")\n";
     oss << "  reuse saving: " << std::fixed << std::setprecision(1)
@@ -142,6 +143,7 @@ std::expected<MemoryPlan, Status> MemoryPlanner::plan(
     }
 
     MemoryPlan plan;
+    plan.alignment = options.alignment;
     plan.ranges.reserve(value_count);
 
     for (const auto& value : values) {

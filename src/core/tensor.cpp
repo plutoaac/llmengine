@@ -19,8 +19,12 @@ Tensor::Tensor(Tensor&& other) noexcept
       dtype_(other.dtype_),
       device_(other.device_),
       storage_(std::move(other.storage_)),
+      external_data_(other.external_data_),
+      external_bytes_(other.external_bytes_),
       cuda_storage_(other.cuda_storage_),
       cuda_bytes_(other.cuda_bytes_) {
+    other.external_data_ = nullptr;
+    other.external_bytes_ = 0;
     other.cuda_storage_ = nullptr;
     other.cuda_bytes_ = 0;
 }
@@ -33,8 +37,12 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
     dtype_ = other.dtype_;
     device_ = other.device_;
     storage_ = std::move(other.storage_);
+    external_data_ = other.external_data_;
+    external_bytes_ = other.external_bytes_;
     cuda_storage_ = other.cuda_storage_;
     cuda_bytes_ = other.cuda_bytes_;
+    other.external_data_ = nullptr;
+    other.external_bytes_ = 0;
     other.cuda_storage_ = nullptr;
     other.cuda_bytes_ = 0;
     return *this;
@@ -55,14 +63,18 @@ std::expected<size_t, Status> Tensor::nbytes() const {
     return *n * *s;
 }
 
-bool Tensor::is_allocated() const { return !storage_.empty() || cuda_storage_ != nullptr; }
+bool Tensor::is_allocated() const {
+    return external_data_ != nullptr || !storage_.empty() || cuda_storage_ != nullptr;
+}
 
 void* Tensor::data() {
+    if (external_data_) return external_data_;
     if (cuda_storage_) return cuda_storage_;
     return storage_.data();
 }
 
 const void* Tensor::data() const {
+    if (external_data_) return external_data_;
     if (cuda_storage_) return cuda_storage_;
     return storage_.data();
 }
@@ -126,6 +138,8 @@ Status Tensor::release() {
     cuda_storage_ = nullptr;
     cuda_bytes_ = 0;
 #endif
+    external_data_ = nullptr;
+    external_bytes_ = 0;
     storage_.clear();
     storage_.shrink_to_fit();
     return Status::make_ok();
@@ -135,6 +149,28 @@ Status Tensor::allocate_cpu_bytes(size_t bytes) {
     auto st = release();
     if (!st.ok()) return st;
     storage_.resize(bytes);
+    device_ = Device::cpu();
+    return Status::make_ok();
+}
+
+Status Tensor::bind_cpu_data(void* data, size_t bytes) {
+    auto st = release();
+    if (!st.ok()) return st;
+    if (!data) {
+        return Status::invalid_argument("cannot bind null CPU storage to tensor: " + name_);
+    }
+    if (shape_.has_dynamic_dim()) {
+        return Status::invalid_argument(
+            "cannot bind tensor with dynamic shape: " + shape_.to_string());
+    }
+    auto nb = nbytes();
+    if (!nb) return nb.error();
+    if (bytes < *nb) {
+        return Status::out_of_range(
+            "external CPU storage is too small for tensor " + name_);
+    }
+    external_data_ = data;
+    external_bytes_ = bytes;
     device_ = Device::cpu();
     return Status::make_ok();
 }

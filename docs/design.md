@@ -189,7 +189,7 @@ decode_ctx.set_kv_cache_advance_tokens(1);
 
 After a successful graph run, `CpuExecutor` calls `advance_kv_cache_step()` exactly once. This avoids advancing once per attention layer.
 
-Intermediate allocation is device-aware: a graph value tagged with `Device::cuda(index)` allocates CUDA storage, while the default CPU graph allocates CPU storage. This preserves the CPU-first behavior and gives CUDA experiments a narrow integration point.
+Intermediate allocation is device-aware: a graph value tagged with `Device::cuda(index)` allocates CUDA storage, while the default CPU graph allocates CPU storage. The plain `allocate_intermediates()` path still gives each value its own tensor. The planned path, `allocate_intermediates_planned()`, runs `MemoryPlanner`, allocates CPU arena buffers, and binds eligible intermediate tensors as non-owning views into those arenas. Outputs and other skipped values fall back to normal allocation.
 
 ## Graph Memory Planner
 
@@ -253,12 +253,13 @@ Graph memory plan:
   eligible intermediates: 28
   skipped values: 14
   buffers: 11
+  alignment: 64
   naive bytes: 50331648 (48.00 MiB)
   planned peak: 20971520 (20.00 MiB)
   reuse saving: 58.3%
 ```
 
-This is not yet an arena allocator. It is the analysis layer that an arena allocator can consume later.
+`RuntimeContext::allocate_intermediates_planned()` consumes this plan. For each logical buffer it allocates one aligned CPU arena block, then creates normal `Tensor` objects whose data pointers reference that block. Values with non-overlapping live ranges can therefore have different shapes but the same backing pointer. Constants and model weights are still externally bound, and outputs are kept separately by default so callers can safely read them after execution.
 
 ## CPU Backend
 
@@ -504,7 +505,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_cpu_kernels` | direct numerical checks for low-level CPU kernels |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
 | `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion, shared tied-weight binding |
-| `test_memory_planner` | graph liveness, buffer reuse planning, skip reasons, report output |
+| `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU arena binding, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
 | `test_cuda_kernels` | CUDA kernels, single/batched CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
@@ -521,7 +522,7 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 
 - quantized kernels such as Q8_0 or Q4_K
 - mmap-based weight loading
-- memory arena planning for intermediate tensors
+- CUDA arena allocation for intermediate tensors
 - multi-threaded execution
 - continuous batching and a production request scheduler
 - prefix cache and block sharing across requests
@@ -576,7 +577,7 @@ Good follow-up improvements:
 
 - add Q8_0 weight loading and matmul
 - add Release-mode benchmark tables
-- integrate the memory planner with a runtime arena allocator
+- add Release-mode activation-memory and prefill/decode benchmark tables
 - add Release-mode CUDA benchmark tables
 - connect the toy scheduler to an end-to-end decode loop
 - add multi-threaded GEMM

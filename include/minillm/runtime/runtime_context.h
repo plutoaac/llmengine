@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <expected>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -7,6 +9,7 @@
 #include "minillm/core/tensor.h"
 #include "minillm/graph/value.h"
 #include "minillm/runtime/kv_cache.h"
+#include "minillm/runtime/memory_planner.h"
 
 namespace minillm {
 
@@ -28,6 +31,18 @@ public:
     // Uses static shape; dynamic dims must already be resolved.
     Status allocate_intermediates(const Graph& graph);
 
+    // Allocate non-input/non-constant values with CPU intermediate buffer reuse.
+    // Returns the plan used for arena bindings so callers can report memory savings.
+    std::expected<MemoryPlan, Status> allocate_intermediates_planned(
+        const Graph& graph,
+        MemoryPlanOptions options = {});
+
+    // Apply an existing memory plan to this context. Values not covered by the
+    // plan, such as outputs by default, fall back to individual allocation.
+    Status allocate_intermediates_with_plan(
+        const Graph& graph,
+        const MemoryPlan& plan);
+
     // KV cache access
     KVCache* kv_cache() const { return kv_cache_.get(); }
     void set_kv_cache(std::shared_ptr<KVCache> cache) { kv_cache_ = std::move(cache); }
@@ -37,8 +52,16 @@ public:
     Status advance_kv_cache_step();
 
 private:
+    struct CpuArenaBlock {
+        std::unique_ptr<std::byte[]> storage;
+        std::byte* data = nullptr;
+        size_t bytes = 0;
+    };
+
     // ValueId.value -> Tensor*
     std::unordered_map<size_t, Tensor*> bindings_;
+    // Backing storage for planned CPU intermediate reuse.
+    std::vector<CpuArenaBlock> cpu_arenas_;
     // Owning storage for tensors we allocate
     std::vector<std::unique_ptr<Tensor>> owned_;
     // KV cache (shared between prefill and decode contexts)

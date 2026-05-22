@@ -13,7 +13,7 @@
 
 namespace minillm {
 
-// Runtime tensor: owns CPU storage via std::vector<std::byte>.
+// Runtime tensor: owns CPU/CUDA storage or views externally-owned CPU storage.
 // In the Graph IR, logical tensors are represented by Value; Tensor is the
 // physical data container that an Executor binds to a ValueId.
 class Tensor {
@@ -43,6 +43,7 @@ public:
     Status allocate_cuda();
     Status release();
     Status allocate_cpu_bytes(size_t bytes);
+    Status bind_cpu_data(void* data, size_t bytes);
 
 private:
     std::string name_;
@@ -50,6 +51,8 @@ private:
     DType dtype_{DType::Unknown};
     Device device_{Device::cpu()};
     std::vector<std::byte> storage_;
+    void* external_data_{nullptr};
+    size_t external_bytes_{0};
     void* cuda_storage_{nullptr};
     size_t cuda_bytes_{0};
 };

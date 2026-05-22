@@ -12,7 +12,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
 - **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, a small multi-sequence scheduler, CPU decode attention, and CUDA paged decode over device block tables.
-- **Graph memory planner** with liveness analysis, intermediate tensor buffer reuse planning, and peak-memory reporting.
+- **Graph memory planner** with liveness analysis, CPU intermediate arena reuse, and peak-memory reporting.
 - **GGUF support** for metadata parsing, tensor table reading, F32/F16/BF16 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
 
@@ -57,7 +57,7 @@ flowchart LR
 | FP32 CPU kernels | Implemented for core transformer ops |
 | Optional CUDA executor/backend | Experimental, disabled by default |
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
-| Graph memory planner | Implemented for CPU intermediates |
+| Graph memory planner | Implemented for CPU intermediates, with runtime arena binding |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with shared weight storage |
 | Byte-level BPE tokenizer | Experimental |
 | KV cache prefill/decode | Implemented for single-batch generation |
@@ -198,7 +198,7 @@ The test suite covers:
 - graph construction and validation
 - CPU executor integration
 - CPU kernel numerical reference checks
-- graph liveness and memory reuse planning
+- graph liveness, memory reuse planning, and CPU arena binding
 - KV cache prefill/decode advancement
 - paged KV block allocation, scheduler batch metadata, and paged decode attention
 - CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
@@ -242,7 +242,7 @@ Key design choices:
 - `KVCache` is shared between prefill and decode contexts and is advanced once after a successful graph run.
 - `SharedWeightStore` lets prefill and decode contexts reuse one loaded GGUF weight set instead of duplicating model parameters.
 - `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
-- `MemoryPlanner` computes intermediate tensor live ranges and assigns non-overlapping values to reusable buffers without changing runtime allocation yet.
+- `MemoryPlanner` computes intermediate tensor live ranges; `RuntimeContext::allocate_intermediates_planned()` binds non-overlapping CPU intermediates to shared arena buffers.
 - CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, and raw paged decode kernels. CUDA graph-memory arena integration, production batching policy, full paged-cache generation, and quantized CUDA matmul are intentionally left as future work.
 
 ## References
@@ -259,7 +259,7 @@ Near-term work with high portfolio value:
 
 - Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos.
 - Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
-- Hook the existing memory plan into `RuntimeContext::allocate_intermediates()` with an arena allocator.
+- Add Release-mode activation-memory and prefill/decode benchmark tables.
 - Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.
 - Connect `PagedAttentionScheduler` to a real decode loop with request admission and finished-sequence eviction.
 - Implement the first quantized weight path, likely `Q8_0`.

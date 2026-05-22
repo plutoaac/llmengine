@@ -29,6 +29,20 @@ void test_dynamic_shape_allocate_fails() {
     std::cout << "  PASS test_dynamic_shape_allocate_fails\n";
 }
 
+void test_bind_cpu_data_view() {
+    alignas(64) std::byte storage[64];
+    Tensor t("x", Shape({2, 3}), DType::Float32);
+    auto st = t.bind_cpu_data(storage, sizeof(storage));
+    assert(st.ok());
+    assert(t.is_allocated());
+    assert(t.data() == storage);
+
+    float* data = reinterpret_cast<float*>(t.data());
+    data[0] = 3.0f;
+    assert(reinterpret_cast<float*>(storage)[0] == 3.0f);
+    std::cout << "  PASS test_bind_cpu_data_view\n";
+}
+
 void test_unsupported_dtype_nbytes() {
     Tensor t("x", Shape({2, 3}), DType::Unknown);
     auto nb = t.nbytes();
@@ -41,6 +55,7 @@ int main() {
     test_nbytes();
     test_allocate_cpu();
     test_dynamic_shape_allocate_fails();
+    test_bind_cpu_data_view();
     test_unsupported_dtype_nbytes();
     std::cout << "All tests passed!\n";
     return 0;

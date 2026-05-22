@@ -1,4 +1,5 @@
 #include <cmath>
+#include <expected>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -13,16 +14,28 @@ using namespace minillm;
 
 namespace {
 
-Status allocate_runtime_tensors_cpu(const Graph& graph, RuntimeContext& ctx) {
+std::expected<MemoryPlan, Status> allocate_runtime_tensors_cpu(
+    const Graph& graph,
+    RuntimeContext& ctx) {
     for (const auto& v : graph.values()) {
-        if (v.kind == ValueKind::Constant) continue;
+        if (v.kind != ValueKind::Input) continue;
         auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
         auto st = t->allocate_cpu();
-        if (!st.ok()) return st;
+        if (!st.ok()) return std::unexpected(st);
         st = ctx.emplace(v.id, std::move(t));
-        if (!st.ok()) return st;
+        if (!st.ok()) return std::unexpected(st);
     }
-    return Status::make_ok();
+    return ctx.allocate_intermediates_planned(graph);
+}
+
+void print_plan_summary(const char* label, const MemoryPlan& plan) {
+    constexpr double MiB = 1024.0 * 1024.0;
+    std::cerr << label << " activation arena: "
+              << (static_cast<double>(plan.planned_bytes) / MiB)
+              << " MiB planned vs "
+              << (static_cast<double>(plan.naive_bytes) / MiB)
+              << " MiB naive, reuse saving "
+              << (plan.savings_ratio() * 100.0) << "%\n";
 }
 
 } // namespace
@@ -139,11 +152,13 @@ int main(int argc, char* argv[]) {
 
     // Prefill context
     RuntimeContext prefill_ctx;
-    st = allocate_runtime_tensors_cpu(prefill_graph, prefill_ctx);
-    if (!st.ok()) {
-        std::cerr << "Failed to allocate prefill tensors: " << st.to_string() << "\n";
+    auto prefill_plan = allocate_runtime_tensors_cpu(prefill_graph, prefill_ctx);
+    if (!prefill_plan) {
+        std::cerr << "Failed to allocate prefill tensors: "
+                  << prefill_plan.error().to_string() << "\n";
         return 1;
     }
+    print_plan_summary("Prefill", *prefill_plan);
     st = shared_weights->bind(prefill_graph, prefill_ctx);
     if (!st.ok()) {
         std::cerr << "Failed to bind prefill weights: " << st.to_string() << "\n";
@@ -152,11 +167,13 @@ int main(int argc, char* argv[]) {
 
     // Decode context
     RuntimeContext decode_ctx;
-    st = allocate_runtime_tensors_cpu(decode_graph, decode_ctx);
-    if (!st.ok()) {
-        std::cerr << "Failed to allocate decode tensors: " << st.to_string() << "\n";
+    auto decode_plan = allocate_runtime_tensors_cpu(decode_graph, decode_ctx);
+    if (!decode_plan) {
+        std::cerr << "Failed to allocate decode tensors: "
+                  << decode_plan.error().to_string() << "\n";
         return 1;
     }
+    print_plan_summary("Decode", *decode_plan);
     st = shared_weights->bind(decode_graph, decode_ctx);
     if (!st.ok()) {
         std::cerr << "Failed to bind decode weights: " << st.to_string() << "\n";

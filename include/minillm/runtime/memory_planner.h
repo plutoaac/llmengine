@@ -46,6 +46,7 @@ struct MemoryBuffer {
 struct MemoryPlan {
     std::vector<MemoryLiveRange> ranges;
     std::vector<MemoryBuffer> buffers;
+    size_t alignment = 64;
     size_t eligible_value_count = 0;
     size_t skipped_value_count = 0;
     size_t naive_bytes = 0;

@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdint>
 #include <iostream>
 #include <string>
 
@@ -81,6 +82,39 @@ void test_skips_non_plannable_values() {
     std::cout << "  PASS test_skips_non_plannable_values\n";
 }
 
+void test_runtime_context_uses_planned_arena() {
+    Graph g;
+    auto input = g.add_value("input", Shape({16}), DType::Float32,
+                             Device::cpu(), ValueKind::Input);
+    auto a = g.add_value("a", Shape({16}), DType::Float32,
+                         Device::cpu(), ValueKind::Intermediate);
+    auto b = g.add_value("b", Shape({32}), DType::Float32,
+                         Device::cpu(), ValueKind::Intermediate);
+    auto c = g.add_value("c", Shape({16}), DType::Float32,
+                         Device::cpu(), ValueKind::Intermediate);
+    assert(input && a && b && c);
+
+    assert(g.add_node(OpType::SiLU, "make_a", {*input}, {*a}));
+    assert(g.add_node(OpType::Linear, "make_b", {*a, *input}, {*b}));
+    assert(g.add_node(OpType::SiLU, "make_c", {*b}, {*c}));
+    assert(g.add_node(OpType::Output, "out", {*c}, {}));
+
+    RuntimeContext ctx;
+    auto plan = ctx.allocate_intermediates_planned(g);
+    assert(plan);
+    assert(plan->planned_bytes == 192);
+
+    Tensor* a_tensor = ctx.get(*a);
+    Tensor* b_tensor = ctx.get(*b);
+    Tensor* c_tensor = ctx.get(*c);
+    assert(a_tensor && b_tensor && c_tensor);
+    assert(a_tensor->data() == c_tensor->data());
+    assert(a_tensor->data() != b_tensor->data());
+    assert(reinterpret_cast<std::uintptr_t>(a_tensor->data()) % plan->alignment == 0);
+
+    std::cout << "  PASS test_runtime_context_uses_planned_arena\n";
+}
+
 void test_include_outputs_option() {
     Graph g;
     auto input = g.add_value("input", Shape({4}), DType::Float32,
@@ -126,6 +160,7 @@ int main() {
     std::cout << "test_memory_planner:\n";
     test_reuses_non_overlapping_intermediates();
     test_skips_non_plannable_values();
+    test_runtime_context_uses_planned_arena();
     test_include_outputs_option();
     test_rejects_invalid_alignment();
     std::cout << "All tests passed!\n";
