@@ -31,10 +31,19 @@ void apply_rope(const float* x, float* y, int seq_len, int head_dim, float base,
 void sdpa(const float* Q, const float* K, const float* V, float* output,
           int heads, int q_len, int kv_len, int head_dim, bool causal);
 
+// FlashAttention prefill: tiled + online softmax + fused attn@V
+// Same API as sdpa but uses O(q_len * head_dim) temp space instead of O(q_len * kv_len)
+void flash_sdpa(const float* Q, const float* K, const float* V, float* output,
+                int heads, int q_len, int kv_len, int head_dim, bool causal);
+
 // Decode-path SDPA for Q=1: Q [heads, 1, head_dim], K/V [kv_len, kv_hidden]
 // Handles GQA: K/V have num_kv_heads columns, expanded to num_heads
 void sdpa_decode(const float* Q, const float* K, const float* V, float* output,
                  int num_heads, int num_kv_heads, int head_dim, int kv_len);
+
+// FlashAttention decode: tiled + online softmax for Q=1 with GQA
+void flash_sdpa_decode(const float* Q, const float* K, const float* V, float* output,
+                       int num_heads, int num_kv_heads, int head_dim, int kv_len);
 
 // Softmax: y[rows, cols]
 void softmax(const float* x, float* y, int rows, int cols);

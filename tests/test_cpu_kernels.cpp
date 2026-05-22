@@ -10,7 +10,21 @@
 using namespace minillm;
 
 static void assert_near(float actual, float expected, float tol = 1e-5f) {
-    assert(std::abs(actual - expected) <= tol);
+    if (!(std::abs(actual - expected) <= tol)) {
+        std::cerr << "  FAIL: actual=" << actual << " expected=" << expected
+                  << " diff=" << std::abs(actual - expected) << " tol=" << tol << "\n";
+        assert(false);
+    }
+}
+
+static void assert_rel_near(float actual, float expected, float rtol = 1e-4f) {
+    float denom = std::max(std::abs(actual), std::abs(expected));
+    if (denom < 1e-6f) { assert_near(actual, expected); return; }
+    if (!(std::abs(actual - expected) / denom <= rtol)) {
+        std::cerr << "  FAIL: actual=" << actual << " expected=" << expected
+                  << " rel_diff=" << std::abs(actual - expected) / denom << " rtol=" << rtol << "\n";
+        assert(false);
+    }
 }
 
 static std::vector<float> reference_softmax(const std::vector<float>& x) {
@@ -214,6 +228,98 @@ void test_sdpa_decode_gqa() {
     std::cout << "  PASS test_sdpa_decode_gqa\n";
 }
 
+void test_flash_sdpa_matches_naive() {
+    // Compare flash_sdpa output against sdpa (naive) for the same inputs
+    const int heads = 2, q_len = 4, kv_len = 8, head_dim = 16;
+
+    std::vector<float> Q(static_cast<size_t>(heads) * q_len * head_dim);
+    std::vector<float> K(static_cast<size_t>(heads) * kv_len * head_dim);
+    std::vector<float> V(static_cast<size_t>(heads) * kv_len * head_dim);
+    std::vector<float> out_naive(static_cast<size_t>(heads) * q_len * head_dim);
+    std::vector<float> out_flash(static_cast<size_t>(heads) * q_len * head_dim);
+
+    // Fill with small random-ish values (use int arithmetic to avoid size_t underflow)
+    for (int i = 0; i < static_cast<int>(Q.size()); ++i) Q[i] = static_cast<float>((i * 7 + 3) % 19 - 9) * 0.1f;
+    for (int i = 0; i < static_cast<int>(K.size()); ++i) K[i] = static_cast<float>((i * 11 + 5) % 23 - 11) * 0.1f;
+    for (int i = 0; i < static_cast<int>(V.size()); ++i) V[i] = static_cast<float>((i * 13 + 7) % 17 - 8) * 0.1f;
+
+    cpu::sdpa(Q.data(), K.data(), V.data(), out_naive.data(),
+              heads, q_len, kv_len, head_dim, true);
+    cpu::flash_sdpa(Q.data(), K.data(), V.data(), out_flash.data(),
+                    heads, q_len, kv_len, head_dim, true);
+
+    for (size_t i = 0; i < out_naive.size(); ++i) {
+        assert_rel_near(out_flash[i], out_naive[i], 1e-3f);
+    }
+
+    // Also test non-causal
+    std::fill(out_naive.begin(), out_naive.end(), 0.0f);
+    std::fill(out_flash.begin(), out_flash.end(), 0.0f);
+    cpu::sdpa(Q.data(), K.data(), V.data(), out_naive.data(),
+              heads, q_len, kv_len, head_dim, false);
+    cpu::flash_sdpa(Q.data(), K.data(), V.data(), out_flash.data(),
+                    heads, q_len, kv_len, head_dim, false);
+
+    for (size_t i = 0; i < out_naive.size(); ++i) {
+        assert_rel_near(out_flash[i], out_naive[i], 1e-3f);
+    }
+
+    std::cout << "  PASS test_flash_sdpa_matches_naive\n";
+}
+
+void test_flash_sdpa_larger() {
+    // Larger shape to exercise multiple KV tiles
+    const int heads = 4, q_len = 16, kv_len = 128, head_dim = 32;
+
+    std::vector<float> Q(static_cast<size_t>(heads) * q_len * head_dim);
+    std::vector<float> K(static_cast<size_t>(heads) * kv_len * head_dim);
+    std::vector<float> V(static_cast<size_t>(heads) * kv_len * head_dim);
+    std::vector<float> out_naive(static_cast<size_t>(heads) * q_len * head_dim);
+    std::vector<float> out_flash(static_cast<size_t>(heads) * q_len * head_dim);
+
+    for (int i = 0; i < static_cast<int>(Q.size()); ++i) Q[i] = static_cast<float>((i * 7 + 3) % 19 - 9) * 0.1f;
+    for (int i = 0; i < static_cast<int>(K.size()); ++i) K[i] = static_cast<float>((i * 11 + 5) % 23 - 11) * 0.1f;
+    for (int i = 0; i < static_cast<int>(V.size()); ++i) V[i] = static_cast<float>((i * 13 + 7) % 17 - 8) * 0.1f;
+
+    cpu::sdpa(Q.data(), K.data(), V.data(), out_naive.data(),
+              heads, q_len, kv_len, head_dim, true);
+    cpu::flash_sdpa(Q.data(), K.data(), V.data(), out_flash.data(),
+                    heads, q_len, kv_len, head_dim, true);
+
+    for (size_t i = 0; i < out_naive.size(); ++i) {
+        assert_rel_near(out_flash[i], out_naive[i], 1e-3f);
+    }
+
+    std::cout << "  PASS test_flash_sdpa_larger\n";
+}
+
+void test_flash_sdpa_decode_matches_naive() {
+    // Compare flash_sdpa_decode against sdpa_decode
+    const int num_heads = 4, num_kv_heads = 2, head_dim = 16, kv_len = 64;
+    int kv_hidden = num_kv_heads * head_dim;
+
+    std::vector<float> Q(static_cast<size_t>(num_heads) * head_dim);
+    std::vector<float> K(static_cast<size_t>(kv_len) * kv_hidden);
+    std::vector<float> V(static_cast<size_t>(kv_len) * kv_hidden);
+    std::vector<float> out_naive(static_cast<size_t>(num_heads) * head_dim);
+    std::vector<float> out_flash(static_cast<size_t>(num_heads) * head_dim);
+
+    for (int i = 0; i < static_cast<int>(Q.size()); ++i) Q[i] = static_cast<float>((i * 7 + 3) % 19 - 9) * 0.1f;
+    for (int i = 0; i < static_cast<int>(K.size()); ++i) K[i] = static_cast<float>((i * 11 + 5) % 23 - 11) * 0.1f;
+    for (int i = 0; i < static_cast<int>(V.size()); ++i) V[i] = static_cast<float>((i * 13 + 7) % 17 - 8) * 0.1f;
+
+    cpu::sdpa_decode(Q.data(), K.data(), V.data(), out_naive.data(),
+                     num_heads, num_kv_heads, head_dim, kv_len);
+    cpu::flash_sdpa_decode(Q.data(), K.data(), V.data(), out_flash.data(),
+                           num_heads, num_kv_heads, head_dim, kv_len);
+
+    for (size_t i = 0; i < out_naive.size(); ++i) {
+        assert_rel_near(out_flash[i], out_naive[i], 1e-3f);
+    }
+
+    std::cout << "  PASS test_flash_sdpa_decode_matches_naive\n";
+}
+
 int main() {
     std::cout << "test_cpu_kernels:\n";
     test_sgemm();
@@ -226,6 +332,9 @@ int main() {
     test_transpose();
     test_sdpa_causal();
     test_sdpa_decode_gqa();
+    test_flash_sdpa_matches_naive();
+    test_flash_sdpa_larger();
+    test_flash_sdpa_decode_matches_naive();
     std::cout << "All tests passed!\n";
     return 0;
 }

@@ -9,6 +9,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **C++23 inference runtime** with strongly typed graph IDs, `std::expected` error handling, and a small public umbrella header.
 - **Graph IR + executor** with `Value`, `Node`, `GraphBuilder`, topological sort, backend capability checks, and runtime tensor binding.
 - **CPU backend** for FP32 kernels including `Linear`, `MatMul`, `RMSNorm`, `QKNorm`, `RoPE`, `Attention`, `Softmax`, `SwiGLU`, `Embedding`, `Transpose`, and `Reshape`.
+- **FlashAttention-style CPU attention** with tiled K/V traversal, online softmax, and a benchmark against the naive SDPA path.
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
 - **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, a small multi-sequence scheduler, CPU decode attention, and CUDA paged decode over device block tables.
@@ -55,6 +56,7 @@ flowchart LR
 | Graph IR / GraphBuilder / shape inference | Implemented |
 | CPU executor and kernel registry | Implemented |
 | FP32 CPU kernels | Implemented for core transformer ops |
+| CPU FlashAttention-style SDPA | Implemented for prefill and decode reference paths |
 | Optional CUDA executor/backend | Experimental, disabled by default |
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU intermediates, with O(n log n) matching and contiguous arena binding |
@@ -105,6 +107,7 @@ Run examples:
 ./build/forward_tiny_llama
 ./build/forward_tiny_llama_gguf /path/to/model.gguf
 ./build/generate /path/to/model.gguf "Hello"
+./build/benchmark_flash_attention 2 8
 ./build-cuda/forward_tiny_llama_gguf_cuda /path/to/model.gguf
 ./build-cuda/generate_cuda /path/to/model.gguf "Hello" 2
 ```
@@ -145,7 +148,7 @@ The CUDA path does not yet include quantized CUDA matmul, production scheduler p
 
 The scheduler is intentionally small: it is not a production request queue, but it demonstrates the core bridge between paged KV allocation and batched GPU decode.
 
-## CPU Benchmark
+## CPU Benchmarks
 
 `benchmark_cpu` measures the GEMM paths used by the CPU backend.
 
@@ -168,6 +171,26 @@ sgemm        shape=[1,512,512] iters=5 avg_ms=0.1473 gflops=3.56
 ```
 
 Use `-DCMAKE_BUILD_TYPE=Release` for meaningful performance numbers.
+
+`benchmark_flash_attention` compares the naive CPU SDPA path against the tiled online-softmax FlashAttention-style CPU path:
+
+```bash
+./build/benchmark_flash_attention [iters] [heads]
+```
+
+Example Release-mode run on the development server:
+
+```text
+    seq head_dim  heads      sdpa_ms     flash_ms   speedup max_rel_err
+    128       64      8        4.064        0.938      4.33    1.41e-04
+    128      128      8        9.432        1.531      6.16    3.17e-03
+    256       64      8       22.317        3.132      7.12    5.39e-04
+    256      128      8       43.841        5.951      7.37    3.17e-03
+    512       64      8       90.460       12.192      7.42    1.72e-03
+    512      128      8      174.011       23.382      7.44    3.17e-03
+```
+
+The CUDA attention kernel already uses an online-softmax fused SDPA shape for prefill/decode, but it is not a full shared-memory tiled FlashAttention implementation.
 
 ## Tests
 
@@ -199,7 +222,7 @@ The test suite covers:
 - shape and tensor allocation behavior
 - graph construction and validation
 - CPU executor integration
-- CPU kernel numerical reference checks
+- CPU kernel numerical reference checks, including FlashAttention-style SDPA comparisons
 - graph liveness, memory reuse planning, and CPU arena binding
 - transformer graph weight naming and RoPE metadata propagation
 - tokenizer boundary behavior and GGUF parser safety checks

@@ -382,6 +382,214 @@ void sdpa_decode(const float* Q, const float* K, const float* V, float* output,
 }
 
 // ===========================================================================
+// FlashAttention prefill: tiled + online softmax + fused attn@V
+// Key insight: instead of materializing the full score matrix (O(q_len * kv_len)),
+// we tile over KV and maintain running softmax state (m_i, l_i) per query position.
+// This fuses QK^T + softmax + attn@V into one pass with O(q_len * head_dim) temp.
+// ===========================================================================
+
+void flash_sdpa(const float* Q, const float* K, const float* V, float* output,
+                int heads, int q_len, int kv_len, int head_dim, bool causal) {
+    constexpr int KVTILE = 32;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    int q_per_head = q_len * head_dim;
+    int kv_per_head = kv_len * head_dim;
+
+    for (int h = 0; h < heads; ++h) {
+        const float* q_h = Q + h * q_per_head;
+        const float* k_h = K + h * kv_per_head;
+        const float* v_h = V + h * kv_per_head;
+        float* o_h = output + h * q_per_head;
+
+        for (int qi = 0; qi < q_len; ++qi) {
+            const float* q_vec = q_h + qi * head_dim;
+            float* o_vec = o_h + qi * head_dim;
+
+            // Online softmax state
+            float m = -std::numeric_limits<float>::infinity();
+            float l = 0.0f;
+            for (int d = 0; d < head_dim; ++d) o_vec[d] = 0.0f;
+
+            // Tile over KV positions
+            for (int kt = 0; kt < kv_len; kt += KVTILE) {
+                int tile_end = std::min(kt + KVTILE, kv_len);
+                // Causal: skip tiles entirely past qi
+                if (causal && kt > qi) break;
+
+                // 1. Compute QK^T for this tile, find local max
+                float tile_max = -std::numeric_limits<float>::infinity();
+                alignas(64) float tile_scores[KVTILE];
+
+                for (int ki = kt; ki < tile_end; ++ki) {
+                    if (causal && ki > qi) {
+                        tile_scores[ki - kt] = -std::numeric_limits<float>::infinity();
+                        continue;
+                    }
+                    // SIMD dot product: q_vec . k_row
+                    const float* k_row = k_h + ki * head_dim;
+                    float dot = 0.0f;
+                    vfloat vsum = VF_SETZERO();
+                    int d = 0;
+                    for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                        vsum = VF_ADD(vsum, VF_MUL(VF_LOAD(q_vec + d), VF_LOAD(k_row + d)));
+                    dot = hsum(vsum);
+                    for (; d < head_dim; ++d)
+                        dot += q_vec[d] * k_row[d];
+                    tile_scores[ki - kt] = dot * scale;
+                    tile_max = std::max(tile_max, tile_scores[ki - kt]);
+                }
+
+                // 2. Online softmax: update running max
+                float m_new = std::max(m, tile_max);
+
+                // 3. Correction factor for previous accumulations
+                float alpha = (m == -std::numeric_limits<float>::infinity())
+                                  ? 1.0f
+                                  : std::exp(m - m_new);
+
+                // 4. Exp and compute tile sum
+                float tile_sum = 0.0f;
+                for (int ki = kt; ki < tile_end; ++ki) {
+                    float e = std::exp(tile_scores[ki - kt] - m_new);
+                    tile_scores[ki - kt] = e;
+                    tile_sum += e;
+                }
+
+                // 5. Correct previous output and running sum
+                vfloat valpha = VF_SET1(alpha);
+                int d = 0;
+                for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                    VF_STORE(o_vec + d, VF_MUL(VF_LOAD(o_vec + d), valpha));
+                for (; d < head_dim; ++d) o_vec[d] *= alpha;
+                l *= alpha;
+
+                // 6. Accumulate weighted V for this tile
+                for (int ki = kt; ki < tile_end; ++ki) {
+                    float w = tile_scores[ki - kt];
+                    if (w == 0.0f) continue;
+                    const float* v_row = v_h + ki * head_dim;
+                    vfloat vw = VF_SET1(w);
+                    d = 0;
+                    for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                        VF_STORE(o_vec + d, VF_FMADD(vw, VF_LOAD(v_row + d), VF_LOAD(o_vec + d)));
+                    for (; d < head_dim; ++d)
+                        o_vec[d] += w * v_row[d];
+                }
+                l += tile_sum;
+                m = m_new;
+            }
+
+            // 7. Final normalization
+            if (l > 0.0f) {
+                float inv_l = 1.0f / l;
+                vfloat vinv = VF_SET1(inv_l);
+                int d = 0;
+                for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                    VF_STORE(o_vec + d, VF_MUL(VF_LOAD(o_vec + d), vinv));
+                for (; d < head_dim; ++d) o_vec[d] *= inv_l;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// FlashAttention decode: tiled + online softmax for Q=1 with GQA
+// Q: [num_heads, 1, head_dim]    — interleaved heads
+// K: [kv_len, kv_hidden]         — cached K, interleaved kv_heads per position
+// V: [kv_len, kv_hidden]         — cached V, same layout
+// output: [num_heads * head_dim]  — single position output
+// ===========================================================================
+
+void flash_sdpa_decode(const float* Q, const float* K, const float* V, float* output,
+                       int num_heads, int num_kv_heads, int head_dim, int kv_len) {
+    constexpr int KVTILE = 32;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    int kv_hidden = num_kv_heads * head_dim;
+    int group_size = num_heads / num_kv_heads;
+
+    for (int h = 0; h < num_heads; ++h) {
+        int kv_h = h / group_size;
+        const float* q_vec = Q + h * head_dim;
+        float* o_vec = output + h * head_dim;
+
+        // Online softmax state
+        float m = -std::numeric_limits<float>::infinity();
+        float l = 0.0f;
+        for (int d = 0; d < head_dim; ++d) o_vec[d] = 0.0f;
+
+        // Tile over KV cache
+        for (int kt = 0; kt < kv_len; kt += KVTILE) {
+            int tile_end = std::min(kt + KVTILE, kv_len);
+
+            // 1. Compute QK^T for this tile, find local max
+            float tile_max = -std::numeric_limits<float>::infinity();
+            alignas(64) float tile_scores[KVTILE];
+
+            for (int ki = kt; ki < tile_end; ++ki) {
+                const float* k_row = K + ki * kv_hidden + kv_h * head_dim;
+                float dot = 0.0f;
+                vfloat vsum = VF_SETZERO();
+                int d = 0;
+                for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                    vsum = VF_ADD(vsum, VF_MUL(VF_LOAD(q_vec + d), VF_LOAD(k_row + d)));
+                dot = hsum(vsum);
+                for (; d < head_dim; ++d)
+                    dot += q_vec[d] * k_row[d];
+                tile_scores[ki - kt] = dot * scale;
+                tile_max = std::max(tile_max, tile_scores[ki - kt]);
+            }
+
+            // 2. Online softmax update
+            float m_new = std::max(m, tile_max);
+            float alpha = (m == -std::numeric_limits<float>::infinity())
+                              ? 1.0f
+                              : std::exp(m - m_new);
+
+            // 3. Exp and tile sum
+            float tile_sum = 0.0f;
+            for (int ki = kt; ki < tile_end; ++ki) {
+                float e = std::exp(tile_scores[ki - kt] - m_new);
+                tile_scores[ki - kt] = e;
+                tile_sum += e;
+            }
+
+            // 4. Correct previous output
+            vfloat valpha = VF_SET1(alpha);
+            int d = 0;
+            for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                VF_STORE(o_vec + d, VF_MUL(VF_LOAD(o_vec + d), valpha));
+            for (; d < head_dim; ++d) o_vec[d] *= alpha;
+            l *= alpha;
+
+            // 5. Accumulate weighted V
+            for (int ki = kt; ki < tile_end; ++ki) {
+                float w = tile_scores[ki - kt];
+                if (w == 0.0f) continue;
+                const float* v_row = V + ki * kv_hidden + kv_h * head_dim;
+                vfloat vw = VF_SET1(w);
+                d = 0;
+                for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                    VF_STORE(o_vec + d, VF_FMADD(vw, VF_LOAD(v_row + d), VF_LOAD(o_vec + d)));
+                for (; d < head_dim; ++d)
+                    o_vec[d] += w * v_row[d];
+            }
+            l += tile_sum;
+            m = m_new;
+        }
+
+        // 6. Final normalization
+        if (l > 0.0f) {
+            float inv_l = 1.0f / l;
+            vfloat vinv = VF_SET1(inv_l);
+            int d = 0;
+            for (; d + MINILLM_SIMD_WIDTH <= head_dim; d += MINILLM_SIMD_WIDTH)
+                VF_STORE(o_vec + d, VF_MUL(VF_LOAD(o_vec + d), vinv));
+            for (; d < head_dim; ++d) o_vec[d] *= inv_l;
+        }
+    }
+}
+
+// ===========================================================================
 // Softmax (row-wise, SIMD)
 // ===========================================================================
 

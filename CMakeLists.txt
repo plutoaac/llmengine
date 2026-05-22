@@ -137,6 +137,10 @@ target_link_libraries(generate PRIVATE minillm_io)
 add_executable(benchmark_cpu examples/benchmark_cpu.cpp)
 target_link_libraries(benchmark_cpu PRIVATE minillm_runtime)
 
+# Example: CPU FlashAttention benchmark
+add_executable(benchmark_flash_attention examples/benchmark_flash_attention.cpp)
+target_link_libraries(benchmark_flash_attention PRIVATE minillm_runtime)
+
 # Tests
 function(add_minillm_test test_name)
     add_executable(${test_name} tests/${test_name}.cpp)

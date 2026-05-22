@@ -288,6 +288,16 @@ Implemented CPU ops include:
 - `Reshape`
 - `Transpose`
 
+The CPU attention path now has two implementations. `sdpa()` is the straightforward reference-style implementation that materializes a score row, applies softmax, and then multiplies by V. `flash_sdpa()` and `flash_sdpa_decode()` use tiled K/V traversal with online softmax state:
+
+```text
+m = running max
+l = running exp-sum
+o = running weighted V accumulator
+```
+
+Each K/V tile updates `(m, l, o)` without materializing the full attention matrix. This is FlashAttention-style in memory behavior and is still intentionally small enough to read in one file. The `benchmark_flash_attention` executable compares this path against `sdpa()` for prefill-shaped causal attention.
+
 ## Optional CUDA Backend
 
 The CUDA backend follows the same three-layer shape as the CPU runtime:
@@ -311,7 +321,7 @@ Current CUDA scope:
 - GGUF F32/F16/BF16 weight staging into CUDA tensors for no-cache forward smoke tests
 - single-batch CUDA generation with a contiguous device KV cache
 
-The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads.
+The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads. CUDA SDPA and decode attention use an online-softmax fused shape, but the CUDA path does not yet implement a full shared-memory tiled FlashAttention kernel.
 
 The CUDA path is experimental and disabled by default:
 
@@ -369,6 +379,12 @@ The benchmark executable measures this path:
 ./build/benchmark_cpu 1 2048 2048 20
 ```
 
+FlashAttention-style CPU attention can be benchmarked with:
+
+```bash
+./build/benchmark_flash_attention 2 8
+```
+
 ## Attention And KV Cache
 
 The attention kernel supports two runtime modes.
@@ -383,7 +399,7 @@ K: [heads, kv_len, head_dim]
 V: [heads, kv_len, head_dim]
 ```
 
-Then scaled dot-product attention is computed directly.
+Then scaled dot-product attention is computed directly. On CPU, the executor uses the FlashAttention-style `flash_sdpa()` implementation for this no-cache path; the naive `sdpa()` remains available for tests and benchmarking.
 
 ### Cache Path
 
@@ -392,7 +408,7 @@ With a cache, the runtime uses separate prefill and decode behavior.
 Prefill:
 
 1. K/V for the full prompt are copied into `KVCache`.
-2. attention is computed over the prompt.
+2. attention is computed over the prompt with the FlashAttention-style CPU path or CUDA online-softmax SDPA.
 3. after the graph completes, the executor advances the cache by `prompt_len`.
 
 Decode:
@@ -503,7 +519,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_tensor` | tensor byte sizing and CPU allocation |
 | `test_graph` | graph validation and dumping |
 | `test_graph_builder` | shape inference and builder-level validation |
-| `test_cpu_kernels` | direct numerical checks for low-level CPU kernels |
+| `test_cpu_kernels` | direct numerical checks for low-level CPU kernels, including FlashAttention-style SDPA |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
 | `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion, shared tied-weight binding |
 | `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU arena binding, skip reasons, report output |
@@ -566,6 +582,7 @@ This project is useful to discuss:
 - how shape inference catches errors before execution
 - how kernel dispatch works in a backend runtime
 - why Linear commonly uses `A[M,K] x W[N,K]^T`
+- how online softmax removes the need to materialize the full attention matrix
 - how KV cache changes decode complexity
 - why PagedAttention uses block tables instead of one large contiguous cache per sequence
 - how a scheduler turns multiple paged KV block tables into one batch for decode

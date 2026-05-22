@@ -507,7 +507,7 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
                 }
             }
 
-            cpu::sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
+            cpu::flash_sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
                       nh, seq_len, seq_len, hd, causal);
 
             for (int h = 0; h < nh; ++h) {
@@ -587,7 +587,7 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
                 }
             }
 
-            cpu::sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
+            cpu::flash_sdpa(q_buf.data(), k_buf.data(), v_buf.data(), o_buf.data(),
                       nh, seq_len, seq_len, hd, causal);
 
             for (int h = 0; h < nh; ++h) {
@@ -637,7 +637,7 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
 
             // Use sdpa_decode which handles GQA directly from cache layout
             std::vector<float> o_buf(static_cast<size_t>(nh) * hd);
-            cpu::sdpa_decode(q_buf.data(), cache_k, cache_v, o_buf.data(),
+            cpu::flash_sdpa_decode(q_buf.data(), cache_k, cache_v, o_buf.data(),
                              nh, nkv, hd, new_kv_len);
 
             // Copy output: [nh*hd] -> [1, nh*hd]
