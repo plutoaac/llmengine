@@ -479,13 +479,42 @@ output:           [batch_size, num_heads, head_dim]
 
 This is still a toy scheduler, not a server runtime. It does not yet implement admission control, preemption, request queues, prefix reuse, or streaming token handoff. Its purpose is to make the paged KV layout useful for multiple active sequences and to provide a clear stepping stone toward continuous batching.
 
+## Continuous Batching Scheduler
+
+`ContinuousBatchScheduler` manages request lifecycle across four phases:
+
+| Phase | Description |
+|-------|-------------|
+| Waiting | Request submitted, not yet allocated KV blocks |
+| Prefilling | KV blocks allocated, prompt tokens being processed |
+| Decoding | Autoregressive token generation, one token per step |
+| Finished | EOS or max tokens reached; KV blocks returned to free list |
+
+The scheduler is deliberately decoupled from model execution. The caller drives the actual compute and informs the scheduler of progress:
+
+```cpp
+scheduler.submit({.prompt_tokens = {1, 2, 3}, .max_tokens = 64});
+scheduler.admit_waiting();  // allocates KV blocks, moves to Prefilling
+// Prefill: caller writes prompt K/V into PagedKVCache, then:
+scheduler.mark_prefill_progress(seq_id, prompt_len);
+// Decode loop: caller runs model, samples token, then:
+scheduler.mark_token_generated(seq_id, token);
+// When finished:
+scheduler.evict_finished();  // frees KV blocks
+auto outputs = scheduler.collect_finished();
+```
+
+This design means the scheduler works with any executor backend (CPU, CUDA, mock) and any sampling strategy. Block allocation and deallocation are tied to `PagedKVCache::reserve_sequence()` and `PagedKVCache::free_sequence()`, giving direct memory visibility.
+
+The `generate_paged` example currently demonstrates multi-sequence decode using `PagedKVCache` for KV storage. `ContinuousBatchScheduler` is covered by its own lifecycle tests and is the next component to wire into that real generation loop.
+
 ## GGUF Loading
 
 The IO layer is split into:
 
 - `GGUFParser`: reads file header, metadata, tensor infos, and raw tensor data.
 - `WeightLoader`: maps GGUF tensor names to graph value names and converts supported formats to FP32 runtime tensors.
-- `BPETokenizer`: experimental byte-level tokenizer initialized from GGUF metadata.
+- `BPETokenizer`: byte-level BPE tokenizer with GPT-2 pre-tokenization initialized from GGUF metadata.
 
 Currently supported weight data types:
 
@@ -525,6 +554,8 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU arena binding, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
+| `test_continuous_batch_scheduler` | admission, eviction, phase transitions, block reuse, finished request collection |
+| `test_e2e_verification` | contiguous vs paged KV numerical alignment, multi-sequence paged decode, block reuse |
 | `test_transformer_graph_builder` | transformer weight naming and RoPE base propagation |
 | `test_bpe_tokenizer` | tokenizer initialization and boundary behavior |
 | `test_cuda_kernels` | CUDA kernels, single/batched CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
@@ -586,6 +617,7 @@ This project is useful to discuss:
 - how KV cache changes decode complexity
 - why PagedAttention uses block tables instead of one large contiguous cache per sequence
 - how a scheduler turns multiple paged KV block tables into one batch for decode
+- how `ContinuousBatchScheduler` manages request lifecycle from prefill through decode to eviction
 - how GGUF metadata and tensor loading fit into inference
 - how parser bounds checks prevent malformed model files from turning into unsafe allocations
 - how a CPU backend can be mirrored by an optional CUDA backend

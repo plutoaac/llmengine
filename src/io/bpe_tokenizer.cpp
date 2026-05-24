@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
-#include <codecvt>
-#include <locale>
 #include <sstream>
 
 namespace minillm {
@@ -72,11 +70,14 @@ static std::string codepoint_to_utf8(int cp) {
 }
 
 // ===========================================================================
-// GPT-2 pre-tokenization pattern
-// ===========================================================================
-
-// Simplified GPT-2 pre-tokenization: split on whitespace and punctuation
-// Pattern: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+// GPT-2 pre-tokenization pattern:
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+//
+// Treats non-ASCII bytes (>=0x80) as letter-class so they stay grouped with
+// adjacent letters, matching the behaviour of tiktoken/GPT-2 for common cases.
+// Full \p{L}/\p{N} unicode property support would require ICU; the current
+// approach is correct for ASCII and reasonable for mixed-input where non-ASCII
+// text is already encoded into byte-level tokens by the outer BPE loop.
 std::vector<std::string> BPETokenizer::gpt2_pretokenize(const std::string& text) const {
     std::vector<std::string> result;
     std::string current;
@@ -87,19 +88,17 @@ std::vector<std::string> BPETokenizer::gpt2_pretokenize(const std::string& text)
     for (size_t i = 0; i < text.size(); ) {
         unsigned char c = static_cast<unsigned char>(text[i]);
         bool is_space = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-        bool is_letter = std::isalpha(c);
-        bool is_digit = std::isdigit(c);
+        bool is_letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80;
+        bool is_digit = (c >= '0' && c <= '9');
 
         if (is_space) {
             if (!current.empty()) {
                 result.push_back(current);
                 current.clear();
             }
-            // Consume whitespace; attach leading space to next token
             pending_space = true;
             current = " ";
             ++i;
-            // Skip remaining spaces unless there's a non-space following
             while (i < text.size()) {
                 unsigned char nc = static_cast<unsigned char>(text[i]);
                 if (nc != ' ' && nc != '\t' && nc != '\n' && nc != '\r') break;
@@ -108,7 +107,6 @@ std::vector<std::string> BPETokenizer::gpt2_pretokenize(const std::string& text)
             continue;
         }
 
-        // Check for contractions first
         if (c == '\'' && i + 1 < text.size()) {
             unsigned char nc = static_cast<unsigned char>(text[i + 1]);
             std::string contraction;
@@ -130,10 +128,6 @@ std::vector<std::string> BPETokenizer::gpt2_pretokenize(const std::string& text)
                 pending_space = false;
                 continue;
             }
-        }
-
-        if (!pending_space && current.empty() && result.empty() && is_letter) {
-            // Start of text, no leading space
         }
 
         if (is_letter) {
@@ -401,26 +395,24 @@ std::expected<std::string, Status> BPETokenizer::decode(
         byte_encoded += tokens_[id];
     }
 
-    // Decode byte-encoded string back to UTF-8
     std::string result;
-    std::string acc;
     for (size_t i = 0; i < byte_encoded.size(); ) {
-        // Try to decode multi-byte UTF-8 sequences
-        acc.clear();
-        // Accumulate until we have a valid byte_decoder key
+        bool decoded = false;
+        std::string acc;
         for (size_t j = i; j < byte_encoded.size(); ++j) {
             acc += byte_encoded[j];
             auto it = byte_decoder_.find(acc);
             if (it != byte_decoder_.end()) {
                 result += static_cast<char>(it->second);
                 i = j + 1;
-                goto next_char;
+                decoded = true;
+                break;
             }
         }
-        // Fallback: output raw byte
-        result += byte_encoded[i];
-        ++i;
-        next_char:;
+        if (!decoded) {
+            result += byte_encoded[i];
+            ++i;
+        }
     }
 
     return result;

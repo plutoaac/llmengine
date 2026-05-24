@@ -40,6 +40,17 @@ static int tests_failed = 0;
 
 // --- GGUF test file writer ---
 
+static uint16_t float_to_f16(float f) {
+    uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3FF;
+    if (exp <= 0) return static_cast<uint16_t>(sign);  // flush to zero
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00);  // inf
+    return static_cast<uint16_t>(sign | (exp << 10) | mant);
+}
+
 class GgufWriter {
 public:
     explicit GgufWriter(std::string path) : path_(std::move(path)) {}
@@ -109,6 +120,41 @@ public:
         tensors_.push_back(std::move(e));
     }
 
+    // Add a Q8_0 tensor from float32 data (quantizes in-place)
+    void add_tensor_q8_0(const std::string& name, int64_t d0, int64_t d1,
+                         const std::vector<float>& f32_data) {
+        TensorEntry e;
+        e.name = name;
+        e.dims = {d0, d1};
+        e.dtype = static_cast<uint32_t>(GgmlDataType::Q8_0);
+        size_t numel = static_cast<size_t>(d0) * static_cast<size_t>(d1);
+        size_t num_blocks = (numel + 31) / 32;
+        e.data_raw.resize(num_blocks * 34);
+        for (size_t b = 0; b < num_blocks; ++b) {
+            size_t base = b * 32;
+            size_t count = std::min(size_t(32), numel - base);
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < count; ++i) {
+                float v = std::fabs((base + i < f32_data.size()) ? f32_data[base + i] : 0.0f);
+                if (v > max_abs) max_abs = v;
+            }
+            float d = max_abs / 127.0f;
+            float inv_d = (d > 0.0f) ? 1.0f / d : 0.0f;
+            // Write fp16 scale (little-endian)
+            uint16_t d_f16 = float_to_f16(d);
+            e.data_raw[b * 34 + 0] = d_f16 & 0xFF;
+            e.data_raw[b * 34 + 1] = (d_f16 >> 8) & 0xFF;
+            for (size_t i = 0; i < count; ++i) {
+                float src = (base + i < f32_data.size()) ? f32_data[base + i] : 0.0f;
+                float v = src * inv_d;
+                v = std::max(-127.0f, std::min(127.0f, v));
+                e.data_raw[b * 34 + 2 + i] = static_cast<uint8_t>(
+                    static_cast<int8_t>(std::round(v)));
+            }
+        }
+        tensors_.push_back(std::move(e));
+    }
+
     void write() {
         buf_.clear();
 
@@ -175,6 +221,12 @@ public:
                     write_float_le(val);
                 }
                 current_offset += elem_count * 4;
+            } else if (!t.data_raw.empty()) {
+                // Raw quantized data (Q8_0, etc.)
+                for (uint8_t byte : t.data_raw) {
+                    buf_.push_back(byte);
+                }
+                current_offset += t.data_raw.size();
             } else {
                 // F16 or BF16
                 for (size_t i = 0; i < elem_count; ++i) {
@@ -202,6 +254,7 @@ private:
         uint64_t data_offset = 0;
         std::vector<float> data_f32;
         std::vector<uint16_t> data_u16;
+        std::vector<uint8_t> data_raw;  // for quantized types (Q8_0, etc.)
     };
 
     void rewrite_with_offsets(uint64_t data_offset_start) {
@@ -246,12 +299,16 @@ private:
         uint64_t current_data_offset = 0;
         for (auto& t : tensors_) {
             t.data_offset = current_data_offset;
-            size_t elem_count = 1;
-            for (auto d : t.dims) elem_count *= static_cast<size_t>(d);
-            if (t.dtype == static_cast<uint32_t>(GgmlDataType::F32)) {
-                current_data_offset += elem_count * 4;
+            if (!t.data_raw.empty()) {
+                current_data_offset += t.data_raw.size();
             } else {
-                current_data_offset += elem_count * 2;
+                size_t elem_count = 1;
+                for (auto d : t.dims) elem_count *= static_cast<size_t>(d);
+                if (t.dtype == static_cast<uint32_t>(GgmlDataType::F32)) {
+                    current_data_offset += elem_count * 4;
+                } else {
+                    current_data_offset += elem_count * 2;
+                }
             }
         }
 
@@ -272,17 +329,23 @@ private:
 
         // Tensor data
         for (auto& t : tensors_) {
-            size_t elem_count = 1;
-            for (auto d : t.dims) elem_count *= static_cast<size_t>(d);
-            if (t.dtype == static_cast<uint32_t>(GgmlDataType::F32)) {
-                for (size_t i = 0; i < elem_count; ++i) {
-                    float val = (i < t.data_f32.size()) ? t.data_f32[i] : 0.0f;
-                    write_float_le(val);
+            if (!t.data_raw.empty()) {
+                for (uint8_t byte : t.data_raw) {
+                    buf_.push_back(byte);
                 }
             } else {
-                for (size_t i = 0; i < elem_count; ++i) {
-                    uint16_t val = (i < t.data_u16.size()) ? t.data_u16[i] : 0;
-                    write_u16_le(val);
+                size_t elem_count = 1;
+                for (auto d : t.dims) elem_count *= static_cast<size_t>(d);
+                if (t.dtype == static_cast<uint32_t>(GgmlDataType::F32)) {
+                    for (size_t i = 0; i < elem_count; ++i) {
+                        float val = (i < t.data_f32.size()) ? t.data_f32[i] : 0.0f;
+                        write_float_le(val);
+                    }
+                } else {
+                    for (size_t i = 0; i < elem_count; ++i) {
+                        uint16_t val = (i < t.data_u16.size()) ? t.data_u16[i] : 0;
+                        write_u16_le(val);
+                    }
                 }
             }
         }
@@ -302,6 +365,9 @@ void test_ggml_dtype_size() {
     ASSERT_EQ(ggml_dtype_size(GgmlDataType::F32), size_t(4));
     ASSERT_EQ(ggml_dtype_size(GgmlDataType::F16), size_t(2));
     ASSERT_EQ(ggml_dtype_size(GgmlDataType::BF16), size_t(2));
+    ASSERT_EQ(ggml_dtype_size(GgmlDataType::Q8_0), size_t(34));
+    ASSERT_EQ(ggml_blck_size(GgmlDataType::F32), size_t(1));
+    ASSERT_EQ(ggml_blck_size(GgmlDataType::Q8_0), size_t(32));
 }
 
 void test_map_ggml_dtype() {
@@ -316,6 +382,10 @@ void test_map_ggml_dtype() {
     auto bf16 = map_ggml_dtype(GgmlDataType::BF16);
     ASSERT_TRUE(bf16.has_value());
     ASSERT_TRUE(*bf16 == DType::BFloat16);
+
+    auto q8 = map_ggml_dtype(GgmlDataType::Q8_0);
+    ASSERT_TRUE(q8.has_value());
+    ASSERT_TRUE(*q8 == DType::Float32);  // dequantized to F32
 
     // Unsupported type should fail
     auto bad = map_ggml_dtype(static_cast<GgmlDataType>(99));
@@ -595,6 +665,64 @@ void test_bf16_tensor_read() {
     ASSERT_TRUE(std::abs(f32_out[3] - 3.0f) < 1e-6f);
 }
 
+void test_q8_0_dequantize() {
+    // Manually construct a Q8_0 block and verify dequantization
+    // Block: fp16 scale (2 bytes) + 32 int8 values
+    // Use scale = 0.5 (fp16: 0x3800)
+    std::vector<uint8_t> block(34);
+    block[0] = 0x00; block[1] = 0x38;  // fp16 0.5
+    for (int i = 0; i < 32; ++i) {
+        block[2 + i] = static_cast<uint8_t>(static_cast<int8_t>(i - 16));
+    }
+
+    std::vector<float> out(32);
+    auto st = WeightLoader::dequantize_to_f32(
+        GgmlDataType::Q8_0, block.data(), out.data(), 32);
+    ASSERT_TRUE(st.ok());
+
+    // Expected: out[i] = (i - 16) * 0.5
+    for (int i = 0; i < 32; ++i) {
+        float expected = static_cast<float>(i - 16) * 0.5f;
+        ASSERT_TRUE(std::abs(out[i] - expected) < 1e-6f);
+    }
+}
+
+void test_q8_0_tensor_read() {
+    std::string path = "/tmp/test_minillm_gguf_q8_0.gguf";
+    // 2x4 tensor: values 1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0
+    std::vector<float> original = {1.0f, 2.0f, 3.0f, 4.0f, -1.0f, -2.0f, -3.0f, -4.0f};
+    {
+        GgufWriter w(path);
+        w.add_meta_string("general.architecture", "llama");
+        w.add_tensor_q8_0("test.weight", 2, 4, original);
+        w.write();
+    }
+
+    auto result = GGUFParser::parse(path);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->tensor_infos[0].dtype, GgmlDataType::Q8_0);
+
+    auto& ti = result->tensor_infos[0];
+    ASSERT_TRUE(ti.bytes().has_value());
+    // 8 elements -> 1 block -> 34 bytes
+    ASSERT_EQ(*ti.bytes(), size_t(34));
+
+    std::vector<std::byte> raw_buf(*ti.bytes());
+    auto st = GGUFParser::read_tensor_data(
+        path, result->data_offset, ti.offset, raw_buf.data(), *ti.bytes());
+    ASSERT_TRUE(st.ok());
+
+    std::vector<float> f32_out(8);
+    st = WeightLoader::dequantize_to_f32(GgmlDataType::Q8_0,
+        raw_buf.data(), f32_out.data(), 8);
+    ASSERT_TRUE(st.ok());
+
+    // Q8_0 has limited precision, check with reasonable tolerance
+    for (size_t i = 0; i < 8; ++i) {
+        ASSERT_TRUE(std::abs(f32_out[i] - original[i]) < 0.05f);
+    }
+}
+
 void test_extract_config() {
     std::string path = "/tmp/test_minillm_gguf_config.gguf";
     {
@@ -685,6 +813,8 @@ int main() {
     TEST(bf16_to_f32);
     TEST(f16_tensor_read);
     TEST(bf16_tensor_read);
+    TEST(q8_0_dequantize);
+    TEST(q8_0_tensor_read);
     TEST(extract_config);
     TEST(shared_weight_store_tied_embeddings);
 

@@ -33,6 +33,7 @@
 #include "minillm/runtime/kv_cache.h"
 #include "minillm/runtime/paged_kv_cache.h"
 #include "minillm/runtime/paged_attention_scheduler.h"
+#include "minillm/runtime/continuous_batch_scheduler.h"
 #include "minillm/runtime/sampler.h"
 
 #if defined(MINILLM_ENABLE_CUDA)

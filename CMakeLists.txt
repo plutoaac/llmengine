@@ -84,6 +84,7 @@ add_library(minillm_runtime
     src/runtime/kv_cache.cpp
     src/runtime/paged_kv_cache.cpp
     src/runtime/paged_attention_scheduler.cpp
+    src/runtime/continuous_batch_scheduler.cpp
 )
 target_include_directories(minillm_runtime PUBLIC include)
 target_link_libraries(minillm_runtime PUBLIC minillm_graph)
@@ -141,10 +142,21 @@ target_link_libraries(benchmark_cpu PRIVATE minillm_runtime)
 add_executable(benchmark_flash_attention examples/benchmark_flash_attention.cpp)
 target_link_libraries(benchmark_flash_attention PRIVATE minillm_runtime)
 
+# Example: paged KV cache generation with multiple sequences
+add_executable(generate_paged examples/generate_paged.cpp)
+target_link_libraries(generate_paged PRIVATE minillm_io)
+
 # Tests
 function(add_minillm_test test_name)
     add_executable(${test_name} tests/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE minillm_model)
+    # Many tests intentionally use assert for compact checks. Keep those checks
+    # active even in Release/RelWithDebInfo so side-effectful setup is not elided.
+    if(MSVC)
+        target_compile_options(${test_name} PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(${test_name} PRIVATE -UNDEBUG)
+    endif()
     if(BUILD_TESTING)
         add_test(NAME ${test_name} COMMAND ${test_name})
     endif()
@@ -160,6 +172,8 @@ add_minillm_test(test_memory_planner)
 add_minillm_test(test_paged_kv_cache)
 add_minillm_test(test_paged_attention_scheduler)
 
+add_minillm_test(test_continuous_batch_scheduler)
+
 add_minillm_test(test_gguf_parser)
 target_link_libraries(test_gguf_parser PRIVATE minillm_io)
 
@@ -167,9 +181,17 @@ add_minillm_test(test_transformer_graph_builder)
 add_minillm_test(test_bpe_tokenizer)
 target_link_libraries(test_bpe_tokenizer PRIVATE minillm_io)
 
+add_minillm_test(test_e2e_verification)
+target_link_libraries(test_e2e_verification PRIVATE minillm_io)
+
 if(MINILLM_ENABLE_CUDA)
     add_executable(test_cuda_kernels tests/test_cuda_kernels.cpp)
     target_link_libraries(test_cuda_kernels PRIVATE minillm_model CUDA::cudart)
+    if(MSVC)
+        target_compile_options(test_cuda_kernels PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_cuda_kernels PRIVATE -UNDEBUG)
+    endif()
     add_executable(forward_tiny_llama_gguf_cuda examples/forward_tiny_llama_gguf_cuda.cpp)
     target_link_libraries(forward_tiny_llama_gguf_cuda PRIVATE minillm_io CUDA::cudart)
     add_executable(generate_cuda examples/generate_cuda.cpp)

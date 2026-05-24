@@ -331,6 +331,25 @@ Status WeightLoader::dequantize_to_f32(
         return Status::make_ok();
     }
 
+    case GgmlDataType::Q8_0: {
+        // Q8_0 block: fp16 scale (2 bytes) + int8 values[32] (32 bytes) = 34 bytes
+        const size_t blck = kQ8_0BlockElems;  // 32
+        const size_t num_blocks = (num_elements + blck - 1) / blck;
+        const auto* blocks = reinterpret_cast<const uint8_t*>(src);
+        for (size_t b = 0; b < num_blocks; ++b) {
+            const uint8_t* block = blocks + b * kQ8_0BlockSize;
+            float scale = f16_to_f32(
+                static_cast<uint16_t>(block[0]) | (static_cast<uint16_t>(block[1]) << 8));
+            const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
+            size_t base = b * blck;
+            size_t count = std::min(blck, num_elements - base);
+            for (size_t i = 0; i < count; ++i) {
+                dst[base + i] = static_cast<float>(qs[i]) * scale;
+            }
+        }
+        return Status::make_ok();
+    }
+
     default:
         return Status::unsupported(
             "cannot dequantize GGML dtype " +

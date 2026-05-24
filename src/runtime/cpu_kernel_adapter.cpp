@@ -1,6 +1,8 @@
 #include "minillm/runtime/cpu_kernel_adapter.h"
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "minillm/core/dtype.h"
 #include "minillm/core/shape.h"
@@ -479,6 +481,113 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     const float* v_data = float_data(*vt);
     float* o_data = float_data_mut(*ot);
 
+    // =================== PAGED ATTENTION PATH ===================
+    // When a paged KV cache is attached to the context, the attention kernel
+    // writes newly projected K/V directly into paged storage and reads all
+    // previous K/V from it, bypassing the contiguous KVCache entirely. Check
+    // this first because a paged decode context may have no contiguous KVCache.
+    if (auto* paged = ctx.paged_kv_cache(); paged && paged->initialized()) {
+        const int li = static_cast<int>(layer_idx);
+        const int seq_id = ctx.paged_sequence_id();
+        int write_pos = ctx.paged_kv_write_pos();
+        if (write_pos < 0) {
+            write_pos = paged->sequence_length(seq_id);
+            ctx.set_paged_kv_write_pos(write_pos);
+        }
+
+        // All layers in one forward pass must write at the same logical token
+        // position. PagedKVCache::write_tokens updates sequence_length, so using
+        // sequence_length again on later layers would incorrectly advance once
+        // per layer instead of once per generated token.
+        for (int s = 0; s < seq_len; ++s) {
+            const float* k_row = k_data + s * kv_hidden_size;
+            const float* v_row = v_data + s * kv_hidden_size;
+            auto st = paged->write_tokens(seq_id, li, write_pos + s,
+                                          k_row, v_row, 1);
+            if (!st.ok()) return st;
+        }
+
+        // Reinterleave Q as [nh, seq_len, hd]
+        std::vector<float> q_buf(static_cast<size_t>(nh) * seq_len * hd);
+        for (int s = 0; s < seq_len; ++s) {
+            for (int h = 0; h < nh; ++h) {
+                for (int d = 0; d < hd; ++d) {
+                    q_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d] =
+                        q_data[s * q_hidden + h * hd + d];
+                }
+            }
+        }
+
+        std::vector<float> o_buf(static_cast<size_t>(nh) * seq_len * hd);
+
+        if (seq_len == 1) {
+            // Decode: use optimized single-token attention
+            auto st = paged_attention_decode(*paged, seq_id, li,
+                                             q_buf.data(), o_buf.data(), nh, hd);
+            if (!st.ok()) return st;
+        } else {
+            // Prefill/chunked decode: query qs may only attend through its own
+            // absolute position, not future tokens from the same chunk.
+            const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            for (int h = 0; h < nh; ++h) {
+                const int kv_h_idx = h / group_size;
+                const float* q_vec = q_buf.data() + static_cast<size_t>(h) * seq_len * hd;
+                float* o_vec = o_buf.data() + static_cast<size_t>(h) * seq_len * hd;
+
+                for (int qs = 0; qs < seq_len; ++qs) {
+                    const float* q_row = q_vec + qs * hd;
+                    const int kv_limit = write_pos + qs + 1;
+                    std::vector<float> scores(static_cast<size_t>(kv_limit));
+                    float max_score = -std::numeric_limits<float>::max();
+
+                    for (int pos = 0; pos < kv_limit; ++pos) {
+                        auto k_ptr = paged->key_ptr(seq_id, li, pos, kv_h_idx);
+                        if (!k_ptr) return k_ptr.error();
+                        float dot = 0.0f;
+                        for (int d = 0; d < hd; ++d) {
+                            dot += q_row[d] * (*k_ptr)[d];
+                        }
+                        float s_val = dot * scale;
+                        scores[static_cast<size_t>(pos)] = s_val;
+                        max_score = std::max(max_score, s_val);
+                    }
+
+                    float sum = 0.0f;
+                    for (int pos = 0; pos < kv_limit; ++pos) {
+                        float p = std::exp(scores[static_cast<size_t>(pos)] - max_score);
+                        scores[static_cast<size_t>(pos)] = p;
+                        sum += p;
+                    }
+                    if (sum <= 0.0f) {
+                        return Status::runtime_error("paged attention softmax sum is non-positive");
+                    }
+
+                    float* out_row = o_vec + qs * hd;
+                    std::fill(out_row, out_row + hd, 0.0f);
+                    for (int pos = 0; pos < kv_limit; ++pos) {
+                        auto v_ptr = paged->value_ptr(seq_id, li, pos, kv_h_idx);
+                        if (!v_ptr) return v_ptr.error();
+                        const float weight = scores[static_cast<size_t>(pos)] / sum;
+                        for (int d = 0; d < hd; ++d) {
+                            out_row[d] += weight * (*v_ptr)[d];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write output
+        for (int s = 0; s < seq_len; ++s) {
+            for (int h = 0; h < nh; ++h) {
+                for (int d = 0; d < hd; ++d) {
+                    o_data[s * q_hidden + h * hd + d] =
+                        o_buf[static_cast<size_t>(h) * seq_len * hd + s * hd + d];
+                }
+            }
+        }
+        return Status::make_ok();
+    }
+
     // =================== NO CACHE PATH (backward compat) ===================
     KVCache* cache = ctx.kv_cache();
     if (!cache || !cache->initialized()) {
@@ -541,7 +650,6 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     }
     int kv_h = nkv * hd;  // kv_hidden per position
 
-    // ---- PREFILL: cached_len == 0 ----
     if (cached_len == 0) {
         if (!cache->can_append(seq_len)) {
             return Status::out_of_range("KV cache does not have enough space for prefill");
@@ -606,7 +714,6 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     }
 
     // ---- DECODE: cached_len > 0, seq_len should be 1 ----
-    // Copy new K/V row into cache at position cached_len
     {
         if (seq_len != 1) {
             return Status::invalid_argument("KV cache decode requires seq_len == 1");

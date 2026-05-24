@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "minillm/minillm.h"
+#include "minillm/runtime/cpu_kernels.h"
 
 using namespace minillm;
 
@@ -168,11 +169,57 @@ void test_paged_attention_decode_matches_contiguous_gqa() {
     std::cout << "  PASS test_paged_attention_decode_matches_contiguous_gqa\n";
 }
 
+void test_paged_vs_flash_sdpa_decode() {
+    // Compare paged_attention_decode with flash_sdpa_decode using identical data
+    const int num_heads = 16;
+    const int num_kv_heads = 8;
+    const int head_dim = 128;
+    const int kv_len = 19;  // 18 prompt + 1 decode
+    const int kv_hidden = num_kv_heads * head_dim;
+
+    // Generate deterministic Q, K, V data
+    std::vector<float> q(static_cast<size_t>(num_heads) * head_dim);
+    std::vector<float> k(static_cast<size_t>(kv_len) * kv_hidden);
+    std::vector<float> v(static_cast<size_t>(kv_len) * kv_hidden);
+
+    for (size_t i = 0; i < q.size(); ++i) q[i] = 0.01f * static_cast<float>(i % 100) - 0.5f;
+    for (size_t i = 0; i < k.size(); ++i) k[i] = 0.02f * static_cast<float>(i % 77) - 0.3f;
+    for (size_t i = 0; i < v.size(); ++i) v[i] = 0.03f * static_cast<float>(i % 53) + 0.1f;
+
+    // flash_sdpa_decode output
+    std::vector<float> out_flash(static_cast<size_t>(num_heads) * head_dim, 0.0f);
+    cpu::flash_sdpa_decode(q.data(), k.data(), v.data(), out_flash.data(),
+                           num_heads, num_kv_heads, head_dim, kv_len);
+
+    // paged_attention_decode output
+    PagedKVCache cache;
+    assert(cache.init(1, num_kv_heads, head_dim, 16, 32).ok());
+    assert(cache.ensure_sequence(0).ok());
+    assert(cache.write_tokens(0, 0, 0, k.data(), v.data(), kv_len).ok());
+
+    std::vector<float> out_paged(static_cast<size_t>(num_heads) * head_dim, 0.0f);
+    assert(paged_attention_decode(cache, 0, 0, q.data(), out_paged.data(),
+                                  num_heads, head_dim).ok());
+
+    // Compare
+    float max_diff = 0.0f;
+    for (int h = 0; h < num_heads; ++h) {
+        for (int d = 0; d < head_dim; ++d) {
+            size_t idx = static_cast<size_t>(h) * head_dim + d;
+            float diff = std::abs(out_flash[idx] - out_paged[idx]);
+            max_diff = std::max(max_diff, diff);
+        }
+    }
+    assert(max_diff < 0.01f);
+    std::cout << "  PASS test_paged_vs_flash_sdpa_decode\n";
+}
+
 int main() {
     std::cout << "test_paged_kv_cache:\n";
     test_paged_kv_cache_write_read_and_free();
     test_paged_kv_cache_capacity_error();
     test_paged_attention_decode_matches_contiguous_gqa();
+    test_paged_vs_flash_sdpa_decode();
     std::cout << "All tests passed!\n";
     return 0;
 }

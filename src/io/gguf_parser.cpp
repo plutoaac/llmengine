@@ -25,12 +25,20 @@ std::expected<size_t, Status> GGUFTensorInfo::num_elements() const {
 std::expected<size_t, Status> GGUFTensorInfo::bytes() const {
     auto ne = num_elements();
     if (!ne) return std::unexpected(ne.error());
-    size_t elem_size = ggml_dtype_size(dtype);
-    if (*ne > std::numeric_limits<size_t>::max() / elem_size) {
+    size_t blck = ggml_blck_size(dtype);
+    size_t dtype_sz = ggml_dtype_size(dtype);
+    if (blck == 0 || dtype_sz == 0) {
+        return std::unexpected(Status::unsupported(
+            "unsupported GGML dtype for tensor byte size: " + name));
+    }
+    // For block-quantized types: (numel / blck_size) * dtype_size
+    // For unquantized types (blck_size=1): numel * dtype_size
+    size_t num_blocks = (*ne + blck - 1) / blck;
+    if (num_blocks > std::numeric_limits<size_t>::max() / dtype_sz) {
         return std::unexpected(Status::invalid_argument(
             "byte size overflow for tensor: " + name));
     }
-    return *ne * elem_size;
+    return num_blocks * dtype_sz;
 }
 
 std::expected<MetadataValue, Status> get_metadata(

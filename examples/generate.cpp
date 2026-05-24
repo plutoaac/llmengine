@@ -256,6 +256,8 @@ int main(int argc, char* argv[]) {
         last_logits, static_cast<int32_t>(vocab_size),
         samp_cfg, all_tokens);
 
+    std::cerr << "  prefill -> token " << first_token << "\n";
+
     if (first_token == tokenizer.eos_token_id()) {
         std::cerr << "Model produced EOS immediately after prefill\n";
         return 0;
@@ -307,6 +309,7 @@ int main(int argc, char* argv[]) {
         }
 
         auto* dec_logits_data = reinterpret_cast<const float*>(dec_logits->data());
+
         int32_t next_token = sampler.sample(
             dec_logits_data, static_cast<int32_t>(vocab_size),
             samp_cfg, all_tokens);

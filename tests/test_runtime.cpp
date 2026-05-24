@@ -238,6 +238,144 @@ void test_kv_cache_executor_advance_and_decode_attention() {
     std::cout << "  PASS test_kv_cache_executor_advance_and_decode_attention\n";
 }
 
+void test_paged_kv_executor_writes_once_per_forward() {
+    PagedKVCache paged;
+    assert(paged.init(2, 1, 2, 4, 8).ok());
+    assert(paged.ensure_sequence(0).ok());
+    assert(paged.reserve_sequence(0, 8).ok());
+
+    const float prompt_k[] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float prompt_v[] = {10.0f, 0.0f, 0.0f, 20.0f};
+    assert(paged.write_tokens(0, 0, 0, prompt_k, prompt_v, 2).ok());
+    assert(paged.write_tokens(0, 1, 0, prompt_k, prompt_v, 2).ok());
+    assert(paged.sequence_length(0) == 2);
+
+    KernelRegistry registry;
+    register_cpu_kernels(registry);
+    auto backend = std::make_shared<CpuBackend>();
+
+    Graph g;
+    GraphBuilder gb(g);
+    auto q = gb.input("q", Shape({1, 1, 4}), DType::Float32);
+    auto k = gb.input("k", Shape({1, 1, 2}), DType::Float32);
+    auto v = gb.input("v", Shape({1, 1, 2}), DType::Float32);
+    assert(q && k && v);
+    auto attn0 = gb.attention(*q, *k, *v, true, 2, 1, 2, 0, "paged_attn_l0");
+    auto attn1 = gb.attention(*q, *k, *v, true, 2, 1, 2, 1, "paged_attn_l1");
+    assert(attn0 && attn1);
+    auto out = gb.output(*attn1, "out");
+    assert(out);
+
+    Tensor q_tensor("q", Shape({1, 1, 4}), DType::Float32);
+    Tensor k_tensor("k", Shape({1, 1, 2}), DType::Float32);
+    Tensor v_tensor("v", Shape({1, 1, 2}), DType::Float32);
+    assert(q_tensor.allocate_cpu().ok());
+    assert(k_tensor.allocate_cpu().ok());
+    assert(v_tensor.allocate_cpu().ok());
+
+    auto* q_data = reinterpret_cast<float*>(q_tensor.data());
+    q_data[0] = 1.0f; q_data[1] = 0.0f; q_data[2] = 0.0f; q_data[3] = 1.0f;
+    auto* k_data = reinterpret_cast<float*>(k_tensor.data());
+    k_data[0] = 1.0f; k_data[1] = 1.0f;
+    auto* v_data = reinterpret_cast<float*>(v_tensor.data());
+    v_data[0] = 30.0f; v_data[1] = 40.0f;
+
+    RuntimeContext ctx;
+    assert(ctx.bind(*q, &q_tensor).ok());
+    assert(ctx.bind(*k, &k_tensor).ok());
+    assert(ctx.bind(*v, &v_tensor).ok());
+    assert(ctx.allocate_intermediates(g).ok());
+    ctx.set_paged_kv_cache(&paged);
+    ctx.set_paged_sequence_id(0);
+
+    CpuExecutor exec(backend, registry);
+    assert(exec.compile(g).ok());
+    assert(exec.run(ctx).ok());
+    assert(paged.sequence_length(0) == 3);
+
+    auto l0_pos2 = paged.key_ptr(0, 0, 2, 0);
+    auto l1_pos2 = paged.key_ptr(0, 1, 2, 0);
+    assert(l0_pos2 && l1_pos2);
+    assert(std::abs((*l0_pos2)[0] - 1.0f) < 1e-6f);
+    assert(std::abs((*l1_pos2)[0] - 1.0f) < 1e-6f);
+    assert(!paged.key_ptr(0, 1, 3, 0));
+
+    k_data[0] = 2.0f; k_data[1] = 3.0f;
+    assert(exec.run(ctx).ok());
+    assert(paged.sequence_length(0) == 4);
+    auto l1_pos3 = paged.key_ptr(0, 1, 3, 0);
+    assert(l1_pos3);
+    assert(std::abs((*l1_pos3)[0] - 2.0f) < 1e-6f);
+    assert(std::abs((*l1_pos3)[1] - 3.0f) < 1e-6f);
+
+    std::cout << "  PASS test_paged_kv_executor_writes_once_per_forward\n";
+}
+
+void test_paged_kv_executor_chunk_prefill_is_causal() {
+    PagedKVCache paged;
+    assert(paged.init(1, 1, 2, 4, 8).ok());
+    assert(paged.ensure_sequence(0).ok());
+    assert(paged.reserve_sequence(0, 8).ok());
+
+    KernelRegistry registry;
+    register_cpu_kernels(registry);
+    auto backend = std::make_shared<CpuBackend>();
+
+    Graph g;
+    GraphBuilder gb(g);
+    auto q = gb.input("q", Shape({1, 2, 2}), DType::Float32);
+    auto k = gb.input("k", Shape({1, 2, 2}), DType::Float32);
+    auto v = gb.input("v", Shape({1, 2, 2}), DType::Float32);
+    assert(q && k && v);
+    auto attn = gb.attention(*q, *k, *v, true, 1, 1, 2, 0, "paged_prefill_attn");
+    assert(attn);
+    auto out = gb.output(*attn, "out");
+    assert(out);
+
+    Tensor q_tensor("q", Shape({1, 2, 2}), DType::Float32);
+    Tensor k_tensor("k", Shape({1, 2, 2}), DType::Float32);
+    Tensor v_tensor("v", Shape({1, 2, 2}), DType::Float32);
+    assert(q_tensor.allocate_cpu().ok());
+    assert(k_tensor.allocate_cpu().ok());
+    assert(v_tensor.allocate_cpu().ok());
+
+    auto* q_data = reinterpret_cast<float*>(q_tensor.data());
+    auto* k_data = reinterpret_cast<float*>(k_tensor.data());
+    auto* v_data = reinterpret_cast<float*>(v_tensor.data());
+    q_data[0] = 1.0f; q_data[1] = 0.0f;
+    q_data[2] = 1.0f; q_data[3] = 0.0f;
+    k_data[0] = 1.0f; k_data[1] = 0.0f;
+    k_data[2] = 0.0f; k_data[3] = 1.0f;
+    v_data[0] = 10.0f; v_data[1] = 0.0f;
+    v_data[2] = 0.0f; v_data[3] = 20.0f;
+
+    RuntimeContext ctx;
+    assert(ctx.bind(*q, &q_tensor).ok());
+    assert(ctx.bind(*k, &k_tensor).ok());
+    assert(ctx.bind(*v, &v_tensor).ok());
+    assert(ctx.allocate_intermediates(g).ok());
+    ctx.set_paged_kv_cache(&paged);
+    ctx.set_paged_sequence_id(0);
+
+    CpuExecutor exec(backend, registry);
+    assert(exec.compile(g).ok());
+    assert(exec.run(ctx).ok());
+    assert(paged.sequence_length(0) == 2);
+
+    Tensor* out_tensor = ctx.get(*out);
+    assert(out_tensor != nullptr);
+    const float* result = reinterpret_cast<const float*>(out_tensor->data());
+
+    const auto expected0 = reference_attention_row(q_data, k_data, v_data, 1, 2);
+    const auto expected1 = reference_attention_row(q_data + 2, k_data, v_data, 2, 2);
+    assert(std::abs(result[0] - expected0[0]) < 1e-5f);
+    assert(std::abs(result[1] - expected0[1]) < 1e-5f);
+    assert(std::abs(result[2] - expected1[0]) < 1e-5f);
+    assert(std::abs(result[3] - expected1[1]) < 1e-5f);
+
+    std::cout << "  PASS test_paged_kv_executor_chunk_prefill_is_causal\n";
+}
+
 void test_cpu_executor_softmax_transpose_reshape() {
     Graph g;
     GraphBuilder gb(g);
@@ -441,6 +579,8 @@ int main() {
     test_sampler_invalid_inputs();
     test_kv_cache_bounds();
     test_kv_cache_executor_advance_and_decode_attention();
+    test_paged_kv_executor_writes_once_per_forward();
+    test_paged_kv_executor_chunk_prefill_is_causal();
     test_cpu_executor_softmax_transpose_reshape();
     test_cpu_executor_linear_bias();
     test_cpu_executor_embedding_rank1();

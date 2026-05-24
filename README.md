@@ -39,13 +39,14 @@ flowchart LR
     CudaExecutor -.-> CudaKernels["CUDA kernels"]
     Context --> KV["KVCache"]
     Context --> PagedKV["PagedKVCache"]
-    PagedKV --> Scheduler["PagedAttentionScheduler"]
+    PagedKV --> PagedScheduler["PagedAttentionScheduler"]
     Kernels --> Tensor["Tensor storage"]
     PagedKV --> PagedAttn["CPU paged decode attention"]
-    Scheduler --> PagedBatch["padded block-table batch"]
+    PagedScheduler --> PagedBatch["padded block-table batch"]
     PagedBatch -.-> CudaPaged["CUDA batched paged decode"]
     CudaKernels -.-> Tensor
     Executor --> Sampler["Sampler"]
+    ContinuousScheduler["ContinuousBatchScheduler"] -.-> PagedKV
 ```
 
 ## What Is Implemented
@@ -61,15 +62,17 @@ flowchart LR
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU intermediates, with O(n log n) matching and contiguous arena binding |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with parser safety checks and shared weight storage |
-| Byte-level BPE tokenizer | Experimental |
+| Byte-level BPE tokenizer | Implemented with GPT-2 pre-tokenization and merge-based BPE |
 | KV cache prefill/decode | Implemented for single-batch generation |
-| Paged KV cache / PagedAttention reference | Implemented for CPU decode and toy multi-sequence scheduling |
+| Paged KV cache / PagedAttention reference | Implemented for CPU decode and multi-sequence scheduling |
+| Continuous batching scheduler | Lifecycle core implemented; real inference-loop integration in progress |
+| Paged generation example | Multi-sequence decode with PagedKVCache |
+| E2E verification tests | Contiguous vs paged KV numerical alignment |
 | CPU benchmark harness | Implemented |
 | Quantized kernels | Not yet |
 | CUDA PagedAttention decode | Implemented for single-sequence and batched decode |
 | CUDA quantized kernels | Not yet |
 | Metal / Vulkan | Out of scope |
-| Continuous batching / server runtime | Out of scope |
 
 ## Quick Start
 
@@ -107,6 +110,7 @@ Run examples:
 ./build/forward_tiny_llama
 ./build/forward_tiny_llama_gguf /path/to/model.gguf
 ./build/generate /path/to/model.gguf "Hello"
+./build/generate_paged /path/to/model.gguf 32
 ./build/benchmark_flash_attention 2 8
 ./build-cuda/forward_tiny_llama_gguf_cuda /path/to/model.gguf
 ./build-cuda/generate_cuda /path/to/model.gguf "Hello" 2
@@ -147,6 +151,33 @@ The CUDA path does not yet include quantized CUDA matmul, production scheduler p
 - `cuda::paged_attention_decode_batch()` consumes scheduler-style batch metadata and decodes multiple active sequences in one launch.
 
 The scheduler is intentionally small: it is not a production request queue, but it demonstrates the core bridge between paged KV allocation and batched GPU decode.
+
+## Continuous Batching Scheduler
+
+`ContinuousBatchScheduler` manages request lifecycle through four phases:
+
+1. **Waiting**: request submitted but not yet allocated KV blocks
+2. **Prefilling**: KV blocks allocated, prompt tokens being processed
+3. **Decoding**: autoregressive token generation, one token per step
+4. **Finished**: EOS reached or max tokens hit; blocks returned to free list
+
+The caller drives the actual model execution. The scheduler provides:
+
+- `submit()`: add a request with prompt tokens and max output length
+- `admit_waiting()`: move waiting requests into active set (allocate KV blocks)
+- `active_ids()`: which sequences are currently generating
+- `evict_finished()`: free blocks for finished sequences
+- `collect_finished()`: retrieve completed outputs
+- `state()`: inspect per-sequence phase, tokens generated, etc.
+
+This separation means the scheduler can be combined with any executor (CPU, CUDA, or mock) and any sampling strategy. The current code tests the scheduler lifecycle directly; wiring it through the real generation loop is the next implementation step.
+
+```cpp
+ContinuousBatchScheduler scheduler(cache, {.max_batch_size = 4});
+scheduler.submit({.prompt_tokens = {1, 2, 3}, .max_tokens = 64});
+scheduler.admit_waiting();
+// ... run decode steps, call mark_token_generated(), mark_finished(), evict_finished() ...
+```
 
 ## CPU Benchmarks
 
@@ -206,15 +237,11 @@ CTest currently runs:
 ./build/test_memory_planner
 ./build/test_paged_kv_cache
 ./build/test_paged_attention_scheduler
+./build/test_continuous_batch_scheduler
 ./build/test_gguf_parser
 ./build/test_transformer_graph_builder
 ./build/test_bpe_tokenizer
-```
-
-CUDA builds add:
-
-```bash
-./build-cuda/test_cuda_kernels
+./build/test_e2e_verification
 ```
 
 The test suite covers:
@@ -228,6 +255,8 @@ The test suite covers:
 - tokenizer boundary behavior and GGUF parser safety checks
 - KV cache prefill/decode advancement
 - paged KV block allocation, scheduler batch metadata, and paged decode attention
+- continuous batching scheduler: admission, eviction, phase transitions, block reuse
+- contiguous vs paged KV cache numerical alignment (cosine similarity, max abs diff)
 - CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
 - GGUF parser and weight conversion helpers
 - GGUF CUDA forward smoke path through `forward_tiny_llama_gguf_cuda`
@@ -239,7 +268,7 @@ The test suite covers:
 include/minillm/
   core/        Tensor, Shape, DType, Device, Status
   graph/       Graph IR, Node, Value, attributes, shape inference
-  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, paged KV cache, sampler
+  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, paged KV cache, sampler, continuous batch scheduler
   io/          GGUF parser, weight loader, tokenizer
   model/       Transformer graph builder
 
@@ -250,8 +279,8 @@ src/
   io/          GGUF and tokenizer implementation
   model/       Decoder-only graph construction
 
-examples/      CLI demos and benchmark
-tests/         Unit and integration tests
+examples/      CLI demos, generation, and benchmark
+tests/         Unit, integration, and E2E verification tests
 docs/          Design notes
 ```
 
@@ -284,17 +313,15 @@ This project is an independent learning implementation inspired by:
 
 Near-term work with high portfolio value:
 
-- Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos.
-- Add a Release-mode benchmark table for prefill/decode and GEMM shapes.
-- Add Release-mode activation-memory and prefill/decode benchmark tables.
+- Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos with reference alignment.
+- Add Release-mode benchmark tables for prefill/decode latency and GEMM throughput.
 - Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.
-- Connect `PagedAttentionScheduler` to a real decode loop with request admission and finished-sequence eviction.
 - Implement the first quantized weight path, likely `Q8_0`.
-- Add a short CLI-focused demo script for interviews.
+- Connect `ContinuousBatchScheduler` to a real decode loop with a serving HTTP API.
 
 Longer-term experiments:
 
 - More optimized GEMM micro-kernels and weight packing.
 - Multi-threaded CPU execution.
-- Prefix cache, continuous batching, and multi-sequence scheduling.
+- Prefix cache, production continuous batching, and multi-sequence scheduling.
 - Minimal streaming HTTP API.

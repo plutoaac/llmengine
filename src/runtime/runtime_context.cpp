@@ -177,17 +177,25 @@ Status RuntimeContext::allocate_intermediates_with_plan(
 }
 
 Status RuntimeContext::advance_kv_cache_step() {
+    auto reset_paged_write_pos = [this]() {
+        paged_kv_write_pos_ = -1;
+    };
+
     if (kv_cache_advance_tokens_ <= 0) {
+        reset_paged_write_pos();
         return Status::make_ok();
     }
     if (!kv_cache_ || !kv_cache_->initialized()) {
+        reset_paged_write_pos();
         return Status::runtime_error("cannot advance an uninitialized KV cache");
     }
     if (!kv_cache_->can_append(kv_cache_advance_tokens_)) {
+        reset_paged_write_pos();
         return Status::out_of_range("KV cache does not have enough space to advance");
     }
 
     kv_cache_->advance(kv_cache_advance_tokens_);
+    reset_paged_write_pos();
     return Status::make_ok();
 }
 

@@ -10,6 +10,7 @@
 #include "minillm/graph/value.h"
 #include "minillm/runtime/kv_cache.h"
 #include "minillm/runtime/memory_planner.h"
+#include "minillm/runtime/paged_kv_cache.h"
 
 namespace minillm {
 
@@ -51,6 +52,17 @@ public:
     int kv_cache_advance_tokens() const { return kv_cache_advance_tokens_; }
     Status advance_kv_cache_step();
 
+    // Paged KV cache for paged attention decode.
+    // When set, the attention kernel reads K/V from the paged cache and
+    // writes newly projected K/V to it, bypassing the contiguous cache.
+    PagedKVCache* paged_kv_cache() const { return paged_kv_cache_; }
+    void set_paged_kv_cache(PagedKVCache* cache) { paged_kv_cache_ = cache; }
+    int paged_sequence_id() const { return paged_sequence_id_; }
+    void set_paged_sequence_id(int id) { paged_sequence_id_ = id; }
+    int paged_kv_write_pos() const { return paged_kv_write_pos_; }
+    void set_paged_kv_write_pos(int pos) { paged_kv_write_pos_ = pos; }
+    void reset_paged_kv_write_pos() { paged_kv_write_pos_ = -1; }
+
 private:
     struct CpuArenaBlock {
         std::unique_ptr<std::byte[]> storage;
@@ -67,6 +79,11 @@ private:
     // KV cache (shared between prefill and decode contexts)
     std::shared_ptr<KVCache> kv_cache_;
     int kv_cache_advance_tokens_ = 0;
+
+    // Paged KV cache (non-owning; lifetime managed by caller)
+    PagedKVCache* paged_kv_cache_ = nullptr;
+    int paged_sequence_id_ = 0;
+    int paged_kv_write_pos_ = -1;
 };
 
 } // namespace minillm

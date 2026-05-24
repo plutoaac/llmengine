@@ -27,22 +27,32 @@ enum class GgufValueType : uint32_t {
 };
 
 // GGML tensor element data types (wire format).
-// Only F32/F16/BF16 are supported initially; others will fail at load time.
 enum class GgmlDataType : uint32_t {
     F32 = 0,
     F16 = 1,
-    // Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q8_1=9,
-    // Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, Q8_K=15,
-    // I8=24, I16=25, I32=26, I64=27, F64=28,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q8_0 = 8,
     BF16 = 30,
 };
 
 constexpr uint32_t kGgufVersion = 3;
 constexpr uint32_t kGgufDefaultAlignment = 32;
 
+// Q8_0 block: fp16 scale (2 bytes) + 32 x int8 (32 bytes) = 34 bytes
+constexpr size_t kQ8_0BlockSize = 34;
+constexpr size_t kQ8_0BlockElems = 32;
+
+// Per-element size for unquantized types; per-block size for block-quantized types.
 size_t ggml_dtype_size(GgmlDataType dt);
+
+// Number of elements per block (1 for unquantized, 32 for Q8_0).
+size_t ggml_blck_size(GgmlDataType dt);
+
 std::string_view ggml_dtype_name(GgmlDataType dt);
 
+// Map GGML dtype to engine DType. Block-quantized types map to Float32
+// (they are dequantized to F32 at load time).
 std::expected<DType, Status> map_ggml_dtype(GgmlDataType dt);
 
 } // namespace minillm
