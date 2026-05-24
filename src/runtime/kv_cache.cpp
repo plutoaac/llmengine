@@ -127,11 +127,13 @@ void KVCache::reset() {
                 cudaMemset(layer.cuda_v, 0, layer.cuda_bytes);
             }
 #endif
-        } else if (!layer.k.empty()) {
-            std::memset(layer.k.data(), 0, layer.k.size() * sizeof(float));
-        }
-        if (!is_cuda() && !layer.v.empty()) {
-            std::memset(layer.v.data(), 0, layer.v.size() * sizeof(float));
+        } else {
+            if (!layer.k.empty()) {
+                std::memset(layer.k.data(), 0, layer.k.size() * sizeof(float));
+            }
+            if (!layer.v.empty()) {
+                std::memset(layer.v.data(), 0, layer.v.size() * sizeof(float));
+            }
         }
     }
 }

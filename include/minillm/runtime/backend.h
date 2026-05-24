@@ -9,10 +9,15 @@ namespace minillm {
 
 class Backend {
 public:
+    Backend(DeviceType dt, std::string_view n);
     virtual ~Backend() = default;
-    virtual DeviceType device_type() const = 0;
-    virtual bool supports(OpType op) const = 0;
-    virtual std::string_view name() const = 0;
+    DeviceType device_type() const;
+    bool supports(OpType op) const;
+    std::string_view name() const;
+
+private:
+    DeviceType device_type_;
+    std::string_view name_;
 };
 
 } // namespace minillm

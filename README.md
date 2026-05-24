@@ -1,8 +1,8 @@
 # MiniLLMEngine
 
-MiniLLMEngine is a C++23 CPU-first LLM inference engine built as a compact AI infrastructure project. It implements the core pieces of a modern local inference runtime: tensor metadata, graph IR, shape inference, CPU kernel dispatch, optional CUDA kernel dispatch, GGUF parsing, weight loading, sampling, and KV cache based generation.
+MiniLLMEngine is a compact C++23 CPU-first LLM inference project built for clarity. It implements the core pieces of a local inference runtime: tensor metadata, graph IR, shape inference, CPU kernel dispatch, optional CUDA kernel dispatch, GGUF parsing, weight loading, sampling, and KV cache based generation.
 
-The goal is not to clone llama.cpp. The goal is to show the engineering ideas behind an inference engine in a smaller codebase that is easy to read, test, explain, and extend.
+The goal is not to clone llama.cpp. The goal is to show the engineering ideas behind an inference engine in a smaller codebase that is easy to read, test, explain, and extend, with a shape that is friendly for internships and portfolio review.
 
 ## Highlights
 
@@ -12,10 +12,13 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **FlashAttention-style CPU attention** with tiled K/V traversal, online softmax, and a benchmark against the naive SDPA path.
 - **Optional CUDA backend** behind `MINILLM_ENABLE_CUDA`, with FP32 kernels for the same core transformer operator set and a separate `CudaExecutor` path.
 - **KV cache flow** for single-batch prefill/decode, including executor-driven cache length advancement.
-- **Paged KV cache reference** inspired by vLLM PagedAttention, with block tables, free-block reuse, a small multi-sequence scheduler, CPU decode attention, and CUDA paged decode over device block tables.
+- **Paged KV cache** with vLLM-style block tables, free-block reuse, CPU decode attention, multi-sequence scheduler, and CUDA device memory + paged decode over device block tables.
+- **Continuous batching scheduler** with waiting→prefilling→decoding→finished lifecycle, auto-assigned sequence IDs, and KV block eviction/reuse.
 - **Graph memory planner** with liveness analysis, O(n log n) best-fit buffer reuse, contiguous CPU arena pools, and peak-memory reporting.
 - **GGUF support** for bounds-checked metadata parsing, tensor table reading, F32/F16/BF16 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
-- **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and a CPU GEMM benchmark.
+- **BPE tokenizer** (ported from Genllm) with GPT-2 byte-to-unicode mapping, full regex pre-tokenization state machine, added-token longest-match, and `<0xHH>` byte token decoding.
+- **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and CPU GEMM/FlashAttention benchmarks.
+- **Code quality** with `TRY`/`TRY_TENSOR` macros eliminating ~50 boilerplate error-propagation if-statements, and `kernel_adapter_common.h` deduplicating ~95 lines of shared adapter helpers.
 
 ## Architecture
 
@@ -62,12 +65,11 @@ flowchart LR
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU intermediates, with O(n log n) matching and contiguous arena binding |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with parser safety checks and shared weight storage |
-| Byte-level BPE tokenizer | Implemented with GPT-2 pre-tokenization and merge-based BPE |
+| Byte-level BPE tokenizer | Implemented (Genllm port) with GPT-2 pre-tokenization, merge-based BPE, and `<0xHH>` byte token support |
 | KV cache prefill/decode | Implemented for single-batch generation |
-| Paged KV cache / PagedAttention reference | Implemented for CPU decode and multi-sequence scheduling |
+| Paged KV cache / PagedAttention | CPU: implemented. CUDA: device memory + block table upload + adapter integration complete. |
+| CUDA PagedAttention decode | Single-sequence and batched decode via `cuda::paged_attention_decode[_batch]`, wired through adapter |
 | Continuous batching scheduler | Lifecycle core implemented; real inference-loop integration in progress |
-| Paged generation example | Multi-sequence decode with PagedKVCache |
-| E2E verification tests | Contiguous vs paged KV numerical alignment |
 | CPU benchmark harness | Implemented |
 | Quantized kernels | Not yet |
 | CUDA PagedAttention decode | Implemented for single-sequence and batched decode |
@@ -106,15 +108,26 @@ ctest --test-dir build --output-on-failure
 Run examples:
 
 ```bash
-./build/build_tiny_llama_graph
-./build/forward_tiny_llama
-./build/forward_tiny_llama_gguf /path/to/model.gguf
 ./build/generate /path/to/model.gguf "Hello"
 ./build/generate_paged /path/to/model.gguf 32
+./build/benchmark_cpu 1 512 512 5
 ./build/benchmark_flash_attention 2 8
-./build-cuda/forward_tiny_llama_gguf_cuda /path/to/model.gguf
 ./build-cuda/generate_cuda /path/to/model.gguf "Hello" 2
 ```
+
+## llama.cpp Alignment Check
+
+To compare MiniLLMEngine against `llama.cpp` on the same Qwen3 prompt, use the
+alignment helper:
+
+```bash
+python3 scripts/compare_llama_completion.py /path/to/Qwen3-0.6B-BF16.gguf "Hello" 32
+```
+
+It uses the raw chat prompt with the empty `<think></think>` block and the same
+deterministic greedy decoding settings as the comparison path in `generate`.
+That keeps the prompt shape and sampling behavior close to `llama-completion`
+for end-to-end verification.
 
 ## CUDA Status
 
@@ -132,21 +145,22 @@ Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear
 
 `test_cuda_kernels` validates raw CUDA kernels against CPU references and also checks a small `CudaExecutor` graph with `Linear` + bias.
 
-`forward_tiny_llama_gguf_cuda` is a real GPU smoke test for GGUF models: it builds the transformer graph on `Device::cuda(0)`, loads GGUF weights into CUDA tensors, runs a no-cache forward pass, and copies logits back for validation.
+`generate_cuda` is the current GPU smoke path for GGUF models. It builds the transformer graph on `Device::cuda(0)`, loads GGUF weights into CUDA tensors, runs prompt prefill, advances the shared cache once per graph run, then decodes one token at a time on GPU while sampling on CPU from copied logits.
 
-`generate_cuda` extends that path to single-batch generation with a CUDA contiguous KV cache. It runs prompt prefill, advances the shared cache once per graph run, then decodes one token at a time on GPU while sampling on CPU from copied logits.
+The older forward-only demo binary was removed to keep the surface smaller. `test_cuda_kernels` covers the low-level CUDA operator surface, while `generate_cuda` covers the end-to-end GPU generation path.
 
-The CUDA path does not yet include quantized CUDA matmul, production scheduler policies, CUDA paged-cache integration in the full generation loop, or memory-planner-backed CUDA arena allocation.
+The CUDA path does not yet include quantized CUDA matmul, production scheduler policies, or memory-planner-backed CUDA arena allocation.
 
 ## Paged KV Cache
 
-`PagedKVCache` is a compact reference implementation of the core idea behind PagedAttention:
+`PagedKVCache` is a compact implementation of the core idea behind PagedAttention:
 
-- K/V memory is split into fixed-size token blocks.
+- K/V memory is split into fixed-size token blocks (CPU via `std::vector`, CUDA via `cudaMalloc`).
 - each sequence owns a block table that maps logical token positions to physical blocks.
 - freed sequences return blocks to a reusable free list.
+- `init_cuda()` allocates device-side block pools; `write_tokens_cuda()` copies K/V device-to-device; `upload_block_table()` stages the block table to device memory.
 - `PagedAttentionScheduler` keeps a small active sequence set and emits padded batch metadata: sequence IDs, sequence lengths, and flattened block tables.
-- `paged_attention_decode()` reads K/V through the block table and supports GQA.
+- `paged_attention_decode()` reads K/V through the block table and supports GQA (CPU reference).
 - `cuda::paged_attention_decode()` runs the same decode pattern on device-resident K/V pages and a device block table.
 - `cuda::paged_attention_decode_batch()` consumes scheduler-style batch metadata and decodes multiple active sequences in one launch.
 
@@ -259,7 +273,6 @@ The test suite covers:
 - contiguous vs paged KV cache numerical alignment (cosine similarity, max abs diff)
 - CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
 - GGUF parser and weight conversion helpers
-- GGUF CUDA forward smoke path through `forward_tiny_llama_gguf_cuda`
 - CUDA single-batch GGUF generation smoke path through `generate_cuda`
 
 ## Project Layout
@@ -268,7 +281,7 @@ The test suite covers:
 include/minillm/
   core/        Tensor, Shape, DType, Device, Status
   graph/       Graph IR, Node, Value, attributes, shape inference
-  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, paged KV cache, sampler, continuous batch scheduler
+  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, paged KV cache, sampler, scheduler, kernel adapter common helpers
   io/          GGUF parser, weight loader, tokenizer
   model/       Transformer graph builder
 
@@ -299,7 +312,7 @@ Key design choices:
 - `SharedWeightStore` lets prefill and decode contexts reuse one loaded GGUF weight set instead of duplicating model parameters.
 - `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
 - `MemoryPlanner` computes intermediate tensor live ranges; `RuntimeContext::allocate_intermediates_planned()` binds non-overlapping CPU intermediates to shared arena buffers.
-- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, and raw paged decode kernels. CUDA graph-memory arena integration, production batching policy, full paged-cache generation, and quantized CUDA matmul are intentionally left as future work.
+- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, and paged decode kernels with full adapter integration. CUDA graph-memory arena integration, production batching policy, and quantized CUDA matmul are intentionally left as future work.
 
 ## References
 
@@ -313,11 +326,11 @@ This project is an independent learning implementation inspired by:
 
 Near-term work with high portfolio value:
 
-- Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos with reference alignment.
+- ~~Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos with reference alignment.~~ Done.
 - Add Release-mode benchmark tables for prefill/decode latency and GEMM throughput.
 - Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.
 - Implement the first quantized weight path, likely `Q8_0`.
-- Connect `ContinuousBatchScheduler` to a real decode loop with a serving HTTP API.
+- Connect `ContinuousBatchScheduler` to a real decode loop.
 
 Longer-term experiments:
 

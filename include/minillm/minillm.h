@@ -21,7 +21,6 @@
 #include "minillm/graph/graph_builder.h"
 
 // Runtime
-#include "minillm/runtime/allocator.h"
 #include "minillm/runtime/backend.h"
 #include "minillm/runtime/cpu_backend.h"
 #include "minillm/runtime/kernel_registry.h"

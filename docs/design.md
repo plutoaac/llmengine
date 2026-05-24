@@ -349,9 +349,9 @@ What is not implemented yet:
 - CUDA arena allocation driven by `MemoryPlanner`
 - CUDA performance benchmarks
 
-The `forward_tiny_llama_gguf_cuda` example is a forward-only smoke test. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `WeightLoader` copy weights to device memory, and copies logits back to the host for validation.
+The current GPU smoke path is `generate_cuda`. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `WeightLoader` copy weights to device memory, and runs end-to-end generation with a contiguous CUDA `KVCache` before copying logits back to the host for validation.
 
-The `generate_cuda` example uses the same graph/runtime shape but attaches a CUDA `KVCache`. During prefill, CUDA Attention copies K/V rows into device cache storage and runs no-cache SDPA over the prompt. During decode, it writes the new token's K/V row at `cached_len` and calls a decode kernel over `[cached_len + 1]` contiguous KV rows. The executor still advances cache length once after the full graph run, matching the CPU path.
+The older forward-only demo binary was removed to keep the surface smaller. `test_cuda_kernels` covers the low-level CUDA operator surface, while `generate_cuda` covers the end-to-end GPU generation path. During prefill, CUDA Attention copies K/V rows into device cache storage and runs no-cache SDPA over the prompt. During decode, it writes the new token's K/V row at `cached_len` and calls a decode kernel over `[cached_len + 1]` contiguous KV rows. The executor still advances cache length once after the full graph run, matching the CPU path.
 
 ## GEMM Design
 
@@ -514,7 +514,7 @@ The IO layer is split into:
 
 - `GGUFParser`: reads file header, metadata, tensor infos, and raw tensor data.
 - `WeightLoader`: maps GGUF tensor names to graph value names and converts supported formats to FP32 runtime tensors.
-- `BPETokenizer`: byte-level BPE tokenizer with GPT-2 pre-tokenization initialized from GGUF metadata.
+- `BPETokenizer`: default byte-level BPE backend with GGUF-driven special tokens and a Qwen3-oriented pre-tokenization path.
 
 Currently supported weight data types:
 
@@ -560,6 +560,12 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_bpe_tokenizer` | tokenizer initialization and boundary behavior |
 | `test_cuda_kernels` | CUDA kernels, single/batched CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
 
+For end-to-end model alignment, `scripts/compare_llama_completion.py` runs the
+same Qwen3 prompt through `examples/generate` and `llama-completion`, then
+normalizes the visible answer text and reports prompt-token counts on both
+sides. The helper is meant for the "compare against llama.cpp" task, not as a
+formal regression test.
+
 The important split is:
 
 - kernel tests catch numerical bugs in primitive ops
@@ -577,7 +583,7 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 - multi-threaded execution
 - continuous batching and a production request scheduler
 - prefix cache and block sharing across requests
-- production-grade tokenizer compatibility
+- full llama.cpp tokenizer parity across all model families
 - CUDA quantized kernels
 - Metal / Vulkan backends
 

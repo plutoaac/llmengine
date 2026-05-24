@@ -10,6 +10,7 @@
 #include "minillm/graph/node.h"
 #include "minillm/graph/op_type.h"
 #include "minillm/runtime/cpu_kernels.h"
+#include "minillm/runtime/kernel_adapter_common.h"
 #include "minillm/runtime/runtime_context.h"
 
 namespace minillm {
@@ -63,11 +64,11 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*ids_t, "input_ids"); if (!st.ok()) return st;
-    st = check_allocated(*wt, "weight"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
-    st = check_dtype_float(*wt, "weight"); if (!st.ok()) return st;
-    st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*ids_t, "input_ids"));
+    TRY(check_allocated(*wt, "weight"));
+    TRY(check_allocated(*ot, "output"));
+    TRY(check_dtype_float(*wt, "weight"));
+    TRY(check_dtype_float(*ot, "output"));
     if ((*ids_t)->dtype() != DType::Int32) {
         return Status::unsupported(
             "input_ids only supports Int32, got " +
@@ -99,12 +100,12 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*wt, "weight"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
-    st = check_dtype_float(*xt, "x"); if (!st.ok()) return st;
-    st = check_dtype_float(*wt, "weight"); if (!st.ok()) return st;
-    st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*wt, "weight"));
+    TRY(check_allocated(*ot, "output"));
+    TRY(check_dtype_float(*xt, "x"));
+    TRY(check_dtype_float(*wt, "weight"));
+    TRY(check_dtype_float(*ot, "output"));
 
     // x: [batch, seq, in] flattened to [M, K]
     // weight: [out, in] stored as [N, K]
@@ -120,8 +121,8 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     if (node.inputs().size() >= 3) {
         auto bt = get_tensor(node.inputs()[2], ctx, "bias");
         if (!bt) return bt.error();
-        st = check_allocated(*bt, "bias"); if (!st.ok()) return st;
-        st = check_dtype_float(*bt, "bias"); if (!st.ok()) return st;
+        TRY(check_allocated(*bt, "bias"));
+        TRY(check_dtype_float(*bt, "bias"));
         if ((*bt)->shape().rank() != 1 || (*bt)->shape().dim(0) != N) {
             return Status::shape_mismatch("Linear bias shape must match output features");
         }
@@ -143,9 +144,9 @@ static Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*at, "a"); if (!st.ok()) return st;
-    st = check_allocated(*bt, "b"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*at, "a"));
+    TRY(check_allocated(*bt, "b"));
+    TRY(check_allocated(*ot, "output"));
 
     int M = static_cast<int>((*at)->shape().dim(0));
     int K = static_cast<int>((*at)->shape().dim(1));
@@ -163,9 +164,9 @@ static Status kernel_rmsnorm(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*gt, "gamma"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*gt, "gamma"));
+    TRY(check_allocated(*ot, "output"));
 
     int rows = 1;
     for (size_t i = 0; i + 1 < (*xt)->shape().rank(); ++i) {
@@ -173,10 +174,7 @@ static Status kernel_rmsnorm(const Node& node, RuntimeContext& ctx) {
     }
     int hidden = static_cast<int>((*xt)->shape().dim((*xt)->shape().rank() - 1));
 
-    double eps = 1e-6;
-    if (auto attr = node.get_attr("eps")) {
-        if (auto* p = std::get_if<double>(&*attr)) eps = *p;
-    }
+    double eps = detail::double_attr(node, "eps", 1e-6);
 
     cpu::rmsnorm(float_data(*xt), float_data(*gt), float_data_mut(*ot),
                  rows, hidden, static_cast<float>(eps));
@@ -191,9 +189,9 @@ static Status kernel_add(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*at, "a"); if (!st.ok()) return st;
-    st = check_allocated(*bt, "b"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*at, "a"));
+    TRY(check_allocated(*bt, "b"));
+    TRY(check_allocated(*ot, "output"));
 
     auto n = (*ot)->numel();
     if (!n) return n.error();
@@ -209,9 +207,9 @@ static Status kernel_mul(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*at, "a"); if (!st.ok()) return st;
-    st = check_allocated(*bt, "b"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*at, "a"));
+    TRY(check_allocated(*bt, "b"));
+    TRY(check_allocated(*ot, "output"));
 
     auto n = (*ot)->numel();
     if (!n) return n.error();
@@ -225,8 +223,8 @@ static Status kernel_silu(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*ot, "output"));
 
     auto n = (*ot)->numel();
     if (!n) return n.error();
@@ -242,9 +240,9 @@ static Status kernel_swiglu(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*gt, "gate"); if (!st.ok()) return st;
-    st = check_allocated(*ut, "up"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*gt, "gate"));
+    TRY(check_allocated(*ut, "up"));
+    TRY(check_allocated(*ot, "output"));
 
     auto n = (*ot)->numel();
     if (!n) return n.error();
@@ -259,15 +257,12 @@ static Status kernel_softmax(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
-    st = check_dtype_float(*xt, "x"); if (!st.ok()) return st;
-    st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*ot, "output"));
+    TRY(check_dtype_float(*xt, "x"));
+    TRY(check_dtype_float(*ot, "output"));
 
-    int64_t axis = -1;
-    if (auto attr = node.get_attr("axis")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) axis = *p;
-    }
+    int64_t axis = detail::int_attr(node, "axis", -1);
 
     const auto& shape = (*xt)->shape();
     const int64_t rank = static_cast<int64_t>(shape.rank());
@@ -297,8 +292,8 @@ static Status kernel_reshape(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*ot, "output"));
     if ((*xt)->dtype() != (*ot)->dtype()) {
         return Status::unsupported("Reshape requires matching input/output dtypes");
     }
@@ -328,19 +323,13 @@ static Status kernel_transpose(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
-    st = check_dtype_float(*xt, "x"); if (!st.ok()) return st;
-    st = check_dtype_float(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*ot, "output"));
+    TRY(check_dtype_float(*xt, "x"));
+    TRY(check_dtype_float(*ot, "output"));
 
-    int64_t axis0 = -2;
-    int64_t axis1 = -1;
-    if (auto attr = node.get_attr("axis0")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) axis0 = *p;
-    }
-    if (auto attr = node.get_attr("axis1")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) axis1 = *p;
-    }
+    int64_t axis0 = detail::int_attr(node, "axis0", -2);
+    int64_t axis1 = detail::int_attr(node, "axis1", -1);
 
     const auto& shape = (*xt)->shape();
     const int64_t rank = static_cast<int64_t>(shape.rank());
@@ -372,8 +361,8 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*ot, "output"));
 
     int seq_len = 1;
     for (size_t i = 0; i + 1 < (*xt)->shape().rank(); ++i) {
@@ -381,15 +370,14 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
     }
     int hidden = static_cast<int>((*xt)->shape().dim((*xt)->shape().rank() - 1));
 
-    int64_t head_dim = 64;
-    if (auto attr = node.get_attr("head_dim")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) head_dim = *p;
-    }
+    int64_t head_dim = detail::int_attr(node, "head_dim", 64);
 
-    // Position offset: for decode with KV cache, use cached_len
     int pos_offset = 0;
-    KVCache* cache = ctx.kv_cache();
-    if (cache && cache->initialized() && cache->cached_len() > 0 && seq_len == 1) {
+    if (auto* pc = ctx.paged_kv_cache(); pc && pc->initialized()) {
+        int wp = ctx.paged_kv_write_pos();
+        pos_offset = (wp >= 0) ? wp : pc->sequence_length(ctx.paged_sequence_id());
+    } else if (KVCache* cache = ctx.kv_cache();
+               cache && cache->initialized() && cache->cached_len() > 0 && seq_len == 1) {
         pos_offset = cache->cached_len();
     }
 
@@ -403,10 +391,7 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         for (int h = 0; h < num_heads; ++h) {
             const float* x_head = x_data + s * hidden + h * head_dim;
             float* o_head = o_data + s * hidden + h * head_dim;
-            float rope_base = 10000.0f;
-            if (auto rb_attr = node.get_attr("rope_base"); rb_attr) {
-                if (auto* rb = std::get_if<double>(&*rb_attr)) rope_base = static_cast<float>(*rb);
-            }
+            float rope_base = static_cast<float>(detail::double_attr(node, "rope_base", 10000.0));
             cpu::apply_rope(x_head, o_head, 1, static_cast<int>(head_dim), rope_base, pos_offset + s);
         }
     }
@@ -423,29 +408,16 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*qt, "q"); if (!st.ok()) return st;
-    st = check_allocated(*kt, "k"); if (!st.ok()) return st;
-    st = check_allocated(*vt, "v"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*qt, "q"));
+    TRY(check_allocated(*kt, "k"));
+    TRY(check_allocated(*vt, "v"));
+    TRY(check_allocated(*ot, "output"));
 
-    int64_t num_heads = 12, num_kv_heads = 12, head_dim = 64, layer_idx = 0;
-    if (auto attr = node.get_attr("num_heads")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) num_heads = *p;
-    }
-    if (auto attr = node.get_attr("num_kv_heads")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) num_kv_heads = *p;
-    }
-    if (auto attr = node.get_attr("head_dim")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) head_dim = *p;
-    }
-    if (auto attr = node.get_attr("layer_idx")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) layer_idx = *p;
-    }
-
-    bool causal = true;
-    if (auto attr = node.get_attr("causal")) {
-        if (auto* p = std::get_if<bool>(&*attr)) causal = *p;
-    }
+    int64_t num_heads = detail::int_attr(node, "num_heads", 12);
+    int64_t num_kv_heads = detail::int_attr(node, "num_kv_heads", 12);
+    int64_t head_dim = detail::int_attr(node, "head_dim", 64);
+    int64_t layer_idx = detail::int_attr(node, "layer_idx", 0);
+    bool causal = detail::bool_attr(node, "causal", true);
 
     int nh = static_cast<int>(num_heads);
     int nkv = static_cast<int>(num_kv_heads);
@@ -766,22 +738,14 @@ static Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {
     auto ot = get_tensor(node.outputs()[0], ctx, "output");
     if (!ot) return ot.error();
 
-    auto st = check_allocated(*xt, "x"); if (!st.ok()) return st;
-    st = check_allocated(*gt, "gamma"); if (!st.ok()) return st;
-    st = check_allocated(*ot, "output"); if (!st.ok()) return st;
+    TRY(check_allocated(*xt, "x"));
+    TRY(check_allocated(*gt, "gamma"));
+    TRY(check_allocated(*ot, "output"));
 
-    int64_t num_heads = 12, head_dim = 64;
-    if (auto attr = node.get_attr("num_heads")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) num_heads = *p;
-    }
-    if (auto attr = node.get_attr("head_dim")) {
-        if (auto* p = std::get_if<int64_t>(&*attr)) head_dim = *p;
-    }
+    int64_t num_heads = detail::int_attr(node, "num_heads", 12);
+    int64_t head_dim = detail::int_attr(node, "head_dim", 64);
 
-    double eps = 1e-6;
-    if (auto attr = node.get_attr("eps")) {
-        if (auto* p = std::get_if<double>(&*attr)) eps = *p;
-    }
+    double eps = detail::double_attr(node, "eps", 1e-6);
 
     // x: [batch, seq, num_heads * head_dim]
     // Apply RMSNorm per-head: treat as [batch*seq*num_heads, head_dim]

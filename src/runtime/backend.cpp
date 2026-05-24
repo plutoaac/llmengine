@@ -1,10 +1,12 @@
-#include "minillm/runtime/cpu_backend.h"
+#include "minillm/runtime/backend.h"
 
 namespace minillm {
 
-DeviceType CpuBackend::device_type() const { return DeviceType::CPU; }
+Backend::Backend(DeviceType dt, std::string_view n) : device_type_(dt), name_(n) {}
 
-bool CpuBackend::supports(OpType op) const {
+DeviceType Backend::device_type() const { return device_type_; }
+
+bool Backend::supports(OpType op) const {
     switch (op) {
     case OpType::Embedding:
     case OpType::MatMul:
@@ -27,6 +29,6 @@ bool CpuBackend::supports(OpType op) const {
     }
 }
 
-std::string_view CpuBackend::name() const { return "CpuBackend"; }
+std::string_view Backend::name() const { return name_; }
 
 } // namespace minillm

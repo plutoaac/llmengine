@@ -16,6 +16,19 @@ using namespace minillm;
 
 namespace {
 
+std::string build_chat_prompt(const std::string& system_prompt,
+                              const std::string& user_prompt,
+                              bool enable_thinking = false) {
+    std::string prompt =
+        "<|im_start|>system\n" + system_prompt + "<|im_end|>\n"
+        "<|im_start|>user\n" + user_prompt + "<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    if (!enable_thinking) {
+        prompt += "<think>\n\n</think>\n\n";
+    }
+    return prompt;
+}
+
 std::expected<MemoryPlan, Status> allocate_runtime_tensors_cpu(
     const Graph& graph,
     RuntimeContext& ctx) {
@@ -121,9 +134,7 @@ int main(int argc, char* argv[]) {
     std::vector<PagedGenerationSession> sessions;
     for (size_t i = 0; i < prompts.size(); ++i) {
         std::string chat_prompt =
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            "<|im_start|>user\n" + prompts[i] + "<|im_end|>\n"
-            "<|im_start|>assistant\n";
+            build_chat_prompt("You are a helpful assistant.", prompts[i], false);
         auto encoded = tokenizer.encode(chat_prompt, false, false);
         if (!encoded) {
             std::cerr << "Failed to encode prompt " << i << "\n";
@@ -239,10 +250,11 @@ int main(int argc, char* argv[]) {
     }
 
     SamplingConfig samp_cfg;
+    // Match the llama.cpp comparison path: deterministic greedy decode.
     samp_cfg.greedy = true;
-    samp_cfg.temperature = 0.8f;
-    samp_cfg.top_k = 40;
-    samp_cfg.top_p = 0.9f;
+    samp_cfg.temperature = 0.0f;
+    samp_cfg.top_k = 1;
+    samp_cfg.top_p = 1.0f;
     samp_cfg.repetition_penalty = 1.1f;
     Sampler sampler(42);
 
@@ -397,8 +409,10 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
+            auto history = session.prompt_tokens;
+            history.insert(history.end(), session.generated_tokens.begin(), session.generated_tokens.end());
             int32_t next_token = sampler.sample(
-                logits, vocab_size, samp_cfg, session.prompt_tokens);
+                logits, vocab_size, samp_cfg, history);
 
             if (next_token == eos_id) {
                 seq_done[si] = true;

@@ -2,6 +2,18 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
+
+#define TRY(expr) \
+    do { auto _st_ = (expr); if (!_st_.ok()) return _st_; } while(0)
+
+#define CONCAT_(a, b) a ## b
+#define CONCAT(a, b) CONCAT_(a, b)
+
+#define TRY_TENSOR(var, expr) \
+    auto CONCAT(_t_, __LINE__) = (expr); \
+    if (!CONCAT(_t_, __LINE__)) return CONCAT(_t_, __LINE__).error(); \
+    auto var = std::move(CONCAT(_t_, __LINE__)).value()
 
 namespace minillm {
 

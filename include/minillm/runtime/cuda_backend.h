@@ -6,9 +6,7 @@ namespace minillm {
 
 class CudaBackend final : public Backend {
 public:
-    DeviceType device_type() const override;
-    bool supports(OpType op) const override;
-    std::string_view name() const override;
+    CudaBackend() : Backend(DeviceType::CUDA, "CudaBackend") {}
 };
 
 } // namespace minillm
