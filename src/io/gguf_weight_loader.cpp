@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cstring>
+#include <span>
 #include <unordered_map>
 #include <vector>
 #include <limits>
@@ -48,20 +49,38 @@ std::unordered_map<std::string, const GGUFTensorInfo*> build_gguf_tensor_map(
     return gguf_tensor_map;
 }
 
+std::expected<std::span<const std::byte>, Status> tensor_raw_view(
+    const std::string& gguf_path,
+    const GGUFFile& file,
+    const GGUFTensorInfo& ti,
+    std::vector<std::byte>& fallback) {
+    auto view = file.tensor_view(ti);
+    if (view) return *view;
+    if (view.error().code() != ErrorCode::Unsupported) {
+        return std::unexpected(view.error());
+    }
+
+    auto raw_bytes_exp = ti.bytes();
+    if (!raw_bytes_exp) return std::unexpected(raw_bytes_exp.error());
+    fallback.resize(*raw_bytes_exp);
+
+    auto st = GGUFParser::read_tensor_data(
+        gguf_path, file.data_offset, ti.offset, fallback.data(), fallback.size());
+    if (!st.ok()) return std::unexpected(st);
+
+    return std::span<const std::byte>(fallback.data(), fallback.size());
+}
+
 Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
                              const GGUFTensorInfo& ti, Tensor& tensor) {
     if (!tensor.is_allocated()) {
         return Status::runtime_error("tensor not allocated: " + tensor.name());
     }
 
-    auto raw_bytes_exp = ti.bytes();
-    if (!raw_bytes_exp) return raw_bytes_exp.error();
-    const size_t raw_bytes = *raw_bytes_exp;
-
-    std::vector<std::byte> raw_buf(raw_bytes);
-    auto st = GGUFParser::read_tensor_data(
-        gguf_path, file.data_offset, ti.offset, raw_buf.data(), raw_bytes);
-    if (!st.ok()) return st;
+    std::vector<std::byte> fallback_raw_buf;
+    auto raw_view_exp = tensor_raw_view(gguf_path, file, ti, fallback_raw_buf);
+    if (!raw_view_exp) return raw_view_exp.error();
+    auto raw_view = *raw_view_exp;
 
     auto num_el_exp = ti.num_elements();
     if (!num_el_exp) return num_el_exp.error();
@@ -71,7 +90,7 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
 #if defined(MINILLM_ENABLE_CUDA)
         std::vector<float> staging(num_el);
         auto st2 = WeightLoader::dequantize_to_f32(
-            ti.dtype, raw_buf.data(), staging.data(), num_el);
+            ti.dtype, raw_view.data(), staging.data(), num_el);
         if (!st2.ok()) return st2;
         auto err = cudaMemcpy(tensor.data(), staging.data(),
                               num_el * sizeof(float), cudaMemcpyHostToDevice);
@@ -83,7 +102,7 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
     }
 
     float* dst = reinterpret_cast<float*>(tensor.data());
-    return WeightLoader::dequantize_to_f32(ti.dtype, raw_buf.data(), dst, num_el);
+    return WeightLoader::dequantize_to_f32(ti.dtype, raw_view.data(), dst, num_el);
 }
 
 Status check_compatible_weight(const Tensor& tensor, const Value& value) {
@@ -246,6 +265,7 @@ std::expected<TransformerConfig, Status> WeightLoader::extract_config(
 
 std::expected<std::string, Status> WeightLoader::gguf_name_to_value_name(
     const std::string& gguf_name, int layer_index) {
+    (void)layer_index;
 
     static const std::vector<std::pair<std::string, std::string>> layer_suffixes = {
         {"attn_norm.weight",        "attn_norm.weight"},
@@ -437,7 +457,7 @@ std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
         store.aliases_by_value_name_[v.name] = shared_tensor;
     }
 
-    return std::move(store);
+    return store;
 }
 
 } // namespace minillm

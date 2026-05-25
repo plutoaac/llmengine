@@ -29,7 +29,7 @@ bool check_cuda(cudaError_t err, const std::string& what) {
 
 Status allocate_runtime_tensors_cuda(const Graph& graph, RuntimeContext& ctx) {
     for (const auto& v : graph.values()) {
-        if (v.kind == ValueKind::Constant) continue;
+        if (v.kind != ValueKind::Input) continue;
         auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
         Status st;
         if (v.device.type == DeviceType::CUDA) {
@@ -41,6 +41,8 @@ Status allocate_runtime_tensors_cuda(const Graph& graph, RuntimeContext& ctx) {
         st = ctx.emplace(v.id, std::move(t));
         if (!st.ok()) return st;
     }
+    auto plan = ctx.allocate_intermediates_planned(graph);
+    if (!plan) return plan.error();
     return Status::make_ok();
 }
 

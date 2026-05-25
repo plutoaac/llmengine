@@ -1,10 +1,211 @@
 #include "minillm/io/gguf_parser.h"
 
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <limits>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace minillm {
+
+class GGUFMemoryView {
+public:
+    virtual ~GGUFMemoryView() = default;
+    virtual std::span<const std::byte> bytes() const noexcept = 0;
+};
+
+namespace {
+
+#if defined(_WIN32)
+std::string win32_message(const std::string& what) {
+    return what + ": GetLastError=" + std::to_string(static_cast<unsigned long>(GetLastError()));
+}
+
+class WindowsMappedGGUFMemoryView final : public GGUFMemoryView {
+public:
+    WindowsMappedGGUFMemoryView(HANDLE file, HANDLE mapping, void* view, size_t size)
+        : file_(file), mapping_(mapping), view_(view), size_(size) {}
+
+    ~WindowsMappedGGUFMemoryView() override {
+        if (view_) UnmapViewOfFile(view_);
+        if (mapping_) CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+
+    std::span<const std::byte> bytes() const noexcept override {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(view_), size_);
+    }
+
+    static std::expected<std::shared_ptr<const GGUFMemoryView>, Status> open(
+        const std::string& filename) {
+        HANDLE file = CreateFileA(
+            filename.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return std::unexpected(Status::io_error(
+                win32_message("failed to open GGUF file for mapping: " + filename)));
+        }
+
+        LARGE_INTEGER size_li;
+        if (!GetFileSizeEx(file, &size_li)) {
+            CloseHandle(file);
+            return std::unexpected(Status::io_error(
+                win32_message("failed to query GGUF file size: " + filename)));
+        }
+        if (size_li.QuadPart < 0 ||
+            static_cast<unsigned long long>(size_li.QuadPart) >
+                static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+            CloseHandle(file);
+            return std::unexpected(Status::invalid_argument(
+                "GGUF file too large to map: " + filename));
+        }
+
+        const size_t size = static_cast<size_t>(size_li.QuadPart);
+        if (size == 0) {
+            CloseHandle(file);
+            return std::unexpected(Status::invalid_argument(
+                "cannot mmap empty GGUF file: " + filename));
+        }
+
+        HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping) {
+            CloseHandle(file);
+            return std::unexpected(Status::io_error(
+                win32_message("failed to create file mapping: " + filename)));
+        }
+
+        void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        if (!view) {
+            CloseHandle(mapping);
+            CloseHandle(file);
+            return std::unexpected(Status::io_error(
+                win32_message("failed to map GGUF file: " + filename)));
+        }
+
+        return std::shared_ptr<const GGUFMemoryView>(
+            new WindowsMappedGGUFMemoryView(file, mapping, view, size));
+    }
+
+private:
+    HANDLE file_{INVALID_HANDLE_VALUE};
+    HANDLE mapping_{nullptr};
+    void* view_{nullptr};
+    size_t size_{0};
+};
+#else
+std::string errno_message(const std::string& what) {
+    return what + ": " + std::strerror(errno);
+}
+
+class PosixMappedGGUFMemoryView final : public GGUFMemoryView {
+public:
+    PosixMappedGGUFMemoryView(int fd, void* mapping, size_t size)
+        : fd_(fd), mapping_(mapping), size_(size) {}
+
+    ~PosixMappedGGUFMemoryView() override {
+        if (mapping_ != MAP_FAILED) munmap(mapping_, size_);
+        if (fd_ >= 0) close(fd_);
+    }
+
+    std::span<const std::byte> bytes() const noexcept override {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(mapping_), size_);
+    }
+
+    static std::expected<std::shared_ptr<const GGUFMemoryView>, Status> open(
+        const std::string& filename) {
+        int fd = ::open(filename.c_str(), O_RDONLY);
+        if (fd < 0) {
+            return std::unexpected(Status::io_error(
+                errno_message("failed to open GGUF file for mapping: " + filename)));
+        }
+
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return std::unexpected(Status::io_error(
+                errno_message("failed to query GGUF file size: " + filename)));
+        }
+        if (st.st_size <= 0 ||
+            static_cast<unsigned long long>(st.st_size) >
+                static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+            close(fd);
+            return std::unexpected(Status::invalid_argument(
+                "GGUF file too large to map: " + filename));
+        }
+
+        const size_t size = static_cast<size_t>(st.st_size);
+        void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapping == MAP_FAILED) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return std::unexpected(Status::io_error(
+                errno_message("failed to mmap GGUF file: " + filename)));
+        }
+
+        return std::shared_ptr<const GGUFMemoryView>(
+            new PosixMappedGGUFMemoryView(fd, mapping, size));
+    }
+
+private:
+    int fd_{-1};
+    void* mapping_{MAP_FAILED};
+    size_t size_{0};
+};
+#endif
+
+std::expected<std::shared_ptr<const GGUFMemoryView>, Status> try_open_memory_view(
+    const std::string& filename) {
+#if defined(_WIN32)
+    return WindowsMappedGGUFMemoryView::open(filename);
+#else
+    return PosixMappedGGUFMemoryView::open(filename);
+#endif
+}
+
+Status copy_tensor_bytes_from_view(
+    const std::span<const std::byte> bytes,
+    uint64_t data_offset,
+    uint64_t tensor_offset,
+    void* dst,
+    size_t byte_count) {
+    if (data_offset > std::numeric_limits<uint64_t>::max() - tensor_offset) {
+        return Status::out_of_range("tensor byte offset overflow");
+    }
+    uint64_t abs_offset = data_offset + tensor_offset;
+    uint64_t view_size = static_cast<uint64_t>(bytes.size());
+    if (abs_offset > view_size || byte_count > view_size - abs_offset) {
+        return Status::out_of_range(
+            "tensor byte range exceeds mapped GGUF file bounds");
+    }
+    std::memcpy(dst, bytes.data() + static_cast<size_t>(abs_offset), byte_count);
+    return Status::make_ok();
+}
+
+} // namespace
 
 std::expected<size_t, Status> GGUFTensorInfo::num_elements() const {
     size_t n = 1;
@@ -266,6 +467,32 @@ GGUFParser::parse_tensor_infos(std::ifstream& f, uint64_t tensor_count) {
     return infos;
 }
 
+std::expected<std::span<const std::byte>, Status> GGUFFile::tensor_view(
+    const GGUFTensorInfo& ti) const {
+    if (!memory_view) {
+        return std::unexpected(Status::unsupported(
+            "GGUF memory view unavailable for file: " +
+            (source_path.empty() ? std::string("<unknown>") : source_path)));
+    }
+
+    auto raw = memory_view->bytes();
+    auto byte_count_exp = ti.bytes();
+    if (!byte_count_exp) return std::unexpected(byte_count_exp.error());
+
+    if (data_offset > std::numeric_limits<uint64_t>::max() - ti.offset) {
+        return std::unexpected(Status::out_of_range(
+            "tensor offset overflow for: " + ti.name));
+    }
+    uint64_t abs_offset = data_offset + ti.offset;
+    if (abs_offset > raw.size() ||
+        *byte_count_exp > raw.size() - static_cast<size_t>(abs_offset)) {
+        return std::unexpected(Status::out_of_range(
+            "tensor byte range exceeds mapped GGUF file bounds for: " + ti.name));
+    }
+
+    return raw.subspan(static_cast<size_t>(abs_offset), *byte_count_exp);
+}
+
 // --- Top-level parse ---
 
 std::expected<GGUFFile, Status> GGUFParser::parse(const std::string& filename) {
@@ -282,6 +509,7 @@ std::expected<GGUFFile, Status> GGUFParser::parse(const std::string& filename) {
     }
 
     GGUFFile file;
+    file.source_path = filename;
 
     auto version = read_u32_le(f);
     if (!version) return std::unexpected(version.error());
@@ -324,6 +552,11 @@ std::expected<GGUFFile, Status> GGUFParser::parse(const std::string& filename) {
     file.data_offset = raw_offset +
         (alignment - raw_offset % alignment) % alignment;
 
+    auto memory_view = try_open_memory_view(filename);
+    if (memory_view) {
+        file.memory_view = std::move(*memory_view);
+    }
+
     return file;
 }
 
@@ -333,10 +566,26 @@ Status GGUFParser::read_tensor_data(
     uint64_t tensor_offset,
     void* dst,
     size_t byte_count) {
+    auto memory_view = try_open_memory_view(filename);
+    if (memory_view) {
+        auto bytes = (*memory_view)->bytes();
+        auto st = copy_tensor_bytes_from_view(
+            bytes, data_offset, tensor_offset, dst, byte_count);
+        if (!st.ok()) return st;
+        return Status::make_ok();
+    }
+
     std::ifstream f(filename, std::ios::binary);
     if (!f) return Status::io_error("cannot open file: " + filename);
 
+    if (data_offset > std::numeric_limits<uint64_t>::max() - tensor_offset) {
+        return Status::out_of_range("tensor offset overflow for: " + filename);
+    }
     uint64_t abs_offset = data_offset + tensor_offset;
+    if (abs_offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return Status::out_of_range(
+            "tensor offset exceeds stream seek range for: " + filename);
+    }
     f.seekg(static_cast<std::streamoff>(abs_offset));
     if (!f) return Status::io_error(
         "seek to offset " + std::to_string(abs_offset) + " failed");

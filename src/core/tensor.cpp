@@ -179,4 +179,26 @@ Status Tensor::bind_cpu_data(void* data, size_t bytes) {
     return Status::make_ok();
 }
 
+Status Tensor::bind_cuda_data(void* data, size_t bytes) {
+    auto st = release();
+    if (!st.ok()) return st;
+    if (!data) {
+        return Status::invalid_argument("cannot bind null CUDA storage to tensor: " + name_);
+    }
+    if (shape_.has_dynamic_dim()) {
+        return Status::invalid_argument(
+            "cannot bind tensor with dynamic shape: " + shape_.to_string());
+    }
+    auto nb = nbytes();
+    if (!nb) return nb.error();
+    if (bytes < *nb) {
+        return Status::out_of_range(
+            "external CUDA storage is too small for tensor " + name_);
+    }
+    external_data_ = data;
+    external_bytes_ = bytes;
+    device_ = Device::cuda(0);
+    return Status::make_ok();
+}
+
 } // namespace minillm

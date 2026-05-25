@@ -14,8 +14,7 @@ CpuExecutor::CpuExecutor(std::shared_ptr<Backend> backend, KernelRegistry& regis
     : backend_(std::move(backend)), registry_(registry) {}
 
 Status CpuExecutor::compile(const Graph& graph) {
-    auto st = graph.validate();
-    if (!st.ok()) return st;
+    TRY(graph.validate());
 
     auto order = graph.topological_sort();
     if (!order) return order.error();
@@ -85,8 +84,7 @@ CudaExecutor::CudaExecutor(std::shared_ptr<Backend> backend, KernelRegistry& reg
     : backend_(std::move(backend)), registry_(registry) {}
 
 Status CudaExecutor::compile(const Graph& graph) {
-    auto st = graph.validate();
-    if (!st.ok()) return st;
+    TRY(graph.validate());
 
     auto order = graph.topological_sort();
     if (!order) return order.error();

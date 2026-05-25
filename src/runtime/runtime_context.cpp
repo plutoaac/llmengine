@@ -6,7 +6,19 @@
 
 #include "minillm/graph/graph.h"
 
+#if defined(MINILLM_ENABLE_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 namespace minillm {
+
+RuntimeContext::~RuntimeContext() {
+#if defined(MINILLM_ENABLE_CUDA)
+    for (auto& block : cuda_arenas_)
+        if (block.data) cudaFree(block.data);
+    cuda_arenas_.clear();
+#endif
+}
 
 namespace {
 
@@ -31,7 +43,7 @@ Status allocate_owned_tensor(const Value& v, std::unique_ptr<Tensor>& out) {
     } else {
         st = t->allocate_cpu();
     }
-    if (!st.ok()) return st;
+    TRY(st);
     out = std::move(t);
     return Status::make_ok();
 }
@@ -68,8 +80,7 @@ Status RuntimeContext::allocate_intermediates(const Graph& graph) {
         if (v.kind == ValueKind::Input || v.kind == ValueKind::Constant) continue;
         if (bindings_.count(v.id.value)) continue;
         std::unique_ptr<Tensor> t;
-        auto st = allocate_owned_tensor(v, t);
-        if (!st.ok()) return st;
+        TRY(allocate_owned_tensor(v, t));
         bindings_[v.id.value] = t.get();
         owned_.push_back(std::move(t));
     }
@@ -112,24 +123,47 @@ Status RuntimeContext::allocate_intermediates_with_plan(
     // and allocate one contiguous block.
     std::vector<std::byte*> arena_bases(max_arena + 1, nullptr);
     std::vector<size_t> arena_total_bytes(max_arena + 1, 0);
+    // Track whether each arena is CUDA (index into cuda_arenas_) or CPU (index into cpu_arenas_)
+    std::vector<DeviceType> arena_device(max_arena + 1, DeviceType::CPU);
 
     for (auto& [arena_idx, buffer_indices] : arena_buffers) {
         size_t total = 0;
+        // Determine device from the first buffer in this arena
+        const auto& first_buffer = plan.buffers[buffer_indices.front()];
+        const DeviceType dt = first_buffer.device.type;
+        arena_device[arena_idx] = dt;
+
         for (size_t bi : buffer_indices) {
             const auto& buffer = plan.buffers[bi];
             total = std::max(total, buffer.offset + buffer.bytes);
         }
         if (total > std::numeric_limits<size_t>::max() - alignment) {
-            return Status::out_of_range("CPU arena allocation size overflow");
+            return Status::out_of_range("arena allocation size overflow");
         }
 
-        CpuArenaBlock block;
-        block.bytes = total;
-        block.storage = std::make_unique<std::byte[]>(total + alignment);
-        block.data = align_pointer(block.storage.get(), alignment);
-        arena_bases[arena_idx] = block.data;
-        arena_total_bytes[arena_idx] = total;
-        cpu_arenas_.push_back(std::move(block));
+        if (dt == DeviceType::CUDA) {
+#if defined(MINILLM_ENABLE_CUDA)
+            CudaArenaBlock block;
+            block.bytes = total;
+            cudaError_t err = cudaMalloc(&block.data, total + alignment);
+            if (err != cudaSuccess)
+                return Status::runtime_error("cudaMalloc arena failed: " + std::string(cudaGetErrorString(err)));
+            std::byte* base = reinterpret_cast<std::byte*>(block.data);
+            arena_bases[arena_idx] = align_pointer(base, alignment);
+            arena_total_bytes[arena_idx] = total;
+            cuda_arenas_.push_back(std::move(block));
+#else
+            return Status::unsupported("CUDA arena allocation requires CUDA support");
+#endif
+        } else {
+            CpuArenaBlock block;
+            block.bytes = total;
+            block.storage = std::make_unique<std::byte[]>(total + alignment);
+            block.data = align_pointer(block.storage.get(), alignment);
+            arena_bases[arena_idx] = block.data;
+            arena_total_bytes[arena_idx] = total;
+            cpu_arenas_.push_back(std::move(block));
+        }
     }
 
     // Map each buffer to its data pointer within the arena
@@ -155,9 +189,15 @@ Status RuntimeContext::allocate_intermediates_with_plan(
         if (!value) return value.error();
         auto tensor = std::make_unique<Tensor>(
             (*value)->name, (*value)->shape, (*value)->dtype, (*value)->device);
-        auto st = tensor->bind_cpu_data(
-            buffer_data[range.buffer_id], buffer_avail_bytes[range.buffer_id]);
-        if (!st.ok()) return st;
+        Status st;
+        if (arena_device[range.buffer_id] == DeviceType::CUDA) {
+            st = tensor->bind_cuda_data(
+                buffer_data[range.buffer_id], buffer_avail_bytes[range.buffer_id]);
+        } else {
+            st = tensor->bind_cpu_data(
+                buffer_data[range.buffer_id], buffer_avail_bytes[range.buffer_id]);
+        }
+        TRY(st);
         bindings_[range.value.value] = tensor.get();
         owned_.push_back(std::move(tensor));
     }
@@ -167,8 +207,7 @@ Status RuntimeContext::allocate_intermediates_with_plan(
         if (v.kind == ValueKind::Input || v.kind == ValueKind::Constant) continue;
         if (bindings_.count(v.id.value)) continue;
         std::unique_ptr<Tensor> t;
-        auto st = allocate_owned_tensor(v, t);
-        if (!st.ok()) return st;
+        TRY(allocate_owned_tensor(v, t));
         bindings_[v.id.value] = t.get();
         owned_.push_back(std::move(t));
     }

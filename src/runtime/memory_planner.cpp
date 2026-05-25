@@ -177,8 +177,9 @@ std::expected<MemoryPlan, Status> MemoryPlanner::plan(
             plan.ranges.push_back(std::move(range));
             continue;
         }
-        if (value.device.type != DeviceType::CPU) {
-            range.skip_reason = "non-CPU device";
+        if (value.device.type != DeviceType::CPU &&
+            value.device.type != DeviceType::CUDA) {
+            range.skip_reason = "unsupported device";
             ++plan.skipped_value_count;
             plan.ranges.push_back(std::move(range));
             continue;

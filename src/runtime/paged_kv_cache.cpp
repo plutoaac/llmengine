@@ -26,8 +26,7 @@ PagedKVCache::~PagedKVCache() {
 
 Status PagedKVCache::init(int num_layers, int num_kv_heads, int head_dim,
                           int block_size, int max_blocks) {
-    auto st = release();
-    if (!st.ok()) return st;
+    TRY(release());
     if (num_layers <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||
         block_size <= 0 || max_blocks <= 0) {
         return Status::invalid_argument(
@@ -58,8 +57,7 @@ Status PagedKVCache::init(int num_layers, int num_kv_heads, int head_dim,
 #if defined(MINILLM_ENABLE_CUDA)
 Status PagedKVCache::init_cuda(int num_layers, int num_kv_heads, int head_dim,
                                int block_size, int max_blocks, int device_index) {
-    auto st = release();
-    if (!st.ok()) return st;
+    TRY(release());
     if (num_layers <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||
         block_size <= 0 || max_blocks <= 0) {
         return Status::invalid_argument(
@@ -178,8 +176,7 @@ Status PagedKVCache::write_tokens_cuda(int sequence_id, int layer, int start_pos
         return Status::make_ok();
 
     const int end_pos = start_pos + token_count;
-    auto st = reserve_sequence(sequence_id, end_pos);
-    if (!st.ok()) return st;
+    TRY(reserve_sequence(sequence_id, end_pos));
 
     const int row_floats = kv_hidden();
     const size_t row_bytes = static_cast<size_t>(row_floats) * sizeof(float);
@@ -328,8 +325,7 @@ const std::vector<int>* PagedKVCache::block_table(int sequence_id) const {
 }
 
 Status PagedKVCache::reserve_sequence(int sequence_id, int total_tokens) {
-    auto st = ensure_sequence(sequence_id);
-    if (!st.ok()) return st;
+    TRY(ensure_sequence(sequence_id));
     if (total_tokens < 0)
         return Status::invalid_argument("total_tokens must be non-negative");
 
@@ -355,8 +351,7 @@ Status PagedKVCache::reserve_sequence(int sequence_id, int total_tokens) {
 Status PagedKVCache::set_sequence_length(int sequence_id, int length) {
     if (length < 0)
         return Status::invalid_argument("sequence length must be non-negative");
-    auto st = reserve_sequence(sequence_id, length);
-    if (!st.ok()) return st;
+    TRY(reserve_sequence(sequence_id, length));
     sequences_[static_cast<size_t>(sequence_id)].length = length;
     return Status::make_ok();
 }
@@ -424,8 +419,7 @@ Status PagedKVCache::write_tokens(int sequence_id, int layer, int start_pos,
         return Status::make_ok();
 
     const int end_pos = start_pos + token_count;
-    auto st = reserve_sequence(sequence_id, end_pos);
-    if (!st.ok()) return st;
+    TRY(reserve_sequence(sequence_id, end_pos));
 
     const int row_floats = kv_hidden();
     for (int t = 0; t < token_count; ++t) {

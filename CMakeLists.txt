@@ -29,6 +29,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MINILLM_ENABLE_NATIVE_ARCH "Enable host-native CPU code generation when supported" ON)
 
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${OpenMP_CXX_FLAGS}>)
+endif()
+
 if(MINILLM_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -86,6 +91,9 @@ add_library(minillm_runtime
 )
 target_include_directories(minillm_runtime PUBLIC include)
 target_link_libraries(minillm_runtime PUBLIC minillm_graph)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(minillm_runtime PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 if(MINILLM_ENABLE_CUDA)
     target_sources(minillm_runtime PRIVATE

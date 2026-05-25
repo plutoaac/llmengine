@@ -14,47 +14,7 @@
 #include "minillm/runtime/runtime_context.h"
 
 namespace minillm {
-
-static Status check_dtype_float(const Tensor* t, std::string_view name) {
-    if (t->dtype() != DType::Float32) {
-        return Status::unsupported(
-            std::string(name) + " only supports Float32, got " +
-            std::string(dtype_name(t->dtype())));
-    }
-    return Status::make_ok();
-}
-
-static Status check_allocated(const Tensor* t, std::string_view name) {
-    if (!t->is_allocated()) {
-        return Status::runtime_error(
-            std::string(name) + " tensor not allocated");
-    }
-    return Status::make_ok();
-}
-
-static const float* float_data(const Tensor* t) {
-    return reinterpret_cast<const float*>(t->data());
-}
-
-static float* float_data_mut(Tensor* t) {
-    return reinterpret_cast<float*>(t->data());
-}
-
-static const int* int_data(const Tensor* t) {
-    return reinterpret_cast<const int*>(t->data());
-}
-
-// Helper to resolve ValueId to Tensor*, with error checks
-static std::expected<Tensor*, Status> get_tensor(ValueId id, RuntimeContext& ctx,
-                                                  std::string_view role) {
-    auto* t = ctx.get(id);
-    if (!t) {
-        return std::unexpected(Status::runtime_error(
-            std::string(role) + " tensor not found for ValueId %" +
-            std::to_string(id.value)));
-    }
-    return t;
-}
+using namespace detail;
 
 static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     auto ids_t = get_tensor(node.inputs()[0], ctx, "input_ids");

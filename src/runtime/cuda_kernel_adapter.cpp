@@ -19,19 +19,13 @@
 #include "minillm/runtime/runtime_context.h"
 
 namespace minillm {
+using namespace detail;
 
 namespace {
 
 Status cuda_status(cudaError_t err, const char* what) {
     if (err == cudaSuccess) return Status::make_ok();
     return Status::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
-}
-
-Status check_allocated(const Tensor* t, std::string_view name) {
-    if (!t->is_allocated()) {
-        return Status::runtime_error(std::string(name) + " tensor not allocated");
-    }
-    return Status::make_ok();
 }
 
 Status check_cuda_device(const Tensor* t, std::string_view name) {
@@ -42,86 +36,12 @@ Status check_cuda_device(const Tensor* t, std::string_view name) {
     return Status::make_ok();
 }
 
-Status check_dtype_float(const Tensor* t, std::string_view name) {
-    if (t->dtype() != DType::Float32) {
-        return Status::unsupported(
-            std::string(name) + " only supports Float32, got " +
-            std::string(dtype_name(t->dtype())));
-    }
-    return Status::make_ok();
-}
-
 Status check_cuda_float(const Tensor* t, std::string_view name) {
     auto st = check_allocated(t, name);
     if (!st.ok()) return st;
     st = check_cuda_device(t, name);
     if (!st.ok()) return st;
     return check_dtype_float(t, name);
-}
-
-const float* float_data(const Tensor* t) {
-    return reinterpret_cast<const float*>(t->data());
-}
-
-float* float_data_mut(Tensor* t) {
-    return reinterpret_cast<float*>(t->data());
-}
-
-const int* int_data(const Tensor* t) {
-    return reinterpret_cast<const int*>(t->data());
-}
-
-std::expected<Tensor*, Status> get_tensor(ValueId id, RuntimeContext& ctx,
-                                          std::string_view role) {
-    auto* t = ctx.get(id);
-    if (!t) {
-        return std::unexpected(Status::runtime_error(
-            std::string(role) + " tensor not found for ValueId %" +
-            std::to_string(id.value)));
-    }
-    return t;
-}
-
-std::expected<int, Status> checked_int(size_t value, std::string_view role) {
-    if (value > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        return std::unexpected(Status::unsupported(
-            std::string(role) + " is too large for the current CUDA kernel int indexing"));
-    }
-    return static_cast<int>(value);
-}
-
-std::expected<int, Status> checked_dim(int64_t value, std::string_view role) {
-    if (value < 0 || value > std::numeric_limits<int>::max()) {
-        return std::unexpected(Status::unsupported(
-            std::string(role) + " dimension is outside CUDA kernel int range"));
-    }
-    return static_cast<int>(value);
-}
-
-std::expected<int, Status> numel_int(const Tensor* t, std::string_view role) {
-    auto n = t->numel();
-    if (!n) return std::unexpected(n.error());
-    return checked_int(*n, role);
-}
-
-std::expected<int, Status> rows_before_last_dim(const Tensor* t, std::string_view role) {
-    if (t->shape().rank() == 0) {
-        return std::unexpected(Status::shape_mismatch(
-            std::string(role) + " expects rank >= 1"));
-    }
-    size_t rows = 1;
-    for (size_t i = 0; i + 1 < t->shape().rank(); ++i) {
-        rows *= static_cast<size_t>(t->shape().dim(i));
-    }
-    return checked_int(rows, role);
-}
-
-std::expected<int, Status> last_dim(const Tensor* t, std::string_view role) {
-    if (t->shape().rank() == 0) {
-        return std::unexpected(Status::shape_mismatch(
-            std::string(role) + " expects rank >= 1"));
-    }
-    return checked_dim(t->shape().dim(t->shape().rank() - 1), role);
 }
 
 Status kernel_embedding(const Node& node, RuntimeContext& ctx) {

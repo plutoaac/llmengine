@@ -68,16 +68,16 @@ void test_skips_non_plannable_values() {
 
     auto plan = MemoryPlanner::plan(g);
     assert(plan);
-    assert(plan->eligible_value_count == 0);
-    assert(plan->skipped_value_count == 5);
-    assert(plan->naive_bytes == 0);
-    assert(plan->planned_bytes == 0);
+    assert(plan->eligible_value_count == 1);  // gpu is now eligible (CUDA arena)
+    assert(plan->skipped_value_count == 4);
+    assert(plan->naive_bytes > 0); // gpu has bytes
+    assert(plan->planned_bytes > 0);
 
     auto* dynamic_range = plan->range_for(*dynamic);
     auto* gpu_range = plan->range_for(*gpu);
     auto* out_range = plan->range_for(*out);
     assert(dynamic_range && dynamic_range->skip_reason == "dynamic shape");
-    assert(gpu_range && gpu_range->skip_reason == "non-CPU device");
+    assert(gpu_range && gpu_range->eligible == true);
     assert(out_range && out_range->skip_reason == "kind=Output");
     std::cout << "  PASS test_skips_non_plannable_values\n";
 }

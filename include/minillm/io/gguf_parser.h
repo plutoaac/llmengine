@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <fstream>
+#include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -12,6 +15,8 @@
 #include "minillm/io/gguf_format.h"
 
 namespace minillm {
+
+class GGUFMemoryView;
 
 // Forward declaration for recursive variant
 struct MetadataArray;
@@ -44,8 +49,15 @@ struct GGUFFile {
     uint64_t tensor_count{0};
     uint64_t metadata_kv_count{0};
     uint64_t data_offset{0};
+    std::string source_path;
+    std::shared_ptr<const GGUFMemoryView> memory_view;
     std::unordered_map<std::string, MetadataValue> metadata;
     std::vector<GGUFTensorInfo> tensor_infos;
+
+    bool has_memory_view() const noexcept { return static_cast<bool>(memory_view); }
+
+    std::expected<std::span<const std::byte>, Status> tensor_view(
+        const GGUFTensorInfo& ti) const;
 };
 
 // Metadata access helpers.
@@ -77,6 +89,7 @@ public:
     static std::expected<GGUFFile, Status> parse(const std::string& filename);
 
     // Read raw tensor data from a GGUF file into a caller-supplied buffer.
+    // Uses an mmap-backed fast path when available and falls back to streaming I/O.
     static Status read_tensor_data(
         const std::string& filename,
         uint64_t data_offset,

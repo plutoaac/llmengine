@@ -18,6 +18,9 @@ class Graph;
 
 class RuntimeContext {
 public:
+    RuntimeContext() = default;
+    ~RuntimeContext();
+
     // Bind an externally-owned Tensor to a ValueId.
     Status bind(ValueId id, Tensor* tensor);
 
@@ -70,10 +73,17 @@ private:
         size_t bytes = 0;
     };
 
+    struct CudaArenaBlock {
+        void* data = nullptr;
+        size_t bytes = 0;
+    };
+
     // ValueId.value -> Tensor*
     std::unordered_map<size_t, Tensor*> bindings_;
     // Backing storage for planned CPU intermediate reuse.
     std::vector<CpuArenaBlock> cpu_arenas_;
+    // Backing storage for planned CUDA intermediate reuse.
+    std::vector<CudaArenaBlock> cuda_arenas_;
     // Owning storage for tensors we allocate
     std::vector<std::unique_ptr<Tensor>> owned_;
     // KV cache (shared between prefill and decode contexts)

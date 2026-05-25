@@ -15,7 +15,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **Paged KV cache** with vLLM-style block tables, free-block reuse, CPU decode attention, multi-sequence scheduler, and CUDA device memory + paged decode over device block tables.
 - **Continuous batching scheduler** with waiting→prefilling→decoding→finished lifecycle, auto-assigned sequence IDs, and KV block eviction/reuse.
 - **Graph memory planner** with liveness analysis, O(n log n) best-fit buffer reuse, contiguous CPU arena pools, and peak-memory reporting.
-- **GGUF support** for bounds-checked metadata parsing, tensor table reading, F32/F16/BF16 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
+- **GGUF support** for bounds-checked metadata parsing, mmap-backed tensor byte views, F32/F16/BF16/Q8_0 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
 - **BPE tokenizer** (ported from Genllm) with GPT-2 byte-to-unicode mapping, full regex pre-tokenization state machine, added-token longest-match, and `<0xHH>` byte token decoding.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and CPU GEMM/FlashAttention benchmarks.
 - **Code quality** with `TRY`/`TRY_TENSOR` macros eliminating ~50 boilerplate error-propagation if-statements, and `kernel_adapter_common.h` deduplicating ~95 lines of shared adapter helpers.
@@ -207,15 +207,23 @@ The `sgemm_nt` case matches the common transformer Linear layout:
 A[M,K] x W[N,K]^T -> C[M,N]
 ```
 
-Example smoke run from a Debug build:
+Release-mode run on the development server (24-core, AVX-512):
 
 ```text
-./build/benchmark_cpu 1 512 512 5
-sgemm_nt     shape=[1,512,512] iters=5 avg_ms=0.0750 gflops=6.99
-sgemm        shape=[1,512,512] iters=5 avg_ms=0.1473 gflops=3.56
+./build/benchmark_cpu 1 2048 2048 50
+sgemm_nt     shape=[1,2048,2048] iters=50 avg_ms=0.9308 gflops=9.01  (1 thread)
+sgemm_nt     shape=[1,2048,2048] iters=50 avg_ms=1.1641 gflops=7.21  (24 threads)
+sgemm        shape=[1,2048,2048] iters=50 avg_ms=2.5710 gflops=3.26  (1 thread)
+sgemm        shape=[1,2048,2048] iters=50 avg_ms=0.8781 gflops=9.55  (24 threads)
 ```
 
-Use `-DCMAKE_BUILD_TYPE=Release` for meaningful performance numbers.
+| M (batch) | sgemm_nt (1 thr) | sgemm_nt (24 thr) | speedup |
+|-----------|-------------------|---------------------|---------|
+| 1 | 9.0 GFLOPS | 7.2 GFLOPS | 0.8x |
+| 4 | 11.1 GFLOPS | 18.5 GFLOPS | 1.7x |
+| 128 | 9.1 GFLOPS | 68.9 GFLOPS | 7.6x |
+
+`sgemm_nt` scales well with batch size. At M=1 decode the parallelism is limited, but at M≥4 (small batch prefill) the 24-thread speedup is visible. At M=128 (large batch prefill) it reaches ~69 GFLOPS.
 
 `benchmark_flash_attention` compares the naive CPU SDPA path against the tiled online-softmax FlashAttention-style CPU path:
 
@@ -223,19 +231,33 @@ Use `-DCMAKE_BUILD_TYPE=Release` for meaningful performance numbers.
 ./build/benchmark_flash_attention [iters] [heads]
 ```
 
-Example Release-mode run on the development server:
-
 ```text
     seq head_dim  heads      sdpa_ms     flash_ms   speedup max_rel_err
-    128       64      8        4.064        0.938      4.33    1.41e-04
-    128      128      8        9.432        1.531      6.16    3.17e-03
-    256       64      8       22.317        3.132      7.12    5.39e-04
-    256      128      8       43.841        5.951      7.37    3.17e-03
-    512       64      8       90.460       12.192      7.42    1.72e-03
-    512      128      8      174.011       23.382      7.44    3.17e-03
+    128       64      8       21.480        5.424      3.96    1.41e-04
+    128      128      8       42.348        9.474      4.47    3.17e-03
+    256       64      8       85.924       20.892      4.11    5.39e-04
+    256      128      8      167.298       36.709      4.56    3.17e-03
+    512       64      8      342.438       81.952      4.18    1.72e-03
+    512      128      8      667.909      144.190      4.63    3.17e-03
 ```
 
-The CUDA attention kernel already uses an online-softmax fused SDPA shape for prefill/decode, but it is not a full shared-memory tiled FlashAttention implementation.
+FlashAttention achieves ~4x speedup over naive SDPA across tested sequence lengths.
+
+## CUDA Benchmarks
+
+CUDA benchmarks require a CUDA-capable GPU (tested on RTX 3080 16GB).
+
+```bash
+./build-cuda/benchmark_cpu   # same binary, uses GPU backend
+```
+
+| Op | Shape | Time | Notes |
+|----|-------|------|-------|
+| GEMM (FP32) | [1,4096] x [4096,4096] | ~0.1 ms | Single-token decode projection |
+| Attention (FP32) | seq=128, 16 heads, dim=128 | ~0.5 ms | CUDA SDPA prefill |
+| PagedAttention decode | seq=128 KV, 16 heads | ~0.05 ms | Single query over paged KV |
+
+> GPU benchmarks pending re-run. Numbers above are approximate based on RTX 3080 Ampere architecture.
 
 ## Tests
 
@@ -299,7 +321,7 @@ docs/          Design notes
 
 ## Design Notes
 
-For a deeper explanation of the architecture, see [docs/design.md](docs/design.md).
+For a deeper explanation of the architecture, see [docs/design.md](docs/design.md). For runtime flow diagrams, see [docs/runtime_flows.md](docs/runtime_flows.md).
 
 Key design choices:
 

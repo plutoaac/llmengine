@@ -21,6 +21,7 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
     std::memset(C, 0, static_cast<size_t>(M) * N * sizeof(float));
 
     constexpr int TILE = 64;
+    #pragma omp parallel for collapse(2)
     for (int m = 0; m < M; m += TILE) {
         for (int n = 0; n < N; n += TILE) {
             for (int k = 0; k < K; k += TILE) {
@@ -59,6 +60,7 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
 // ===========================================================================
 
 void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
+    #pragma omp parallel for
     for (int m = 0; m < M; ++m) {
         const float* a_row = A + m * K;
         float* c_row = C + m * N;

@@ -5,6 +5,10 @@
 #include <random>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "minillm/runtime/cpu_kernels.h"
 
 using namespace minillm;
@@ -84,6 +88,11 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "MiniLLM CPU GEMM benchmark\n";
+#ifdef _OPENMP
+    std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
+#else
+    std::cout << "OpenMP: not available (single-threaded)\n";
+#endif
     std::cout << "sgemm_nt matches Linear: A[M,K] x W[N,K]^T -> C[M,N]\n";
 
     double nt_seconds = benchmark_sgemm_nt(M, N, K, iters);

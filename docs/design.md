@@ -2,6 +2,8 @@
 
 MiniLLMEngine is a compact CPU-first LLM inference runtime. It borrows ideas from systems such as llama.cpp and ggml, but keeps the implementation intentionally small so each subsystem can be understood and tested independently.
 
+For visual chain diagrams, see [runtime_flows.md](runtime_flows.md).
+
 The design goal is to demonstrate the core engineering concepts behind local LLM inference:
 
 - graph construction and shape inference
@@ -58,7 +60,8 @@ The runtime is separated into five layers:
 | Graph | Logical `Value` and `Node` descriptors plus graph validation and topological sort |
 | Model | Transformer graph construction using `GraphBuilder` |
 | Runtime | `RuntimeContext`, `CpuExecutor`, optional `CudaExecutor`, backend capability checks, kernel registries, KV cache, paged KV cache, paged attention scheduler, sampler |
-| IO | GGUF metadata parsing, tensor loading, weight-name mapping, and tokenizer |
+| IO | GGUF metadata parsing, tensor loading, weight-name mapping |
+| Tokenizer | Replaceable tokenizer interface plus default GGUF BPE backend |
 
 ## Core Types
 
@@ -318,7 +321,7 @@ Current CUDA scope:
 - FP32 single-sequence and batched PagedAttention decode over device block tables
 - FP32 `Transpose`
 - dtype-preserving CUDA `Reshape` through device-to-device copy
-- GGUF F32/F16/BF16 weight staging into CUDA tensors for no-cache forward smoke tests
+- GGUF F32/F16/BF16/Q8_0 weight staging into CUDA tensors for generation smoke tests
 - single-batch CUDA generation with a contiguous device KV cache
 
 The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads. CUDA SDPA and decode attention use an online-softmax fused shape, but the CUDA path does not yet implement a full shared-memory tiled FlashAttention kernel.
@@ -514,6 +517,7 @@ The IO layer is split into:
 
 - `GGUFParser`: reads file header, metadata, tensor infos, and raw tensor data.
 - `WeightLoader`: maps GGUF tensor names to graph value names and converts supported formats to FP32 runtime tensors.
+- `Tokenizer`: small interface for replacing the text-to-token backend.
 - `BPETokenizer`: default byte-level BPE backend with GGUF-driven special tokens and a Qwen3-oriented pre-tokenization path.
 
 Currently supported weight data types:
@@ -536,7 +540,45 @@ GGUF tensor "token_embd.weight"
 
 This removes the largest avoidable memory duplication in the current two-graph generation path. Activations remain separate because prefill and decode have different shapes, while weights and KV cache are shared runtime state.
 
-Quantized GGUF tensors are a future extension.
+The tokenizer layer is intentionally kept replaceable. The current in-tree
+`BPETokenizer` is the default backend, but a third-party implementation can be
+plugged in later without changing the runtime or examples.
+
+Q8_0 GGUF tensors can be expanded during weight loading. True quantized
+matmul kernels are a future extension.
+
+## GGUF mmap Weight Loading
+
+GGUF loading is split into two layers:
+
+- `GGUFParser` reads the header, metadata, and tensor table with explicit bounds checks.
+- `GGUFFile` keeps a read-only memory view of the file and exposes tensor slices with `tensor_view()`.
+
+On Linux this uses `mmap`; on Windows it uses `CreateFileMapping` and `MapViewOfFile`. If mapping is unavailable, the old streaming `read_tensor_data()` path remains as a fallback. The important design choice is that mapping is file-level, not tensor-level: the engine maps the GGUF once, then each tensor is a checked span into that mapped file.
+
+```mermaid
+flowchart TD
+    Path["GGUF path"] --> Parse["GGUFParser::parse"]
+    Parse --> Header["magic/version/metadata/tensor table"]
+    Parse --> Map["read-only file mapping"]
+    Header --> File["GGUFFile"]
+    Map --> File
+    File --> View["GGUFFile::tensor_view(tensor_info)"]
+    View --> Bounds["offset + bytes bounds check"]
+    Bounds --> Raw["span<const byte> over mapped file"]
+    Raw --> Dequant["WeightLoader::dequantize_to_f32"]
+    Dequant --> CpuTensor["CPU Tensor storage"]
+    Dequant -. "CUDA build" .-> Staging["host F32 staging"]
+    Staging -. "cudaMemcpy" .-> CudaTensor["CUDA Tensor storage"]
+```
+
+This keeps model loading easy to explain:
+
+- metadata and tensor offsets are still parsed normally
+- tensor bytes are not copied into an intermediate raw buffer on the mmap path
+- F16/BF16/Q8_0 are still expanded into the engine's FP32 runtime tensors
+- CUDA still stages through host FP32 before copying to device tensors
+- malformed tensor ranges fail before any dequantization starts
 
 ## Testing Strategy
 
@@ -550,7 +592,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_graph_builder` | shape inference and builder-level validation |
 | `test_cpu_kernels` | direct numerical checks for low-level CPU kernels, including FlashAttention-style SDPA |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
-| `test_gguf_parser` | GGUF parsing, metadata, tensor reading, F16/BF16 conversion, shared tied-weight binding |
+| `test_gguf_parser` | GGUF parsing, metadata, mmap tensor views, tensor reading, F16/BF16 conversion, shared tied-weight binding |
 | `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU arena binding, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
@@ -578,7 +620,6 @@ The important split is:
 MiniLLMEngine is intentionally CPU-first and small. It does not currently implement:
 
 - quantized kernels such as Q8_0 or Q4_K
-- mmap-based weight loading
 - CUDA arena allocation for intermediate tensors
 - multi-threaded execution
 - continuous batching and a production request scheduler
@@ -625,6 +666,7 @@ This project is useful to discuss:
 - how a scheduler turns multiple paged KV block tables into one batch for decode
 - how `ContinuousBatchScheduler` manages request lifecycle from prefill through decode to eviction
 - how GGUF metadata and tensor loading fit into inference
+- how mmap-backed tensor views avoid an extra raw weight copy
 - how parser bounds checks prevent malformed model files from turning into unsafe allocations
 - how a CPU backend can be mirrored by an optional CUDA backend
 - how CUDA paged decode reads K/V through device block tables
@@ -635,7 +677,7 @@ This project is useful to discuss:
 
 Good follow-up improvements:
 
-- add Q8_0 weight loading and matmul
+- add true Q8_0 quantized matmul
 - add Release-mode benchmark tables
 - add Release-mode activation-memory and prefill/decode benchmark tables
 - add Release-mode CUDA benchmark tables
