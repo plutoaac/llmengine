@@ -245,19 +245,37 @@ FlashAttention achieves ~4x speedup over naive SDPA across tested sequence lengt
 
 ## CUDA Benchmarks
 
-CUDA benchmarks require a CUDA-capable GPU (tested on RTX 3080 16GB, Ampere SM86).
+CUDA benchmarks measured on RTX 3080 16GB (Ampere SM86), FP32, Release build.
 
 ```bash
 ./build-cuda/benchmark_cuda
 ```
 
-| Op | Shape | Time | Throughput |
-|----|-------|------|------------|
-| `sgemm_nt` (decode) | [1, 4096] × [4096, 4096] | 0.29 ms | 115 GFLOPS |
-| `sgemm_nt` (prefill) | [4, 4096] × [4096, 4096] | 0.54 ms | 247 GFLOPS |
-| `sdpa` | seq=256, 16 heads, dim=128 | 1.77 ms | — |
+### Transformer ops
 
-Compared to CPU GEMM (M=4: 18.5 GFLOPS), CUDA GEMM delivers ~13× higher throughput at 247 GFLOPS. Single-token decode (M=1) is 115 GFLOPS on CUDA vs 7.2 GFLOPS on CPU — a ~16× gap that highlights the GPU's advantage for latency-sensitive single-batch inference.
+| Op | Shape | Time | Notes |
+|----|-------|------|-------|
+| `sgemm_nt` | [4, 4096] × [4096, 4096] | 0.54 ms | 247 GFLOPS (prefill batch=4) |
+| `sgemm_nt` (decode) | [1, 4096] × [4096, 4096] | 0.29 ms | 115 GFLOPS (single token) |
+| `rmsnorm` | [4096, 1024] | 78 µs | — |
+| `add` / `mul` | 16M elements | ~420 µs | Element-wise |
+| `silu` | 16M elements | 281 µs | — |
+| `fused_silu_mul` | 16M elements | 417 µs | SwiGLU fused |
+| `embedding` | seq=256, vocab=151936 | ~2 µs | Gather from 151936×1024 table |
+| `apply_rope` | 256 tokens, 16 heads | ~0.3 µs | In-place rotary embedding |
+| `softmax` | [4096, 151936] | ~2 ms | Per-row over full vocab |
+| `sdpa` | seq=256, 16 heads, dim=128 | 1.77 ms | Causal attention with GQA |
+| `kv_cache_attn` | KV=128 tokens, 16 heads | ~15 µs | Contiguous cache decode |
+| `paged_attn_decode` | KV=128 tokens, 16 heads | ~15 µs | Paged cache decode (block_size=16) |
+| `transpose` | [64, 128] | ~0.2 µs | — |
+
+## CPU vs CUDA comparison
+
+| Op | CPU (24 threads) | CUDA (RTX 3080) | Ratio |
+|----|-------------------|------------------|-------|
+| GEMM M=4 (prefill) | 18.5 GFLOPS | 247 GFLOPS | 13× |
+| GEMM M=1 (decode) | 7.2 GFLOPS | 115 GFLOPS | 16× |
+| Flash/SDPA (seq=256) | 36.7 ms | 1.77 ms | 21× |
 
 ## Tests
 
