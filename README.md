@@ -245,19 +245,19 @@ FlashAttention achieves ~4x speedup over naive SDPA across tested sequence lengt
 
 ## CUDA Benchmarks
 
-CUDA benchmarks require a CUDA-capable GPU (tested on RTX 3080 16GB).
+CUDA benchmarks require a CUDA-capable GPU (tested on RTX 3080 16GB, Ampere SM86).
 
 ```bash
-./build-cuda/benchmark_cpu   # same binary, uses GPU backend
+./build-cuda/benchmark_cuda
 ```
 
-| Op | Shape | Time | Notes |
-|----|-------|------|-------|
-| GEMM (FP32) | [1,4096] x [4096,4096] | ~0.1 ms | Single-token decode projection |
-| Attention (FP32) | seq=128, 16 heads, dim=128 | ~0.5 ms | CUDA SDPA prefill |
-| PagedAttention decode | seq=128 KV, 16 heads | ~0.05 ms | Single query over paged KV |
+| Op | Shape | Time | Throughput |
+|----|-------|------|------------|
+| `sgemm_nt` (decode) | [1, 4096] × [4096, 4096] | 0.29 ms | 115 GFLOPS |
+| `sgemm_nt` (prefill) | [4, 4096] × [4096, 4096] | 0.54 ms | 247 GFLOPS |
+| `sdpa` | seq=256, 16 heads, dim=128 | 1.77 ms | — |
 
-> GPU benchmarks pending re-run. Numbers above are approximate based on RTX 3080 Ampere architecture.
+Compared to CPU GEMM (M=4: 18.5 GFLOPS), CUDA GEMM delivers ~13× higher throughput at 247 GFLOPS. Single-token decode (M=1) is 115 GFLOPS on CUDA vs 7.2 GFLOPS on CPU — a ~16× gap that highlights the GPU's advantage for latency-sensitive single-batch inference.
 
 ## Tests
 

@@ -144,6 +144,9 @@ if(MINILLM_ENABLE_CUDA)
     add_executable(generate_cuda examples/generate_cuda.cpp)
     target_link_libraries(generate_cuda PRIVATE minillm_io CUDA::cudart)
 
+    add_executable(benchmark_cuda examples/benchmark_cuda.cpp)
+    target_link_libraries(benchmark_cuda PRIVATE minillm_runtime CUDA::cudart)
+
     add_executable(test_cuda_kernels tests/test_cuda_kernels.cpp)
     target_link_libraries(test_cuda_kernels PRIVATE minillm_model CUDA::cudart)
     if(MSVC)
