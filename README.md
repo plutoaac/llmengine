@@ -16,7 +16,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **Continuous batching scheduler** with waiting→prefilling→decoding→finished lifecycle, auto-assigned sequence IDs, and KV block eviction/reuse.
 - **Graph memory planner** with liveness analysis, O(n log n) best-fit buffer reuse, contiguous CPU/CUDA arena pools, and peak-memory reporting.
 - **GGUF support** for bounds-checked metadata parsing, mmap-backed tensor byte views, F32/F16/BF16/Q8_0 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
-- **BPE tokenizer** (ported from Genllm) with GPT-2 byte-to-unicode mapping, full regex pre-tokenization state machine, added-token longest-match, and `<0xHH>` byte token decoding.
+- **BPE tokenizer** with GPT-2 byte-to-unicode mapping, full regex pre-tokenization state machine, added-token longest-match, and `<0xHH>` byte token decoding.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and CPU GEMM/FlashAttention benchmarks.
 - **Code quality** with `TRY`/`TRY_TENSOR` macros eliminating ~50 boilerplate error-propagation if-statements, `concepts` and `constexpr` replacing runtime helpers, `std::unreachable()` in exhaustive switches, and `kernel_adapter_common.h` deduplicating ~95 lines of shared adapter helpers.
 
@@ -65,7 +65,7 @@ flowchart LR
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU and CUDA intermediates, with O(n log n) matching and contiguous arena binding |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with parser safety checks and shared weight storage |
-| Byte-level BPE tokenizer | Implemented (Genllm port) with GPT-2 pre-tokenization, merge-based BPE, and `<0xHH>` byte token support |
+| Byte-level BPE tokenizer | Implemented with GPT-2 pre-tokenization, merge-based BPE, and `<0xHH>` byte token support |
 | KV cache prefill/decode | Implemented for single-batch generation |
 | Paged KV cache / PagedAttention | CPU: implemented. CUDA: device memory, block table upload, single-sequence & batched paged decode, contiguous cache prefill/decode — all wired through adapter. |
 | Continuous batching scheduler | Lifecycle core implemented; real inference-loop integration in progress |
