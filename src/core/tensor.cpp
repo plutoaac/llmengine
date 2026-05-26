@@ -180,6 +180,7 @@ Status Tensor::bind_cpu_data(void* data, size_t bytes) {
 }
 
 Status Tensor::bind_cuda_data(void* data, size_t bytes) {
+    const int device_index = device_.index;
     auto st = release();
     if (!st.ok()) return st;
     if (!data) {
@@ -197,7 +198,7 @@ Status Tensor::bind_cuda_data(void* data, size_t bytes) {
     }
     external_data_ = data;
     external_bytes_ = bytes;
-    device_ = Device::cuda(device_.index);
+    device_ = Device::cuda(device_index);
     return Status::make_ok();
 }
 

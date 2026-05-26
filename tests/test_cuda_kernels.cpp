@@ -634,6 +634,67 @@ void test_cuda_executor_linear_bias() {
     std::cout << "  PASS test_cuda_executor_linear_bias\n";
 }
 
+void test_cuda_executor_rope_custom_base() {
+    Graph g;
+    GraphBuilder gb(g);
+    auto x = gb.input("x", Shape({2, 8}), DType::Float32, Device::cuda(0));
+    assert(x);
+    auto y = gb.rope(*x, 2, 4, 500000.0, "rope");
+    assert(y);
+    auto out = gb.output(*y, "out");
+    assert(out);
+    check_status(g.validate());
+
+    Tensor tx("x", Shape({2, 8}), DType::Float32, Device::cuda(0));
+    check_status(tx.allocate_cuda());
+    const std::vector<float> hx{0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7};
+    check_cuda(cudaMemcpy(tx.data(), hx.data(), hx.size()*sizeof(float), cudaMemcpyHostToDevice));
+
+    RuntimeContext ctx;
+    check_status(ctx.bind(*x, &tx));
+    check_status(ctx.allocate_intermediates(g));
+
+    KernelRegistry registry;
+    register_cuda_kernels(registry);
+    CudaExecutor executor(std::make_shared<CudaBackend>(), registry);
+    check_status(executor.compile(g));
+    check_status(executor.run(ctx));
+    sync_ok();
+
+    Tensor* y_tensor = ctx.get(*y);
+    assert(y_tensor != nullptr);
+    assert(y_tensor->device().type == DeviceType::CUDA);
+    std::cout << "  PASS test_cuda_executor_rope_custom_base\n";
+}
+
+void test_cuda_planned_memory_arena() {
+    Graph g;
+    GraphBuilder gb(g);
+    auto x = gb.input("x", Shape({64}), DType::Float32, Device::cuda(0));
+    assert(x);
+    auto y = gb.silu(*x, "y");
+    assert(y);
+    auto out = gb.output(*y, "out");
+    assert(out);
+    check_status(g.validate());
+
+    Tensor tx("x", Shape({64}), DType::Float32, Device::cuda(0));
+    check_status(tx.allocate_cuda());
+
+    RuntimeContext ctx;
+    check_status(ctx.bind(*x, &tx));
+    {
+        auto plan = ctx.allocate_intermediates_planned(g);
+        assert(plan);
+    }
+
+    Tensor* y_tensor = ctx.get(*y);
+    assert(y_tensor != nullptr);
+    assert(y_tensor->device().type == DeviceType::CUDA);
+    assert(y_tensor->is_allocated());
+    std::cout << "  PASS test_cuda_planned_memory_arena\n";
+}
+
 int main() {
     int count = 0;
     check_cuda(cudaGetDeviceCount(&count));
@@ -649,6 +710,8 @@ int main() {
     test_cuda_paged_attention_decode_batch_gqa();
     test_cuda_kv_cache_attention_decode_gqa();
     test_cuda_executor_linear_bias();
+    test_cuda_executor_rope_custom_base();
+    test_cuda_planned_memory_arena();
     std::cout << "All tests passed!\n";
     return 0;
 }

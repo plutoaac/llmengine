@@ -145,7 +145,10 @@ Status RuntimeContext::allocate_intermediates_with_plan(
 #if defined(MINILLM_ENABLE_CUDA)
             CudaArenaBlock block;
             block.bytes = total;
-            cudaError_t err = cudaMalloc(&block.data, total + alignment);
+            cudaError_t err = cudaSetDevice(first_buffer.device.index);
+            if (err != cudaSuccess)
+                return Status::runtime_error("cudaSetDevice failed: " + std::string(cudaGetErrorString(err)));
+            err = cudaMalloc(&block.data, total + alignment);
             if (err != cudaSuccess)
                 return Status::runtime_error("cudaMalloc arena failed: " + std::string(cudaGetErrorString(err)));
             std::byte* base = reinterpret_cast<std::byte*>(block.data);
