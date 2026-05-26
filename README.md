@@ -63,7 +63,7 @@ flowchart LR
 | CPU FlashAttention-style SDPA | Implemented for prefill and decode reference paths |
 | Optional CUDA executor/backend | Experimental, disabled by default |
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
-| Graph memory planner | Implemented for CPU intermediates, with O(n log n) matching and contiguous arena binding |
+| Graph memory planner | Implemented for CPU and CUDA intermediates, with O(n log n) matching and contiguous arena binding |
 | GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with parser safety checks and shared weight storage |
 | Byte-level BPE tokenizer | Implemented (Genllm port) with GPT-2 pre-tokenization, merge-based BPE, and `<0xHH>` byte token support |
 | KV cache prefill/decode | Implemented for single-batch generation |
@@ -149,7 +149,7 @@ Implemented CUDA operators currently target FP32 inference: `Embedding`, `Linear
 
 The older forward-only demo binary was removed to keep the surface smaller. `test_cuda_kernels` covers the low-level CUDA operator surface, while `generate_cuda` covers the end-to-end GPU generation path.
 
-The CUDA path does not yet include quantized CUDA matmul, production scheduler policies, or memory-planner-backed CUDA arena allocation.
+The CUDA path does not yet include quantized CUDA matmul or production scheduler policies.
 
 ## Paged KV Cache
 
@@ -352,7 +352,7 @@ Key design choices:
 - `SharedWeightStore` lets prefill and decode contexts reuse one loaded GGUF weight set instead of duplicating model parameters.
 - `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
 - `MemoryPlanner` computes intermediate tensor live ranges; `RuntimeContext::allocate_intermediates_planned()` binds non-overlapping CPU intermediates to shared arena buffers.
-- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, and paged decode kernels with full adapter integration. CUDA graph-memory arena integration, production batching policy, and quantized CUDA matmul are intentionally left as future work.
+- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, paged decode kernels with full adapter integration, and graph-memory arena allocation for intermediate tensors (both CPU and CUDA). Production batching policy and quantized CUDA matmul are intentionally left as future work.
 
 ## References
 

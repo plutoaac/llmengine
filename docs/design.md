@@ -192,13 +192,13 @@ decode_ctx.set_kv_cache_advance_tokens(1);
 
 After a successful graph run, `CpuExecutor` calls `advance_kv_cache_step()` exactly once. This avoids advancing once per attention layer.
 
-Intermediate allocation is device-aware: a graph value tagged with `Device::cuda(index)` allocates CUDA storage, while the default CPU graph allocates CPU storage. The plain `allocate_intermediates()` path still gives each value its own tensor. The planned path, `allocate_intermediates_planned()`, runs `MemoryPlanner`, allocates CPU arena buffers, and binds eligible intermediate tensors as non-owning views into those arenas. Outputs and other skipped values fall back to normal allocation.
+Intermediate allocation is device-aware: a graph value tagged with `Device::cuda(index)` allocates CUDA storage, while the default CPU graph allocates CPU storage. The plain `allocate_intermediates()` path still gives each value its own tensor. The planned path, `allocate_intermediates_planned()`, runs `MemoryPlanner`, allocates per-device arena buffers (CPU `std::byte[]` or CUDA `cudaMalloc`), and binds eligible intermediate tensors as non-owning views into those arenas. Outputs and other skipped values fall back to normal allocation.
 
 ## Graph Memory Planner
 
 `MemoryPlanner` analyzes a graph without changing execution behavior. It answers a systems question that matters in inference runtimes: which intermediate tensors can share the same memory because their lifetimes do not overlap?
 
-The planner currently targets CPU contiguous tensors and intentionally excludes:
+The planner currently targets contiguous tensors and intentionally excludes:
 
 - inputs
 - constants and weights
@@ -349,7 +349,7 @@ What is not implemented yet:
 - CUDA paged-cache integration in the full generation loop
 - production serving integration around the toy paged attention scheduler
 - CUDA quantized matmul
-- CUDA arena allocation driven by `MemoryPlanner`
+- CUDA quantized matmul
 - CUDA performance benchmarks
 
 The current GPU smoke path is `generate_cuda`. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `WeightLoader` copy weights to device memory, and runs end-to-end generation with a contiguous CUDA `KVCache` before copying logits back to the host for validation.
@@ -620,7 +620,6 @@ The important split is:
 MiniLLMEngine is intentionally CPU-first and small. It does not currently implement:
 
 - quantized kernels such as Q8_0 or Q4_K
-- CUDA arena allocation for intermediate tensors
 - multi-threaded execution
 - continuous batching and a production request scheduler
 - prefix cache and block sharing across requests

@@ -197,7 +197,7 @@ Status Tensor::bind_cuda_data(void* data, size_t bytes) {
     }
     external_data_ = data;
     external_bytes_ = bytes;
-    device_ = Device::cuda(0);
+    device_ = Device::cuda(device_.index);
     return Status::make_ok();
 }
 

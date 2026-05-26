@@ -400,7 +400,7 @@ Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         cache->cached_len() > 0 && *tokens == 1) {
         pos_offset = cache->cached_len();
     }
-    double base = detail::double_attr(node, "base", 10000.0);
+    double base = detail::double_attr(node, "rope_base", 10000.0);
     return cuda::apply_rope(float_data(*xt), float_data_mut(*ot), *tokens,
                             *num_heads, *head_dim, static_cast<float>(base),
                             pos_offset);

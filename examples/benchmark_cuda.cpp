@@ -47,7 +47,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::sgemm_nt(dA, dB, dC, M, N, K);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "sgemm_nt" << std::setw(18) << "[4,4096]x[4096,4096]"
                   << " ms=" << std::setw(10) << std::fixed << std::setprecision(4) << ms
                   << " gflops=" << std::setprecision(1) << 2.0*M*N*K/ms/1e6 << "\n";
@@ -65,7 +65,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::sgemm_nt(dA, dB, dC, M, N, K);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "sgemm_nt (decode)" << std::setw(18) << "[1,4096]x[4096,4096]"
                   << " ms=" << std::setw(10) << std::fixed << std::setprecision(4) << ms
                   << " gflops=" << std::setprecision(1) << 2.0*M*N*K/ms/1e6 << "\n";
@@ -84,7 +84,7 @@ void run() {
         for (int i = 0; i < iters; ++i) fn(dA, dB, dC, n);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << name << std::setw(18) << ("n="+std::to_string(n))
                   << " us=" << std::setw(10) << std::fixed << std::setprecision(2) << ms*1000 << "\n";
         cudaFree(dA); cudaFree(dB); cudaFree(dC);
@@ -110,7 +110,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::rmsnorm(dX, dG, dY, rows, cols, 1e-6f);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "rmsnorm" << std::setw(18)
                   << ("["+std::to_string(rows)+","+std::to_string(cols)+"]")
                   << " us=" << std::setw(10) << std::fixed << std::setprecision(2) << ms*1000 << "\n";
@@ -132,7 +132,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::embedding(dW, dIDs, dO, seq, hidden, vocab);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "embedding" << std::setw(18)
                   << ("seq="+std::to_string(seq)+" vocab="+std::to_string(vocab))
                   << " us=" << std::setw(10) << std::fixed << std::setprecision(2) << ms*1000 << "\n";
@@ -152,7 +152,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::apply_rope(dX, dO, tokens, nh, hd, 10000.0f, 0);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "apply_rope" << std::setw(18)
                   << ("tok="+std::to_string(tokens)+" hd="+std::to_string(hd))
                   << " us=" << std::setw(10) << std::fixed << std::setprecision(2) << ms*1000 << "\n";
@@ -172,7 +172,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::softmax(dX, dO, rows, cols);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "softmax" << std::setw(18)
                   << ("["+std::to_string(rows)+","+std::to_string(cols)+"]")
                   << " ms=" << std::setw(10) << std::fixed << std::setprecision(4) << ms << "\n";
@@ -195,7 +195,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::sdpa(dQ, dK, dV, dO, b, seq, nh, nkv, hd, true);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "sdpa" << std::setw(18) << ("seq="+std::to_string(seq)+" nh=16")
                   << " ms=" << std::setw(10) << std::fixed << std::setprecision(4) << ms << "\n";
         cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
@@ -218,7 +218,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::kv_cache_attention_decode(dQ, dK, dV, dO, kvlen, nh, nkv, hd);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "kv_cache_attn" << std::setw(18)
                   << ("kv="+std::to_string(kvlen)+" nh=16") << " us=" << std::setw(10)
                   << std::fixed << std::setprecision(2) << ms*1000 << "\n";
@@ -248,7 +248,7 @@ void run() {
             cuda::paged_attention_decode(dQ, dK, dV, dBT, dO, kvlen, nh, nkv, hd, bs);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "paged_attn_decode" << std::setw(18)
                   << ("kv="+std::to_string(kvlen)+" nh=16") << " us=" << std::setw(10)
                   << std::fixed << std::setprecision(2) << ms*1000 << "\n";
@@ -269,7 +269,7 @@ void run() {
         for (int i = 0; i < iters; ++i) cuda::transpose(dX, dO, dims, 2, 0, 1);
         cudaDeviceSynchronize();
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters; volatile float sink = hO[0]; (void)sink;
+        double ms = std::chrono::duration<double,std::milli>(t1-t0).count()/iters;
         std::cout << std::setw(20) << "transpose" << std::setw(18)
                   << "["+std::to_string(a)+","+std::to_string(b)+"]" << " us=" << std::setw(10)
                   << std::fixed << std::setprecision(2) << ms*1000 << "\n";

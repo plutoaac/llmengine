@@ -27,9 +27,10 @@ bool check_cuda(cudaError_t err, const std::string& what) {
     return false;
 }
 
-Status allocate_runtime_tensors_cuda(const Graph& graph, RuntimeContext& ctx) {
+Status allocate_input_tensors(const Graph& graph, RuntimeContext& ctx) {
     for (const auto& v : graph.values()) {
         if (v.kind != ValueKind::Input) continue;
+        if (ctx.get(v.id)) continue;
         auto t = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
         Status st;
         if (v.device.type == DeviceType::CUDA) {
@@ -41,8 +42,6 @@ Status allocate_runtime_tensors_cuda(const Graph& graph, RuntimeContext& ctx) {
         st = ctx.emplace(v.id, std::move(t));
         if (!st.ok()) return st;
     }
-    auto plan = ctx.allocate_intermediates_planned(graph);
-    if (!plan) return plan.error();
     return Status::make_ok();
 }
 
@@ -185,16 +184,32 @@ int main(int argc, char* argv[]) {
               << " MiB\n";
 
     RuntimeContext prefill_ctx;
-    st = allocate_runtime_tensors_cuda(prefill_graph, prefill_ctx);
-    if (!check_status(st, "Failed to allocate prefill tensors")) return 1;
     st = shared_weights->bind(prefill_graph, prefill_ctx);
     if (!check_status(st, "Failed to bind prefill weights")) return 1;
+    {
+        auto plan_result = prefill_ctx.allocate_intermediates_planned(prefill_graph);
+        if (!plan_result) {
+            std::cerr << "Failed to allocate prefill intermediates: "
+                      << plan_result.error().to_string() << "\n";
+            return 1;
+        }
+    }
+    st = allocate_input_tensors(prefill_graph, prefill_ctx);
+    if (!check_status(st, "Failed to allocate prefill inputs")) return 1;
 
     RuntimeContext decode_ctx;
-    st = allocate_runtime_tensors_cuda(decode_graph, decode_ctx);
-    if (!check_status(st, "Failed to allocate decode tensors")) return 1;
     st = shared_weights->bind(decode_graph, decode_ctx);
     if (!check_status(st, "Failed to bind decode weights")) return 1;
+    {
+        auto plan_result = decode_ctx.allocate_intermediates_planned(decode_graph);
+        if (!plan_result) {
+            std::cerr << "Failed to allocate decode intermediates: "
+                      << plan_result.error().to_string() << "\n";
+            return 1;
+        }
+    }
+    st = allocate_input_tensors(decode_graph, decode_ctx);
+    if (!check_status(st, "Failed to allocate decode inputs")) return 1;
 
     auto kv_cache = std::make_shared<KVCache>();
     st = kv_cache->init_cuda(static_cast<int>(cfg.num_layers),

@@ -190,7 +190,8 @@ Status RuntimeContext::allocate_intermediates_with_plan(
         auto tensor = std::make_unique<Tensor>(
             (*value)->name, (*value)->shape, (*value)->dtype, (*value)->device);
         Status st;
-        if (arena_device[range.buffer_id] == DeviceType::CUDA) {
+        const auto& buffer = plan.buffers[range.buffer_id];
+        if (arena_device[buffer.arena_index] == DeviceType::CUDA) {
             st = tensor->bind_cuda_data(
                 buffer_data[range.buffer_id], buffer_avail_bytes[range.buffer_id]);
         } else {
