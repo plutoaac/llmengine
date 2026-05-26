@@ -16,11 +16,11 @@ public:
     Shape() = default;
     explicit Shape(std::vector<int64_t> dims);
 
-    size_t rank() const;
+    constexpr size_t rank() const { return dims_.size(); }
     int64_t dim(size_t i) const;
     const std::vector<int64_t>& dims() const;
 
-    bool empty() const;
+    constexpr bool empty() const { return dims_.empty(); }
     bool has_dynamic_dim() const;
     std::expected<size_t, Status> numel() const;
 

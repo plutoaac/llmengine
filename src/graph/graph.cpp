@@ -4,6 +4,7 @@
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "minillm/core/dtype.h"
 
@@ -140,13 +141,13 @@ std::expected<std::vector<NodeId>, Status> Graph::topological_sort() const {
     return order;
 }
 
-static std::string kind_name(ValueKind kind) {
+static std::string_view kind_name(ValueKind kind) {
     switch (kind) {
     case ValueKind::Input:       return "Input";
     case ValueKind::Constant:    return "Constant";
     case ValueKind::Intermediate:return "Intermediate";
     case ValueKind::Output:      return "Output";
-    default:                     return "Unknown";
+    default:                     std::unreachable();
     }
 }
 
@@ -157,7 +158,7 @@ std::string Graph::dump() const {
              " shape=" + v.shape.to_string() +
              " dtype=" + std::string(dtype_name(v.dtype)) +
              " device=" + v.device.to_string() +
-             " kind=" + kind_name(v.kind) + "\n";
+             " kind=" + std::string(kind_name(v.kind)) + "\n";
     }
     s += "  Nodes:\n";
     for (const auto& nd : nodes_) {

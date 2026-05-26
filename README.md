@@ -18,7 +18,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **GGUF support** for bounds-checked metadata parsing, mmap-backed tensor byte views, F32/F16/BF16/Q8_0 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
 - **BPE tokenizer** (ported from Genllm) with GPT-2 byte-to-unicode mapping, full regex pre-tokenization state machine, added-token longest-match, and `<0xHH>` byte token decoding.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and CPU GEMM/FlashAttention benchmarks.
-- **Code quality** with `TRY`/`TRY_TENSOR` macros eliminating ~50 boilerplate error-propagation if-statements, and `kernel_adapter_common.h` deduplicating ~95 lines of shared adapter helpers.
+- **Code quality** with `TRY`/`TRY_TENSOR` macros eliminating ~50 boilerplate error-propagation if-statements, `concepts` and `constexpr` replacing runtime helpers, `std::unreachable()` in exhaustive switches, and `kernel_adapter_common.h` deduplicating ~95 lines of shared adapter helpers.
 
 ## Architecture
 

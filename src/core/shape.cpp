@@ -17,13 +17,9 @@ Shape::Shape(std::vector<int64_t> dims) : dims_(std::move(dims)) {
     }
 }
 
-size_t Shape::rank() const { return dims_.size(); }
-
 int64_t Shape::dim(size_t i) const { return dims_.at(i); }
 
 const std::vector<int64_t>& Shape::dims() const { return dims_; }
-
-bool Shape::empty() const { return dims_.empty(); }
 
 bool Shape::has_dynamic_dim() const {
     for (auto d : dims_) {

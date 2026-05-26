@@ -134,7 +134,7 @@ static Status kernel_rmsnorm(const Node& node, RuntimeContext& ctx) {
     }
     int hidden = static_cast<int>((*xt)->shape().dim((*xt)->shape().rank() - 1));
 
-    double eps = detail::double_attr(node, "eps", 1e-6);
+    double eps = detail::attr(node, "eps", 1e-6);
 
     cpu::rmsnorm(float_data(*xt), float_data(*gt), float_data_mut(*ot),
                  rows, hidden, static_cast<float>(eps));
@@ -222,7 +222,7 @@ static Status kernel_softmax(const Node& node, RuntimeContext& ctx) {
     TRY(check_dtype_float(*xt, "x"));
     TRY(check_dtype_float(*ot, "output"));
 
-    int64_t axis = detail::int_attr(node, "axis", -1);
+    int64_t axis = detail::attr(node, "axis", int64_t{-1});
 
     const auto& shape = (*xt)->shape();
     const int64_t rank = static_cast<int64_t>(shape.rank());
@@ -288,8 +288,8 @@ static Status kernel_transpose(const Node& node, RuntimeContext& ctx) {
     TRY(check_dtype_float(*xt, "x"));
     TRY(check_dtype_float(*ot, "output"));
 
-    int64_t axis0 = detail::int_attr(node, "axis0", -2);
-    int64_t axis1 = detail::int_attr(node, "axis1", -1);
+    int64_t axis0 = detail::attr(node, "axis0", int64_t{-2});
+    int64_t axis1 = detail::attr(node, "axis1", int64_t{-1});
 
     const auto& shape = (*xt)->shape();
     const int64_t rank = static_cast<int64_t>(shape.rank());
@@ -330,7 +330,7 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
     }
     int hidden = static_cast<int>((*xt)->shape().dim((*xt)->shape().rank() - 1));
 
-    int64_t head_dim = detail::int_attr(node, "head_dim", 64);
+    int64_t head_dim = detail::attr(node, "head_dim", int64_t{64});
 
     int pos_offset = 0;
     if (auto* pc = ctx.paged_kv_cache(); pc && pc->initialized()) {
@@ -351,7 +351,7 @@ static Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         for (int h = 0; h < num_heads; ++h) {
             const float* x_head = x_data + s * hidden + h * head_dim;
             float* o_head = o_data + s * hidden + h * head_dim;
-            float rope_base = static_cast<float>(detail::double_attr(node, "rope_base", 10000.0));
+            float rope_base = static_cast<float>(detail::attr(node, "rope_base", 10000.0));
             cpu::apply_rope(x_head, o_head, 1, static_cast<int>(head_dim), rope_base, pos_offset + s);
         }
     }
@@ -373,11 +373,11 @@ static Status kernel_attention(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*vt, "v"));
     TRY(check_allocated(*ot, "output"));
 
-    int64_t num_heads = detail::int_attr(node, "num_heads", 12);
-    int64_t num_kv_heads = detail::int_attr(node, "num_kv_heads", 12);
-    int64_t head_dim = detail::int_attr(node, "head_dim", 64);
-    int64_t layer_idx = detail::int_attr(node, "layer_idx", 0);
-    bool causal = detail::bool_attr(node, "causal", true);
+    int64_t num_heads = detail::attr(node, "num_heads", int64_t{12});
+    int64_t num_kv_heads = detail::attr(node, "num_kv_heads", int64_t{12});
+    int64_t head_dim = detail::attr(node, "head_dim", int64_t{64});
+    int64_t layer_idx = detail::attr(node, "layer_idx", int64_t{0});
+    bool causal = detail::attr(node, "causal", true);
 
     int nh = static_cast<int>(num_heads);
     int nkv = static_cast<int>(num_kv_heads);
@@ -702,10 +702,10 @@ static Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*gt, "gamma"));
     TRY(check_allocated(*ot, "output"));
 
-    int64_t num_heads = detail::int_attr(node, "num_heads", 12);
-    int64_t head_dim = detail::int_attr(node, "head_dim", 64);
+    int64_t num_heads = detail::attr(node, "num_heads", int64_t{12});
+    int64_t head_dim = detail::attr(node, "head_dim", int64_t{64});
 
-    double eps = detail::double_attr(node, "eps", 1e-6);
+    double eps = detail::attr(node, "eps", 1e-6);
 
     // x: [batch, seq, num_heads * head_dim]
     // Apply RMSNorm per-head: treat as [batch*seq*num_heads, head_dim]

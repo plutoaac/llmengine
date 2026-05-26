@@ -184,7 +184,7 @@ Status kernel_rmsnorm(const Node& node, RuntimeContext& ctx) {
     if ((*gt)->shape().rank() != 1 || (*gt)->shape().dim(0) != *hidden) {
         return Status::shape_mismatch("RMSNorm gamma shape must match hidden size");
     }
-    double eps = detail::double_attr(node, "eps", 1e-6);
+    double eps = detail::attr(node, "eps", 1e-6);
     return cuda::rmsnorm(float_data(*xt), float_data(*gt), float_data_mut(*ot),
                          *rows, *hidden, static_cast<float>(eps));
 }
@@ -276,7 +276,7 @@ Status kernel_softmax(const Node& node, RuntimeContext& ctx) {
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
 
-    int64_t axis = detail::int_attr(node, "axis", -1);
+    int64_t axis = detail::attr(node, "axis", int64_t{-1});
     const auto& shape = (*xt)->shape();
     int64_t rank = static_cast<int64_t>(shape.rank());
     if (rank <= 0) {
@@ -349,8 +349,8 @@ Status kernel_transpose(const Node& node, RuntimeContext& ctx) {
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
 
-    int64_t axis0 = detail::int_attr(node, "axis0", -2);
-    int64_t axis1 = detail::int_attr(node, "axis1", -1);
+    int64_t axis0 = detail::attr(node, "axis0", int64_t{-2});
+    int64_t axis1 = detail::attr(node, "axis1", int64_t{-1});
     const auto& shape = (*xt)->shape();
     int64_t rank = static_cast<int64_t>(shape.rank());
     if (rank <= 0) {
@@ -382,13 +382,13 @@ Status kernel_rope(const Node& node, RuntimeContext& ctx) {
     if (!tokens) return tokens.error();
     auto hidden = last_dim(*xt, "rope x");
     if (!hidden) return hidden.error();
-    int64_t head_dim_attr = detail::int_attr(node, "head_dim", 64);
+    int64_t head_dim_attr = detail::attr(node, "head_dim", int64_t{64});
     auto head_dim = checked_dim(head_dim_attr, "rope head_dim");
     if (!head_dim) return head_dim.error();
     if (*head_dim <= 0 || (*head_dim % 2) != 0) {
         return Status::invalid_argument("RoPE head_dim must be a positive even value");
     }
-    int64_t heads_attr = detail::int_attr(node, "num_heads", *hidden / *head_dim);
+    int64_t heads_attr = detail::attr(node, "num_heads", static_cast<int64_t>(*hidden / *head_dim));
     auto num_heads = checked_dim(heads_attr, "rope num_heads");
     if (!num_heads) return num_heads.error();
     if (*hidden != *num_heads * *head_dim) {
@@ -400,7 +400,7 @@ Status kernel_rope(const Node& node, RuntimeContext& ctx) {
         cache->cached_len() > 0 && *tokens == 1) {
         pos_offset = cache->cached_len();
     }
-    double base = detail::double_attr(node, "rope_base", 10000.0);
+    double base = detail::attr(node, "rope_base", 10000.0);
     return cuda::apply_rope(float_data(*xt), float_data_mut(*ot), *tokens,
                             *num_heads, *head_dim, static_cast<float>(base),
                             pos_offset);
@@ -429,9 +429,9 @@ Status kernel_attention(const Node& node, RuntimeContext& ctx) {
         return Status::shape_mismatch("CUDA Attention expects q/k/v rank-3 tensors");
     }
 
-    int64_t num_heads_attr = detail::int_attr(node, "num_heads", 12);
-    int64_t num_kv_heads_attr = detail::int_attr(node, "num_kv_heads", num_heads_attr);
-    int64_t head_dim_attr = detail::int_attr(node, "head_dim", 64);
+    int64_t num_heads_attr = detail::attr(node, "num_heads", int64_t{12});
+    int64_t num_kv_heads_attr = detail::attr(node, "num_kv_heads", num_heads_attr);
+    int64_t head_dim_attr = detail::attr(node, "head_dim", int64_t{64});
     auto num_heads = checked_dim(num_heads_attr, "attention num_heads");
     if (!num_heads) return num_heads.error();
     auto num_kv_heads = checked_dim(num_kv_heads_attr, "attention num_kv_heads");
@@ -468,7 +468,7 @@ Status kernel_attention(const Node& node, RuntimeContext& ctx) {
         return Status::shape_mismatch("CUDA Attention currently expects q/k/v to share batch and seq");
     }
 
-    bool causal = detail::bool_attr(node, "causal", true);
+    bool causal = detail::attr(node, "causal", true);
     KVCache* cache = ctx.kv_cache();
     if (cache && cache->initialized()) {
         if (!cache->is_cuda()) {
@@ -482,7 +482,7 @@ Status kernel_attention(const Node& node, RuntimeContext& ctx) {
                 "CUDA KV cache hidden size does not match attention K/V hidden size");
         }
 
-        int64_t layer_idx_attr = detail::int_attr(node, "layer_idx", 0);
+        int64_t layer_idx_attr = detail::attr(node, "layer_idx", int64_t{0});
         auto layer_idx = checked_dim(layer_idx_attr, "attention layer_idx");
         if (!layer_idx) return layer_idx.error();
         if (*layer_idx < 0 || *layer_idx >= cache->num_layers()) {
@@ -561,7 +561,7 @@ Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
 
-    int64_t head_dim_attr = detail::int_attr(node, "head_dim", 64);
+    int64_t head_dim_attr = detail::attr(node, "head_dim", int64_t{64});
     auto head_dim = checked_dim(head_dim_attr, "qk_norm head_dim");
     if (!head_dim) return head_dim.error();
     if (*head_dim <= 0) {
@@ -577,7 +577,7 @@ Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {
     }
     auto rows = checked_int(*total / static_cast<size_t>(*head_dim), "qk_norm rows");
     if (!rows) return rows.error();
-    double eps = detail::double_attr(node, "eps", 1e-6);
+    double eps = detail::attr(node, "eps", 1e-6);
     return cuda::rmsnorm(float_data(*xt), float_data(*gt), float_data_mut(*ot),
                          *rows, *head_dim, static_cast<float>(eps));
 }

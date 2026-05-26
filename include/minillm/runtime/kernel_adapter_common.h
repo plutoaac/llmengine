@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <cstddef>
 #include <expected>
 #include <limits>
@@ -16,6 +17,8 @@
 namespace minillm {
 namespace detail {
 
+// --- Data accessors ---
+
 inline const float* float_data(const Tensor* t) {
     return reinterpret_cast<const float*>(t->data());
 }
@@ -27,6 +30,8 @@ inline float* float_data_mut(Tensor* t) {
 inline const int* int_data(const Tensor* t) {
     return reinterpret_cast<const int*>(t->data());
 }
+
+// --- Validation helpers ---
 
 inline Status check_allocated(const Tensor* t, std::string_view name) {
     if (!t->is_allocated())
@@ -51,6 +56,8 @@ inline std::expected<Tensor*, Status> get_tensor(ValueId id, RuntimeContext& ctx
             std::to_string(id.value)));
     return t;
 }
+
+// --- Dimension/size helpers ---
 
 inline std::expected<int, Status> checked_int(size_t value, std::string_view role) {
     if (value > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -89,21 +96,18 @@ inline std::expected<int, Status> last_dim(const Tensor* t, std::string_view rol
     return checked_dim(t->shape().dim(t->shape().rank() - 1), role);
 }
 
-inline int64_t int_attr(const Node& node, std::string_view name, int64_t fallback) {
-    if (auto attr = node.get_attr(name))
-        if (auto* p = std::get_if<int64_t>(&*attr)) return *p;
-    return fallback;
-}
+// --- Attribute extraction ---
 
-inline double double_attr(const Node& node, std::string_view name, double fallback) {
-    if (auto attr = node.get_attr(name))
-        if (auto* p = std::get_if<double>(&*attr)) return *p;
-    return fallback;
-}
+// Concept: types that can be stored in AttributeValue variant.
+template<typename T>
+concept AttrType = std::same_as<T, int64_t> || std::same_as<T, double>
+                || std::same_as<T, bool> || std::same_as<T, std::string>;
 
-inline bool bool_attr(const Node& node, std::string_view name, bool fallback) {
-    if (auto attr = node.get_attr(name))
-        if (auto* p = std::get_if<bool>(&*attr)) return *p;
+// Extract a typed attribute from a Node, returning fallback if missing or wrong type.
+template<AttrType T>
+inline T attr(const Node& node, std::string_view name, T fallback) {
+    if (auto a = node.get_attr(name))
+        if (auto* p = std::get_if<T>(&*a)) return *p;
     return fallback;
 }
 

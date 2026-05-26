@@ -1,9 +1,9 @@
 #pragma once
 
 #include <expected>
-#include <functional>
 #include <map>
 #include <string>
+#include <utility>
 
 #include "minillm/core/device.h"
 #include "minillm/core/status.h"
@@ -14,7 +14,8 @@ namespace minillm {
 
 class RuntimeContext;
 
-using KernelFn = std::function<Status(const Node& node, RuntimeContext& ctx)>;
+// Kernel function pointer — zero type-erasure overhead.
+using KernelFn = Status(*)(const Node&, RuntimeContext&);
 
 class KernelRegistry {
 public:
@@ -27,7 +28,7 @@ private:
     struct KeyComp {
         bool operator()(const Key& a, const Key& b) const {
             if (a.first != b.first) return a.first < b.first;
-            return static_cast<int>(a.second) < static_cast<int>(b.second);
+            return std::to_underlying(a.second) < std::to_underlying(b.second);
         }
     };
     std::map<Key, KernelFn, KeyComp> kernels_;
