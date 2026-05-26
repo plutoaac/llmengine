@@ -204,7 +204,6 @@ The planner currently targets contiguous tensors and intentionally excludes:
 - constants and weights
 - outputs by default
 - dynamic-shape values
-- non-CPU values
 - KV cache storage
 
 This keeps the first implementation predictable and easy to explain.
@@ -349,8 +348,6 @@ What is not implemented yet:
 - CUDA paged-cache integration in the full generation loop
 - production serving integration around the toy paged attention scheduler
 - CUDA quantized matmul
-- CUDA quantized matmul
-- CUDA performance benchmarks
 
 The current GPU smoke path is `generate_cuda`. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `WeightLoader` copy weights to device memory, and runs end-to-end generation with a contiguous CUDA `KVCache` before copying logits back to the host for validation.
 
