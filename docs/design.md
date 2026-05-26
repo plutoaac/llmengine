@@ -342,6 +342,8 @@ The `test_cuda_kernels` executable validates:
 - no-cache SDPA with GQA
 - paged decode attention with non-contiguous single-sequence and batched block tables
 - `CudaExecutor` dispatch on a small graph
+- custom `rope_base` attribute through the CUDA adapter
+- CUDA intermediate tensor arena via `allocate_intermediates_planned`
 
 What is not implemented yet:
 
@@ -349,7 +351,7 @@ What is not implemented yet:
 - production serving integration around the toy paged attention scheduler
 - CUDA quantized matmul
 
-The current GPU smoke path is `generate_cuda`. It builds the graph on `Device::cuda(0)`, allocates CUDA tensors, lets `WeightLoader` copy weights to device memory, and runs end-to-end generation with a contiguous CUDA `KVCache` before copying logits back to the host for validation.
+The current GPU smoke path is `generate_cuda`. It builds the graph on `Device::cuda(0)`, binds shared weights, allocates intermediate tensors through `allocate_intermediates_planned()` with per-device arena buffers, lets `WeightLoader` copy weights to device memory, and runs end-to-end generation with a contiguous CUDA `KVCache` before copying logits back to the host for validation.
 
 The older forward-only demo binary was removed to keep the surface smaller. `test_cuda_kernels` covers the low-level CUDA operator surface, while `generate_cuda` covers the end-to-end GPU generation path. During prefill, CUDA Attention copies K/V rows into device cache storage and runs no-cache SDPA over the prompt. During decode, it writes the new token's K/V row at `cached_len` and calls a decode kernel over `[cached_len + 1]` contiguous KV rows. The executor still advances cache length once after the full graph run, matching the CPU path.
 
@@ -590,7 +592,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_cpu_kernels` | direct numerical checks for low-level CPU kernels, including FlashAttention-style SDPA |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
 | `test_gguf_parser` | GGUF parsing, metadata, mmap tensor views, tensor reading, F16/BF16 conversion, shared tied-weight binding |
-| `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU arena binding, skip reasons, report output |
+| `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU/CUDA arena binding, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
 | `test_continuous_batch_scheduler` | admission, eviction, phase transitions, block reuse, finished request collection |
@@ -674,9 +676,5 @@ This project is useful to discuss:
 Good follow-up improvements:
 
 - add true Q8_0 quantized matmul
-- add Release-mode benchmark tables
-- add Release-mode activation-memory and prefill/decode benchmark tables
-- add Release-mode CUDA benchmark tables
 - connect the toy scheduler to an end-to-end decode loop
-- add multi-threaded GEMM
-- align an end-to-end Qwen3-0.6B run against llama.cpp for the first few generated tokens
+- extend memory planner to handle KV cache buffer reuse
