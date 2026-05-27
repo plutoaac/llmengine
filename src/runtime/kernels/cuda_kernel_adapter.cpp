@@ -44,6 +44,19 @@ Status check_cuda_float(const Tensor* t, std::string_view name) {
     return check_dtype_float(t, name);
 }
 
+Status check_cuda_float_or_bf16(const Tensor* t, std::string_view name) {
+    auto st = check_allocated(t, name);
+    if (!st.ok()) return st;
+    st = check_cuda_device(t, name);
+    if (!st.ok()) return st;
+    if (t->dtype() == DType::Float32 || t->dtype() == DType::BFloat16) {
+        return Status::make_ok();
+    }
+    return Status::unsupported(
+        std::string(name) + " supports Float32 or BFloat16, got " +
+        std::string(dtype_name(t->dtype())));
+}
+
 Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     auto ids_t = get_tensor(node.inputs()[0], ctx, "input_ids");
     if (!ids_t) return ids_t.error();
@@ -61,7 +74,7 @@ Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
             "input_ids only supports Int32, got " +
             std::string(dtype_name((*ids_t)->dtype())));
     }
-    st = check_cuda_float(*wt, "weight");
+    st = check_cuda_float_or_bf16(*wt, "weight");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -76,6 +89,10 @@ Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     auto hidden = checked_dim((*wt)->shape().dim(1), "embedding hidden");
     if (!hidden) return hidden.error();
 
+    if ((*wt)->dtype() == DType::BFloat16) {
+        return cuda::embedding(bf16_bits_data(*wt), int_data(*ids_t),
+                               float_data_mut(*ot), *seq_len, *vocab_size, *hidden);
+    }
     return cuda::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
                            *seq_len, *vocab_size, *hidden);
 }
@@ -90,7 +107,7 @@ Status kernel_linear(const Node& node, RuntimeContext& ctx) {
 
     auto st = check_cuda_float(*xt, "x");
     if (!st.ok()) return st;
-    st = check_cuda_float(*wt, "weight");
+    st = check_cuda_float_or_bf16(*wt, "weight");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -110,19 +127,28 @@ Status kernel_linear(const Node& node, RuntimeContext& ctx) {
         return Status::shape_mismatch("Linear x last dimension must match weight input dimension");
     }
 
-    st = cuda::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot),
-                        *M, *N, *K);
+    if ((*wt)->dtype() == DType::BFloat16) {
+        st = cuda::sgemm_nt(float_data(*xt), bf16_bits_data(*wt), float_data_mut(*ot),
+                            *M, *N, *K);
+    } else {
+        st = cuda::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot),
+                            *M, *N, *K);
+    }
     if (!st.ok()) return st;
 
     if (node.inputs().size() >= 3) {
         auto bt = get_tensor(node.inputs()[2], ctx, "bias");
         if (!bt) return bt.error();
-        st = check_cuda_float(*bt, "bias");
+        st = check_cuda_float_or_bf16(*bt, "bias");
         if (!st.ok()) return st;
         if ((*bt)->shape().rank() != 1 || (*bt)->shape().dim(0) != *N) {
             return Status::shape_mismatch("Linear bias shape must match output features");
         }
-        st = cuda::add_bias(float_data_mut(*ot), float_data(*bt), *M, *N);
+        if ((*bt)->dtype() == DType::BFloat16) {
+            st = cuda::add_bias(float_data_mut(*ot), bf16_bits_data(*bt), *M, *N);
+        } else {
+            st = cuda::add_bias(float_data_mut(*ot), float_data(*bt), *M, *N);
+        }
         if (!st.ok()) return st;
     }
     return Status::make_ok();
@@ -138,7 +164,7 @@ Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
 
     auto st = check_cuda_float(*at, "a");
     if (!st.ok()) return st;
-    st = check_cuda_float(*bt, "b");
+    st = check_cuda_float_or_bf16(*bt, "b");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -158,6 +184,10 @@ Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
         return Status::shape_mismatch("MatMul inner dimensions differ");
     }
 
+    if ((*bt)->dtype() == DType::BFloat16) {
+        return cuda::sgemm(float_data(*at), bf16_bits_data(*bt), float_data_mut(*ot),
+                           *M, *N, *K);
+    }
     return cuda::sgemm(float_data(*at), float_data(*bt), float_data_mut(*ot),
                        *M, *N, *K);
 }
@@ -172,7 +202,7 @@ Status kernel_rmsnorm(const Node& node, RuntimeContext& ctx) {
 
     auto st = check_cuda_float(*xt, "x");
     if (!st.ok()) return st;
-    st = check_cuda_float(*gt, "gamma");
+    st = check_cuda_float_or_bf16(*gt, "gamma");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -185,6 +215,10 @@ Status kernel_rmsnorm(const Node& node, RuntimeContext& ctx) {
         return Status::shape_mismatch("RMSNorm gamma shape must match hidden size");
     }
     double eps = detail::attr(node, "eps", 1e-6);
+    if ((*gt)->dtype() == DType::BFloat16) {
+        return cuda::rmsnorm(float_data(*xt), bf16_bits_data(*gt), float_data_mut(*ot),
+                             *rows, *hidden, static_cast<float>(eps));
+    }
     return cuda::rmsnorm(float_data(*xt), float_data(*gt), float_data_mut(*ot),
                          *rows, *hidden, static_cast<float>(eps));
 }
@@ -556,7 +590,7 @@ Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {
 
     auto st = check_cuda_float(*xt, "x");
     if (!st.ok()) return st;
-    st = check_cuda_float(*gt, "gamma");
+    st = check_cuda_float_or_bf16(*gt, "gamma");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -578,6 +612,10 @@ Status kernel_qk_norm(const Node& node, RuntimeContext& ctx) {
     auto rows = checked_int(*total / static_cast<size_t>(*head_dim), "qk_norm rows");
     if (!rows) return rows.error();
     double eps = detail::attr(node, "eps", 1e-6);
+    if ((*gt)->dtype() == DType::BFloat16) {
+        return cuda::rmsnorm(float_data(*xt), bf16_bits_data(*gt), float_data_mut(*ot),
+                             *rows, *head_dim, static_cast<float>(eps));
+    }
     return cuda::rmsnorm(float_data(*xt), float_data(*gt), float_data_mut(*ot),
                          *rows, *head_dim, static_cast<float>(eps));
 }

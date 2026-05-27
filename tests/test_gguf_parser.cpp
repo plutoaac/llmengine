@@ -9,6 +9,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(MINILLM_ENABLE_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 #include "minillm/io/gguf_format.h"
 #include "minillm/io/gguf_parser.h"
 #include "minillm/io/gguf_weight_loader.h"
@@ -653,6 +657,60 @@ void test_extract_config() {
     ASSERT_EQ(cfg->head_dim, int64_t(8));
 }
 
+
+#if defined(MINILLM_ENABLE_CUDA)
+void test_cuda_bf16_shared_weight_load() {
+    int device_count = 0;
+    auto err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count == 0) {
+        std::cout << "  SKIP test_cuda_bf16_shared_weight_load: no CUDA device\n";
+        return;
+    }
+    ASSERT_TRUE(cudaSetDevice(0) == cudaSuccess);
+
+    std::string path = temp_path("test_minillm_cuda_bf16_weight.gguf");
+    std::vector<uint16_t> raw_bf16 = {0x3F80, 0x4000, 0x3F00, 0x4040};
+    {
+        GgufWriter w(path);
+        w.add_meta_string("general.architecture", "llama");
+        w.add_tensor_bf16("token_embd.weight", 2, 2, raw_bf16);
+        w.write();
+    }
+
+    WeightLoader loader(path);
+    auto file = loader.open();
+    ASSERT_TRUE(file.has_value());
+
+    Graph graph;
+    auto tok = graph.add_value("tok_embeddings.weight", Shape({2, 2}),
+                               DType::Float32, Device::cuda(0), ValueKind::Constant);
+    ASSERT_TRUE(tok.has_value());
+
+    auto store = loader.load_shared_weights(*file, graph);
+    ASSERT_TRUE(store.has_value());
+    ASSERT_EQ(store->tensor_count(), size_t(1));
+    ASSERT_EQ(store->alias_count(), size_t(1));
+    ASSERT_EQ(store->total_bytes(), raw_bf16.size() * sizeof(uint16_t));
+
+    Tensor* t = store->get("tok_embeddings.weight");
+    ASSERT_TRUE(t != nullptr);
+    ASSERT_EQ(t->dtype(), DType::BFloat16);
+    ASSERT_EQ(t->device().type, DeviceType::CUDA);
+
+    auto bytes = t->nbytes();
+    ASSERT_TRUE(bytes.has_value());
+    ASSERT_EQ(*bytes, raw_bf16.size() * sizeof(uint16_t));
+
+    std::vector<uint16_t> got(raw_bf16.size());
+    err = cudaMemcpy(got.data(), t->data(), got.size() * sizeof(uint16_t),
+                     cudaMemcpyDeviceToHost);
+    ASSERT_TRUE(err == cudaSuccess);
+    for (size_t i = 0; i < raw_bf16.size(); ++i) {
+        ASSERT_EQ(got[i], raw_bf16[i]);
+    }
+}
+#endif
+
 void test_shared_weight_store_tied_embeddings() {
     std::string path = temp_path("test_minillm_gguf_shared_weights.gguf");
     {
@@ -718,6 +776,9 @@ int main() {
     TEST(f16_tensor_read);
     TEST(bf16_tensor_read);
     TEST(extract_config);
+#if defined(MINILLM_ENABLE_CUDA)
+    TEST(cuda_bf16_shared_weight_load);
+#endif
     TEST(shared_weight_store_tied_embeddings);
 
     std::cout << (tests_failed == 0 ? "All tests passed!" : "Some tests FAILED!")

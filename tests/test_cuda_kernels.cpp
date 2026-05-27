@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <iostream>
@@ -32,6 +34,18 @@ static void sync_ok() {
 
 static void assert_near(float actual, float expected, float tol = 1e-4f) {
     assert(std::abs(actual - expected) <= tol);
+}
+
+static uint16_t bf16_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return static_cast<uint16_t>(bits >> 16);
+}
+
+static std::vector<uint16_t> to_bf16_bits(const std::vector<float>& values) {
+    std::vector<uint16_t> out(values.size());
+    for (size_t i = 0; i < values.size(); ++i) out[i] = bf16_bits(values[i]);
+    return out;
 }
 
 template <typename T>
@@ -244,6 +258,70 @@ void test_cuda_gemm_and_bias() {
     }
 
     std::cout << "  PASS test_cuda_gemm_and_bias\n";
+}
+
+void test_cuda_bf16_weight_kernels() {
+    const std::vector<float> A{1, 2, 3, 4, 5, 6};
+    const std::vector<uint16_t> Bt = to_bf16_bits({7, 8, 9, 10, 11, 12});
+    DeviceBuffer<float> dA(A.size()), dC(4);
+    DeviceBuffer<uint16_t> dBt(Bt.size());
+    dA.copy_from(A);
+    dBt.copy_from(Bt);
+
+    check_status(cuda::sgemm_nt(dA.get(), dBt.get(), dC.get(), 2, 2, 3));
+    sync_ok();
+    auto C = dC.copy_to_host();
+    const std::vector<float> expected_nt{50, 68, 122, 167};
+    for (size_t i = 0; i < expected_nt.size(); ++i) assert_near(C[i], expected_nt[i]);
+
+    const std::vector<uint16_t> bias = to_bf16_bits({0.5f, -1.0f});
+    DeviceBuffer<uint16_t> dbias(bias.size());
+    dbias.copy_from(bias);
+    check_status(cuda::add_bias(dC.get(), dbias.get(), 2, 2));
+    sync_ok();
+    C = dC.copy_to_host();
+    for (int r = 0; r < 2; ++r) {
+        for (int c = 0; c < 2; ++c) {
+            assert_near(C[static_cast<size_t>(r * 2 + c)],
+                        expected_nt[static_cast<size_t>(r * 2 + c)] +
+                        (c == 0 ? 0.5f : -1.0f));
+        }
+    }
+
+    const std::vector<float> x{1, 2, 3, -1, 0, 1};
+    const std::vector<uint16_t> gamma = to_bf16_bits({1.0f, 0.5f, 2.0f});
+    DeviceBuffer<float> dx(x.size()), dy(x.size());
+    DeviceBuffer<uint16_t> dg(gamma.size());
+    dx.copy_from(x);
+    dg.copy_from(gamma);
+    check_status(cuda::rmsnorm(dx.get(), dg.get(), dy.get(), 2, 3, 1e-6f));
+    sync_ok();
+    auto y = dy.copy_to_host();
+    for (int r = 0; r < 2; ++r) {
+        float sum_sq = 0.0f;
+        for (int h = 0; h < 3; ++h) sum_sq += x[static_cast<size_t>(r * 3 + h)] * x[static_cast<size_t>(r * 3 + h)];
+        const float inv = 1.0f / std::sqrt(sum_sq / 3.0f + 1e-6f);
+        const std::vector<float> gamma_f{1.0f, 0.5f, 2.0f};
+        for (int h = 0; h < 3; ++h) {
+            assert_near(y[static_cast<size_t>(r * 3 + h)],
+                        x[static_cast<size_t>(r * 3 + h)] * inv * gamma_f[static_cast<size_t>(h)]);
+        }
+    }
+
+    const std::vector<uint16_t> weight = to_bf16_bits({1, 2, 3, 4, 5, 6, 7, 8});
+    const std::vector<int> ids{2, 0, 3};
+    DeviceBuffer<uint16_t> dw(weight.size());
+    DeviceBuffer<int> dids(ids.size());
+    DeviceBuffer<float> de(6);
+    dw.copy_from(weight);
+    dids.copy_from(ids);
+    check_status(cuda::embedding(dw.get(), dids.get(), de.get(), 3, 4, 2));
+    sync_ok();
+    y = de.copy_to_host();
+    const std::vector<float> expected_embedding{5, 6, 1, 2, 7, 8};
+    for (size_t i = 0; i < expected_embedding.size(); ++i) assert_near(y[i], expected_embedding[i]);
+
+    std::cout << "  PASS test_cuda_bf16_weight_kernels\n";
 }
 
 void test_cuda_norm_embedding_rope_softmax_transpose() {
@@ -704,6 +782,7 @@ int main() {
     std::cout << "test_cuda_kernels:\n";
     test_cuda_elementwise();
     test_cuda_gemm_and_bias();
+    test_cuda_bf16_weight_kernels();
     test_cuda_norm_embedding_rope_softmax_transpose();
     test_cuda_sdpa_gqa();
     test_cuda_paged_attention_decode_gqa();

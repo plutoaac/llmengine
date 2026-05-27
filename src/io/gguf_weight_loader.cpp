@@ -99,6 +99,30 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
 
     if (tensor.device().type == DeviceType::CUDA) {
 #if defined(MINILLM_ENABLE_CUDA)
+        if (tensor.dtype() == DType::BFloat16) {
+            if (ti.dtype != GgmlDataType::BF16) {
+                return Status::unsupported(
+                    "CUDA native BF16 weight load requires a BF16 GGUF tensor: " +
+                    tensor.name());
+            }
+            if (num_el > std::numeric_limits<size_t>::max() / sizeof(uint16_t)) {
+                return Status::invalid_argument(
+                    "CUDA BF16 weight byte size overflow for tensor " + tensor.name());
+            }
+            const size_t expected_bytes = num_el * sizeof(uint16_t);
+            if (raw_view.size() < expected_bytes) {
+                return Status::out_of_range(
+                    "BF16 raw view too small for CUDA tensor " + tensor.name());
+            }
+            auto err = cudaMemcpy(tensor.data(), raw_view.data(), expected_bytes,
+                                  cudaMemcpyHostToDevice);
+            return cuda_status(err, "copy BF16 GGUF weight to CUDA tensor failed");
+        }
+        if (tensor.dtype() != DType::Float32) {
+            return Status::unsupported(
+                "CUDA GGUF weight loader supports Float32 and native BF16 tensors only: " +
+                tensor.name());
+        }
         std::vector<float> staging(num_el);
         auto st2 = WeightLoader::dequantize_to_f32(
             ti.dtype, raw_view.data(), staging.data(), num_el);
@@ -115,7 +139,11 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
     // BF16 native path: raw bytes go directly into the tensor without conversion.
     // This halves weight memory compared to dequantizing to FP32.
     if (ti.dtype == GgmlDataType::BF16 && tensor.dtype() == DType::BFloat16) {
-        auto expected_bytes = num_el * sizeof(uint16_t);
+        if (num_el > std::numeric_limits<size_t>::max() / sizeof(uint16_t)) {
+            return Status::invalid_argument(
+                "BF16 weight byte size overflow for tensor " + tensor.name());
+        }
+        const size_t expected_bytes = num_el * sizeof(uint16_t);
         if (raw_view.size() < expected_bytes) {
             return Status::out_of_range("BF16 raw view too small for tensor " + tensor.name());
         }
@@ -134,8 +162,8 @@ Status check_compatible_weight(const Tensor& tensor, const Value& value) {
             ": tensor " + tensor.shape().to_string() +
             " vs value " + value.shape.to_string());
     }
-    // Allow BF16 tensors to serve FP32 graph values — the adapter handles
-    // the dtype dispatch at kernel time.
+    // Allow BF16 tensors to serve FP32 graph values because adapters
+    // dispatch on the physical weight tensor dtype at kernel time.
     bool dtype_ok = (tensor.dtype() == value.dtype) ||
                     (tensor.dtype() == DType::BFloat16 && value.dtype == DType::Float32);
     if (!dtype_ok) {
@@ -456,11 +484,12 @@ std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
         Tensor* shared_tensor = nullptr;
         auto existing = store.storage_by_gguf_name_.find(gguf_name);
         if (existing == store.storage_by_gguf_name_.end()) {
-            // Use the GGML dtype for the tensor so BF16 weights stay BF16 on CPU.
-            // CUDA tensors always use FP32 since CUDA kernels don't support BF16 yet.
-            DType tensor_dtype = (v.device.type == DeviceType::CUDA)
-                ? DType::Float32
-                : ggml_to_dtype(info_it->second->dtype);
+            // Keep BF16 GGUF weights in native 16-bit storage on CUDA; other
+            // CUDA weight formats still dequantize to FP32 until kernels support them.
+            DType tensor_dtype = ggml_to_dtype(info_it->second->dtype);
+            if (v.device.type == DeviceType::CUDA && tensor_dtype != DType::BFloat16) {
+                tensor_dtype = DType::Float32;
+            }
             auto tensor = std::make_unique<Tensor>(v.name, v.shape, tensor_dtype, v.device);
             Status st;
             if (v.device.type == DeviceType::CUDA) {

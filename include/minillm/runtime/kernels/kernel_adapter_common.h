@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <limits>
 #include <string>
@@ -58,6 +59,10 @@ inline Status check_dtype_floating(const Tensor* t, std::string_view name) {
 
 inline const bfloat16_t* bf16_data(const Tensor* t) {
     return reinterpret_cast<const bfloat16_t*>(t->data());
+}
+
+inline const uint16_t* bf16_bits_data(const Tensor* t) {
+    return reinterpret_cast<const uint16_t*>(t->data());
 }
 
 inline std::expected<Tensor*, Status> get_tensor(ValueId id, RuntimeContext& ctx,
