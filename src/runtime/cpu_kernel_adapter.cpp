@@ -28,7 +28,7 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*ids_t, "input_ids"));
     TRY(check_allocated(*wt, "weight"));
     TRY(check_allocated(*ot, "output"));
-    TRY(check_dtype_float(*wt, "weight"));
+    TRY(check_dtype_floating(*wt, "weight"));
     TRY(check_dtype_float(*ot, "output"));
     if ((*ids_t)->dtype() != DType::Int32) {
         return Status::unsupported(
