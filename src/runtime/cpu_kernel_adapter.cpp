@@ -10,6 +10,7 @@
 #include "minillm/graph/node.h"
 #include "minillm/graph/op_type.h"
 #include "minillm/runtime/cpu_kernels.h"
+#include "minillm/runtime/cpu_kernels_bf16.h"
 #include "minillm/runtime/kernel_adapter_common.h"
 #include "minillm/runtime/runtime_context.h"
 
@@ -47,8 +48,13 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
                 "input_ids contains token id out of embedding vocabulary range");
         }
     }
-    cpu::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
-                   seq_len, hidden);
+    if ((*wt)->dtype() == DType::BFloat16) {
+        cpu_bf16::embedding(bf16_data(*wt), int_data(*ids_t), float_data_mut(*ot),
+                            seq_len, hidden);
+    } else {
+        cpu::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
+                       seq_len, hidden);
+    }
     return Status::make_ok();
 }
 
@@ -64,7 +70,7 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*wt, "weight"));
     TRY(check_allocated(*ot, "output"));
     TRY(check_dtype_float(*xt, "x"));
-    TRY(check_dtype_float(*wt, "weight"));
+    TRY(check_dtype_floating(*wt, "weight"));
     TRY(check_dtype_float(*ot, "output"));
 
     // x: [batch, seq, in] flattened to [M, K]
@@ -77,7 +83,11 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     int K = static_cast<int>((*xt)->shape().dim((*xt)->shape().rank() - 1));
     int N = static_cast<int>((*wt)->shape().dim(0));
 
-    cpu::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot), M, N, K);
+    if ((*wt)->dtype() == DType::BFloat16) {
+        cpu_bf16::sgemm_nt(float_data(*xt), bf16_data(*wt), float_data_mut(*ot), M, N, K);
+    } else {
+        cpu::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot), M, N, K);
+    }
     if (node.inputs().size() >= 3) {
         auto bt = get_tensor(node.inputs()[2], ctx, "bias");
         if (!bt) return bt.error();
@@ -107,12 +117,19 @@ static Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*at, "a"));
     TRY(check_allocated(*bt, "b"));
     TRY(check_allocated(*ot, "output"));
+    TRY(check_dtype_float(*at, "a"));
+    TRY(check_dtype_floating(*bt, "b"));
+    TRY(check_dtype_float(*ot, "output"));
 
     int M = static_cast<int>((*at)->shape().dim(0));
     int K = static_cast<int>((*at)->shape().dim(1));
     int N = static_cast<int>((*bt)->shape().dim(1));
 
-    cpu::sgemm(float_data(*at), float_data(*bt), float_data_mut(*ot), M, N, K);
+    if ((*bt)->dtype() == DType::BFloat16) {
+        cpu_bf16::sgemm(float_data(*at), bf16_data(*bt), float_data_mut(*ot), M, N, K);
+    } else {
+        cpu::sgemm(float_data(*at), float_data(*bt), float_data_mut(*ot), M, N, K);
+    }
     return Status::make_ok();
 }
 

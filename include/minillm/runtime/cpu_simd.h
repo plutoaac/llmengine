@@ -4,7 +4,9 @@
 // Provides portable SIMD abstractions that compile to the best available
 // instruction set at build time.
 
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 
 // Detect SIMD level
@@ -41,6 +43,13 @@ using vfloat = __m512;
 #define VF_SET1(s)    _mm512_set1_ps(s)
 #define VF_SETZERO()  _mm512_setzero_ps()
 #define VF_FMADD(a,b,c) _mm512_fmadd_ps(a,b,c)
+// BF16 → FP32: load 16 BF16, return 16 FP32
+inline vfloat VF_LOAD_BF16(const void* ptr) {
+    __m256i bf16 = _mm256_loadu_si256((const __m256i*)ptr);
+    __m512i i32  = _mm512_cvtepu16_epi32(bf16);
+    i32 = _mm512_slli_epi32(i32, 16);
+    return _mm512_castsi512_ps(i32);
+}
 #elif defined(MINILLM_SIMD_AVX2)
 using vfloat = __m256;
 #define VF_LOAD(p)    _mm256_loadu_ps(p)
@@ -58,6 +67,13 @@ using vfloat = __m256;
 #else
     #define VF_FMADD(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
 #endif
+// BF16 → FP32: load 8 BF16, return 8 FP32
+inline vfloat VF_LOAD_BF16(const void* ptr) {
+    __m128i bf16 = _mm_loadu_si128((const __m128i*)ptr);
+    __m256i i32  = _mm256_cvtepu16_epi32(bf16);
+    i32 = _mm256_slli_epi32(i32, 16);
+    return _mm256_castsi256_ps(i32);
+}
 #elif defined(MINILLM_SIMD_SSE2)
 using vfloat = __m128;
 #define VF_LOAD(p)    _mm_loadu_ps(p)
@@ -71,6 +87,13 @@ using vfloat = __m128;
 #define VF_SET1(s)    _mm_set1_ps(s)
 #define VF_SETZERO()  _mm_setzero_ps()
 #define VF_FMADD(a,b,c) _mm_add_ps(_mm_mul_ps(a,b),c)
+// BF16 → FP32: load 4 BF16, return 4 FP32
+inline vfloat VF_LOAD_BF16(const void* ptr) {
+    __m128i bf16 = _mm_loadl_epi64((const __m128i*)ptr);
+    __m128i i32  = _mm_cvtepu16_epi32(bf16);
+    i32 = _mm_slli_epi32(i32, 16);
+    return _mm_castsi128_ps(i32);
+}
 #else
 using vfloat = float;
 #define VF_LOAD(p)    (*(p))
@@ -84,6 +107,12 @@ using vfloat = float;
 #define VF_SET1(s)    (s)
 #define VF_SETZERO()  (0.0f)
 #define VF_FMADD(a,b,c) ((a) * (b) + (c))
+// BF16 → FP32 scalar fallback
+inline float VF_LOAD_BF16(const void* ptr) {
+    uint16_t bits;
+    std::memcpy(&bits, ptr, sizeof(uint16_t));
+    return std::bit_cast<float>(static_cast<uint32_t>(bits) << 16);
+}
 #endif
 
 namespace minillm::simd {

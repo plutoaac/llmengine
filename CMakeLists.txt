@@ -81,6 +81,7 @@ add_library(minillm_runtime
     src/runtime/executor.cpp
     src/runtime/runtime_context.cpp
     src/runtime/cpu_kernels.cpp
+    src/runtime/cpu_kernels_bf16.cpp
     src/runtime/cpu_kernel_adapter.cpp
     src/runtime/memory_planner.cpp
     src/runtime/sampler.cpp
@@ -179,6 +180,7 @@ add_minillm_test(test_graph)
 add_minillm_test(test_graph_builder)
 add_minillm_test(test_runtime)
 add_minillm_test(test_cpu_kernels)
+add_minillm_test(test_cpu_kernels_bf16)
 add_minillm_test(test_memory_planner)
 add_minillm_test(test_paged_kv_cache)
 add_minillm_test(test_paged_attention_scheduler)

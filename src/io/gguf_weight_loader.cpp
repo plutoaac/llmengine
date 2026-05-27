@@ -15,6 +15,17 @@ namespace minillm {
 
 namespace {
 
+// Map GGML dtype to engine DType. BF16 stays BF16 for native path.
+DType ggml_to_dtype(GgmlDataType ggml_dt) {
+    switch (ggml_dt) {
+    case GgmlDataType::F32:  return DType::Float32;
+    case GgmlDataType::F16:  return DType::Float16;
+    case GgmlDataType::BF16: return DType::BFloat16;
+    case GgmlDataType::Q8_0: return DType::Float32;  // Q8_0 dequants to FP32
+    default:                 return DType::Float32;
+    }
+}
+
 #if defined(MINILLM_ENABLE_CUDA)
 Status cuda_status(cudaError_t err, const char* what) {
     if (err == cudaSuccess) return Status::make_ok();
@@ -101,6 +112,17 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
 #endif
     }
 
+    // BF16 native path: raw bytes go directly into the tensor without conversion.
+    // This halves weight memory compared to dequantizing to FP32.
+    if (ti.dtype == GgmlDataType::BF16 && tensor.dtype() == DType::BFloat16) {
+        auto expected_bytes = num_el * sizeof(uint16_t);
+        if (raw_view.size() < expected_bytes) {
+            return Status::out_of_range("BF16 raw view too small for tensor " + tensor.name());
+        }
+        std::memcpy(tensor.data(), raw_view.data(), expected_bytes);
+        return Status::make_ok();
+    }
+
     float* dst = reinterpret_cast<float*>(tensor.data());
     return WeightLoader::dequantize_to_f32(ti.dtype, raw_view.data(), dst, num_el);
 }
@@ -112,7 +134,11 @@ Status check_compatible_weight(const Tensor& tensor, const Value& value) {
             ": tensor " + tensor.shape().to_string() +
             " vs value " + value.shape.to_string());
     }
-    if (tensor.dtype() != value.dtype) {
+    // Allow BF16 tensors to serve FP32 graph values — the adapter handles
+    // the dtype dispatch at kernel time.
+    bool dtype_ok = (tensor.dtype() == value.dtype) ||
+                    (tensor.dtype() == DType::BFloat16 && value.dtype == DType::Float32);
+    if (!dtype_ok) {
         return Status::type_error("shared weight dtype mismatch for " + value.name);
     }
     if (tensor.device().type != value.device.type ||
@@ -430,7 +456,9 @@ std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
         Tensor* shared_tensor = nullptr;
         auto existing = store.storage_by_gguf_name_.find(gguf_name);
         if (existing == store.storage_by_gguf_name_.end()) {
-            auto tensor = std::make_unique<Tensor>(v.name, v.shape, v.dtype, v.device);
+            // Use the GGML dtype for the tensor so BF16 weights stay BF16.
+            DType tensor_dtype = ggml_to_dtype(info_it->second->dtype);
+            auto tensor = std::make_unique<Tensor>(v.name, v.shape, tensor_dtype, v.device);
             Status st;
             if (v.device.type == DeviceType::CUDA) {
                 st = tensor->allocate_cuda();

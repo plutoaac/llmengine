@@ -13,6 +13,7 @@
 #include "minillm/core/tensor.h"
 #include "minillm/graph/node.h"
 #include "minillm/runtime/runtime_context.h"
+#include "minillm/utils/bfloat16.hpp"
 
 namespace minillm {
 namespace detail {
@@ -45,6 +46,18 @@ inline Status check_dtype_float(const Tensor* t, std::string_view name) {
             std::string(name) + " only supports Float32, got " +
             std::string(dtype_name(t->dtype())));
     return Status::make_ok();
+}
+
+inline Status check_dtype_floating(const Tensor* t, std::string_view name) {
+    if (!is_floating_point(t->dtype()))
+        return Status::unsupported(
+            std::string(name) + " must be a floating tensor, got " +
+            std::string(dtype_name(t->dtype())));
+    return Status::make_ok();
+}
+
+inline const bfloat16_t* bf16_data(const Tensor* t) {
+    return reinterpret_cast<const bfloat16_t*>(t->data());
 }
 
 inline std::expected<Tensor*, Status> get_tensor(ValueId id, RuntimeContext& ctx,
