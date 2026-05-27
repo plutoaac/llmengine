@@ -83,7 +83,6 @@ add_library(minillm_runtime
     src/runtime/continuous_batch_scheduler.cpp
     # Kernel layer
     src/runtime/kernels/cpu_kernels.cpp
-    src/runtime/kernels/cpu_kernels_bf16.cpp
     src/runtime/kernels/cpu_kernel_adapter.cpp
     # Cache layer
     src/runtime/cache/kv_cache.cpp

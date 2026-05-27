@@ -14,10 +14,12 @@ namespace minillm::cpu {
 
 // ===========================================================================
 // GEMM: C[M,N] = A[M,K] @ B[K,N]
-// Tiled + SIMD: tile size 64, inner loop vectorized with VF_FMADD
+// Tiled + SIMD: tile size 64, inner loop vectorized with VF_FMADD.
+// Templated on weight type.
 // ===========================================================================
 
-void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
+template<typename W>
+static void sgemm_impl(const float* A, const W* B, float* C, int M, int N, int K) {
     std::memset(C, 0, static_cast<size_t>(M) * N * sizeof(float));
 
     constexpr int TILE = 64;
@@ -35,17 +37,17 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
 
                     for (int kk = 0; kk < tk; ++kk) {
                         float a_val = a_row[kk];
-                        const float* b_row = B + (k + kk) * N + n;
+                        const W* b_row = B + (k + kk) * N + n;
                         vfloat va = VF_SET1(a_val);
 
                         int jj = 0;
                         for (; jj + MINILLM_SIMD_WIDTH <= tn; jj += MINILLM_SIMD_WIDTH) {
                             vfloat vc = VF_LOAD(c_row + jj);
-                            vfloat vb = VF_LOAD(b_row + jj);
+                            vfloat vb = load_weight(b_row + jj);
                             VF_STORE(c_row + jj, VF_FMADD(va, vb, vc));
                         }
                         for (; jj < tn; ++jj) {
-                            c_row[jj] += a_val * b_row[jj];
+                            c_row[jj] += a_val * static_cast<float>(b_row[jj]);
                         }
                     }
                 }
@@ -54,12 +56,21 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
     }
 }
 
+void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
+    sgemm_impl(A, B, C, M, N, K);
+}
+
+void sgemm(const float* A, const bfloat16_t* B, float* C, int M, int N, int K) {
+    sgemm_impl(A, B, C, M, N, K);
+}
+
 // ===========================================================================
 // GEMM with transposed B: C[M,N] = A[M,K] @ B^T[K,N], B stored as [N,K]
-// Tiled + SIMD: tile size 64, dot-product along K with SIMD
+// Tiled + SIMD: dot-product along K with SIMD. Templated on weight type.
 // ===========================================================================
 
-void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
+template<typename W>
+static void sgemm_nt_impl(const float* A, const W* B, float* C, int M, int N, int K) {
     #pragma omp parallel for
     for (int m = 0; m < M; ++m) {
         const float* a_row = A + m * K;
@@ -67,10 +78,10 @@ void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
 
         int n = 0;
         for (; n + 3 < N; n += 4) {
-            const float* b0 = B + (n + 0) * K;
-            const float* b1 = B + (n + 1) * K;
-            const float* b2 = B + (n + 2) * K;
-            const float* b3 = B + (n + 3) * K;
+            const W* b0 = B + (n + 0) * K;
+            const W* b1 = B + (n + 1) * K;
+            const W* b2 = B + (n + 2) * K;
+            const W* b3 = B + (n + 3) * K;
 
             vfloat vdot0 = VF_SETZERO();
             vfloat vdot1 = VF_SETZERO();
@@ -80,10 +91,10 @@ void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
             int k = 0;
             for (; k + MINILLM_SIMD_WIDTH <= K; k += MINILLM_SIMD_WIDTH) {
                 vfloat va = VF_LOAD(a_row + k);
-                vdot0 = VF_FMADD(va, VF_LOAD(b0 + k), vdot0);
-                vdot1 = VF_FMADD(va, VF_LOAD(b1 + k), vdot1);
-                vdot2 = VF_FMADD(va, VF_LOAD(b2 + k), vdot2);
-                vdot3 = VF_FMADD(va, VF_LOAD(b3 + k), vdot3);
+                vdot0 = VF_FMADD(va, load_weight(b0 + k), vdot0);
+                vdot1 = VF_FMADD(va, load_weight(b1 + k), vdot1);
+                vdot2 = VF_FMADD(va, load_weight(b2 + k), vdot2);
+                vdot3 = VF_FMADD(va, load_weight(b3 + k), vdot3);
             }
 
             float dot0 = hsum(vdot0);
@@ -92,10 +103,10 @@ void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
             float dot3 = hsum(vdot3);
             for (; k < K; ++k) {
                 float a = a_row[k];
-                dot0 += a * b0[k];
-                dot1 += a * b1[k];
-                dot2 += a * b2[k];
-                dot3 += a * b3[k];
+                dot0 += a * static_cast<float>(b0[k]);
+                dot1 += a * static_cast<float>(b1[k]);
+                dot2 += a * static_cast<float>(b2[k]);
+                dot3 += a * static_cast<float>(b3[k]);
             }
 
             c_row[n + 0] = dot0;
@@ -105,20 +116,28 @@ void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
         }
 
         for (; n < N; ++n) {
-            const float* b_row = B + n * K;
+            const W* b_row = B + n * K;
             vfloat vdot = VF_SETZERO();
             int k = 0;
             for (; k + MINILLM_SIMD_WIDTH <= K; k += MINILLM_SIMD_WIDTH) {
-                vdot = VF_FMADD(VF_LOAD(a_row + k), VF_LOAD(b_row + k), vdot);
+                vdot = VF_FMADD(VF_LOAD(a_row + k), load_weight(b_row + k), vdot);
             }
 
             float dot = hsum(vdot);
             for (; k < K; ++k) {
-                dot += a_row[k] * b_row[k];
+                dot += a_row[k] * static_cast<float>(b_row[k]);
             }
             c_row[n] = dot;
         }
     }
+}
+
+void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
+    sgemm_nt_impl(A, B, C, M, N, K);
+}
+
+void sgemm_nt(const float* A, const bfloat16_t* B, float* C, int M, int N, int K) {
+    sgemm_nt_impl(A, B, C, M, N, K);
 }
 
 // ===========================================================================
@@ -160,20 +179,31 @@ void rmsnorm(const float* x, const float* gamma, float* y,
 }
 
 // ===========================================================================
-// Embedding: gather rows by id
+// Embedding: gather rows by id. Templated on weight type.
 // ===========================================================================
 
-void embedding(const float* weight, const int* ids, float* out,
-               int seq_len, int hidden) {
+template<typename W>
+static void embedding_impl(const W* weight, const int* ids, float* out,
+                           int seq_len, int hidden) {
     for (int s = 0; s < seq_len; ++s) {
-        const float* row = weight + ids[s] * hidden;
+        const W* row = weight + ids[s] * hidden;
         float* out_row = out + s * hidden;
 
         int h = 0;
         for (; h + MINILLM_SIMD_WIDTH <= hidden; h += MINILLM_SIMD_WIDTH)
-            VF_STORE(out_row + h, VF_LOAD(row + h));
-        for (; h < hidden; ++h) out_row[h] = row[h];
+            VF_STORE(out_row + h, load_weight(row + h));
+        for (; h < hidden; ++h) out_row[h] = static_cast<float>(row[h]);
     }
+}
+
+void embedding(const float* weight, const int* ids, float* out,
+               int seq_len, int hidden) {
+    embedding_impl(weight, ids, out, seq_len, hidden);
+}
+
+void embedding(const bfloat16_t* weight, const int* ids, float* out,
+               int seq_len, int hidden) {
+    embedding_impl(weight, ids, out, seq_len, hidden);
 }
 
 // ===========================================================================

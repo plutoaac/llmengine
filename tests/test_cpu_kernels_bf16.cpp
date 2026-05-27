@@ -6,7 +6,6 @@
 #include <algorithm>
 
 #include "minillm/runtime/kernels/cpu_kernels.h"
-#include "minillm/runtime/kernels/cpu_kernels_bf16.h"
 #include "minillm/utils/bfloat16.hpp"
 
 using namespace minillm;
@@ -47,7 +46,7 @@ void test_sgemm_nt_bf16() {
     to_bf16(hB, hB_bf16);
 
     cpu::sgemm_nt(hA.data(), hB.data(), hC_fp32.data(), M, N, K);
-    cpu_bf16::sgemm_nt(hA.data(), hB_bf16.data(), hC_bf16.data(), M, N, K);
+    cpu::sgemm_nt(hA.data(), hB_bf16.data(), hC_bf16.data(), M, N, K);
 
     float err = max_abs_diff(hC_fp32, hC_bf16);
     // BF16 has ~1e-2 relative error; with K=16, accumulated error ~16 * 1e-2 = ~0.16
@@ -65,7 +64,7 @@ void test_sgemm_nt_bf16_large() {
     to_bf16(hB, hB_bf16);
 
     cpu::sgemm_nt(hA.data(), hB.data(), hC_fp32.data(), M, N, K);
-    cpu_bf16::sgemm_nt(hA.data(), hB_bf16.data(), hC_bf16.data(), M, N, K);
+    cpu::sgemm_nt(hA.data(), hB_bf16.data(), hC_bf16.data(), M, N, K);
 
     // With K=4096, accumulated BF16 error is larger
     float err = max_abs_diff(hC_fp32, hC_bf16);
@@ -90,7 +89,7 @@ void test_sgemm_bf16() {
     to_bf16(hB, hB_bf16);
 
     cpu::sgemm(hA.data(), hB.data(), hC_fp32.data(), M, N, K);
-    cpu_bf16::sgemm(hA.data(), hB_bf16.data(), hC_bf16.data(), M, N, K);
+    cpu::sgemm(hA.data(), hB_bf16.data(), hC_bf16.data(), M, N, K);
 
     float err = max_abs_diff(hC_fp32, hC_bf16);
     assert(err < 1.0f);
@@ -109,7 +108,7 @@ void test_embedding_bf16() {
     to_bf16(hW_f32, hW_bf16);
 
     cpu::embedding(hW_f32.data(), ids.data(), hO_fp32.data(), seq_len, hidden);
-    cpu_bf16::embedding(hW_bf16.data(), ids.data(), hO_bf16.data(), seq_len, hidden);
+    cpu::embedding(hW_bf16.data(), ids.data(), hO_bf16.data(), seq_len, hidden);
 
     float err = max_abs_diff(hO_fp32, hO_bf16);
     // BF16 round-trip error per element is ~1e-3

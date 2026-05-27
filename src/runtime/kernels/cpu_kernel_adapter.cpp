@@ -10,7 +10,6 @@
 #include "minillm/graph/node.h"
 #include "minillm/graph/op_type.h"
 #include "minillm/runtime/kernels/cpu_kernels.h"
-#include "minillm/runtime/kernels/cpu_kernels_bf16.h"
 #include "minillm/runtime/kernels/kernel_adapter_common.h"
 #include "minillm/runtime/runtime_context.h"
 
@@ -49,7 +48,7 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
         }
     }
     if ((*wt)->dtype() == DType::BFloat16) {
-        cpu_bf16::embedding(bf16_data(*wt), int_data(*ids_t), float_data_mut(*ot),
+        cpu::embedding(bf16_data(*wt), int_data(*ids_t), float_data_mut(*ot),
                             seq_len, hidden);
     } else {
         cpu::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
@@ -84,7 +83,7 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     int N = static_cast<int>((*wt)->shape().dim(0));
 
     if ((*wt)->dtype() == DType::BFloat16) {
-        cpu_bf16::sgemm_nt(float_data(*xt), bf16_data(*wt), float_data_mut(*ot), M, N, K);
+        cpu::sgemm_nt(float_data(*xt), bf16_data(*wt), float_data_mut(*ot), M, N, K);
     } else {
         cpu::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot), M, N, K);
     }
@@ -126,7 +125,7 @@ static Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
     int N = static_cast<int>((*bt)->shape().dim(1));
 
     if ((*bt)->dtype() == DType::BFloat16) {
-        cpu_bf16::sgemm(float_data(*at), bf16_data(*bt), float_data_mut(*ot), M, N, K);
+        cpu::sgemm(float_data(*at), bf16_data(*bt), float_data_mut(*ot), M, N, K);
     } else {
         cpu::sgemm(float_data(*at), float_data(*bt), float_data_mut(*ot), M, N, K);
     }

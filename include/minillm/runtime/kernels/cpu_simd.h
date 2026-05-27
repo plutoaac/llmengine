@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "minillm/utils/bfloat16.hpp"
+
 // Detect SIMD level
 #if defined(__AVX512F__)
     #include <immintrin.h>
@@ -171,5 +173,10 @@ inline vfloat v_sigmoid(vfloat x) {
     vfloat neg_x = VF_MUL(VF_SET1(-1.0f), x);
     return VF_DIV(ones, VF_ADD(ones, v_exp(neg_x)));
 }
+
+// Weight-type-aware SIMD load: FP32 → direct, BF16 → convert inline.
+// Used by templated kernels to support both FP32 and BF16 weights.
+inline vfloat load_weight(const float* ptr)      { return VF_LOAD(ptr); }
+inline vfloat load_weight(const bfloat16_t* ptr) { return VF_LOAD_BF16(ptr); }
 
 } // namespace minillm::simd
