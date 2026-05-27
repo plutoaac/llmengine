@@ -456,8 +456,11 @@ std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
         Tensor* shared_tensor = nullptr;
         auto existing = store.storage_by_gguf_name_.find(gguf_name);
         if (existing == store.storage_by_gguf_name_.end()) {
-            // Use the GGML dtype for the tensor so BF16 weights stay BF16.
-            DType tensor_dtype = ggml_to_dtype(info_it->second->dtype);
+            // Use the GGML dtype for the tensor so BF16 weights stay BF16 on CPU.
+            // CUDA tensors always use FP32 since CUDA kernels don't support BF16 yet.
+            DType tensor_dtype = (v.device.type == DeviceType::CUDA)
+                ? DType::Float32
+                : ggml_to_dtype(info_it->second->dtype);
             auto tensor = std::make_unique<Tensor>(v.name, v.shape, tensor_dtype, v.device);
             Status st;
             if (v.device.type == DeviceType::CUDA) {
