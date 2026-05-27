@@ -5,7 +5,7 @@
 #include <limits>
 #include <vector>
 
-#include "minillm/runtime/cpu_kernels.h"
+#include "minillm/runtime/kernels/cpu_kernels.h"
 
 using namespace minillm;
 

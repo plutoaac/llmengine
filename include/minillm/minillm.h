@@ -26,19 +26,19 @@
 #include "minillm/runtime/kernel_registry.h"
 #include "minillm/runtime/executor.h"
 #include "minillm/runtime/runtime_context.h"
-#include "minillm/runtime/cpu_kernels.h"
-#include "minillm/runtime/cpu_kernel_adapter.h"
+#include "minillm/runtime/kernels/cpu_kernels.h"
+#include "minillm/runtime/kernels/cpu_kernel_adapter.h"
 #include "minillm/runtime/memory_planner.h"
-#include "minillm/runtime/kv_cache.h"
-#include "minillm/runtime/paged_kv_cache.h"
-#include "minillm/runtime/paged_attention_scheduler.h"
+#include "minillm/runtime/cache/kv_cache.h"
+#include "minillm/runtime/cache/paged_kv_cache.h"
+#include "minillm/runtime/cache/paged_attention_scheduler.h"
 #include "minillm/runtime/continuous_batch_scheduler.h"
 #include "minillm/runtime/sampler.h"
 
 #if defined(MINILLM_ENABLE_CUDA)
 #include "minillm/runtime/cuda_backend.h"
-#include "minillm/runtime/cuda_kernel_adapter.h"
-#include "minillm/runtime/cuda_kernels.h"
+#include "minillm/runtime/kernels/cuda_kernel_adapter.h"
+#include "minillm/runtime/kernels/cuda_kernels.h"
 #endif
 
 // Model

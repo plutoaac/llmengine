@@ -7,7 +7,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include "minillm/runtime/cuda_kernels.h"
+#include "minillm/runtime/kernels/cuda_kernels.h"
 
 using namespace minillm;
 

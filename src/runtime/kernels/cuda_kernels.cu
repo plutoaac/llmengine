@@ -1,4 +1,4 @@
-#include "minillm/runtime/cuda_kernels.h"
+#include "minillm/runtime/kernels/cuda_kernels.h"
 
 #include <cfloat>
 #include <cstddef>

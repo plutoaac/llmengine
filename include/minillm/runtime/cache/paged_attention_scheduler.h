@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "minillm/core/status.h"
-#include "minillm/runtime/paged_kv_cache.h"
+#include "minillm/runtime/cache/paged_kv_cache.h"
 
 namespace minillm {
 

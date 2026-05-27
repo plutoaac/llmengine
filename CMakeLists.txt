@@ -55,7 +55,6 @@ include(CTest)
 # Core library
 add_library(minillm_core
     src/core/status.cpp
-    src/core/dtype.cpp
     src/core/device.cpp
     src/core/shape.cpp
     src/core/tensor.cpp
@@ -64,7 +63,6 @@ target_include_directories(minillm_core PUBLIC include)
 
 # Graph library
 add_library(minillm_graph
-    src/graph/op_type.cpp
     src/graph/attribute.cpp
     src/graph/node.cpp
     src/graph/graph.cpp
@@ -80,15 +78,17 @@ add_library(minillm_runtime
     src/runtime/kernel_registry.cpp
     src/runtime/executor.cpp
     src/runtime/runtime_context.cpp
-    src/runtime/cpu_kernels.cpp
-    src/runtime/cpu_kernels_bf16.cpp
-    src/runtime/cpu_kernel_adapter.cpp
     src/runtime/memory_planner.cpp
     src/runtime/sampler.cpp
-    src/runtime/kv_cache.cpp
-    src/runtime/paged_kv_cache.cpp
-    src/runtime/paged_attention_scheduler.cpp
     src/runtime/continuous_batch_scheduler.cpp
+    # Kernel layer
+    src/runtime/kernels/cpu_kernels.cpp
+    src/runtime/kernels/cpu_kernels_bf16.cpp
+    src/runtime/kernels/cpu_kernel_adapter.cpp
+    # Cache layer
+    src/runtime/cache/kv_cache.cpp
+    src/runtime/cache/paged_kv_cache.cpp
+    src/runtime/cache/paged_attention_scheduler.cpp
 )
 target_include_directories(minillm_runtime PUBLIC include)
 target_link_libraries(minillm_runtime PUBLIC minillm_graph)
@@ -98,8 +98,8 @@ endif()
 
 if(MINILLM_ENABLE_CUDA)
     target_sources(minillm_runtime PRIVATE
-        src/runtime/cuda_kernel_adapter.cpp
-        src/runtime/cuda_kernels.cu
+        src/runtime/kernels/cuda_kernel_adapter.cpp
+        src/runtime/kernels/cuda_kernels.cu
     )
     target_compile_definitions(minillm_core PUBLIC MINILLM_ENABLE_CUDA=1)
     target_compile_definitions(minillm_runtime PUBLIC MINILLM_ENABLE_CUDA=1)
@@ -138,7 +138,7 @@ add_executable(benchmark_flash_attention examples/benchmark_flash_attention.cpp)
 target_link_libraries(benchmark_flash_attention PRIVATE minillm_runtime)
 
 # Tools
-add_executable(dump_tokens tests/dump_tokens.cpp)
+add_executable(dump_tokens tools/dump_tokens.cpp)
 target_link_libraries(dump_tokens PRIVATE minillm_io)
 
 if(MINILLM_ENABLE_CUDA)

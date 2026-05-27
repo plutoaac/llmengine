@@ -1,4 +1,4 @@
-#include "minillm/runtime/cuda_kernel_adapter.h"
+#include "minillm/runtime/kernels/cuda_kernel_adapter.h"
 
 #include <cuda_runtime.h>
 
@@ -13,8 +13,8 @@
 #include "minillm/core/tensor.h"
 #include "minillm/graph/node.h"
 #include "minillm/graph/op_type.h"
-#include "minillm/runtime/cuda_kernels.h"
-#include "minillm/runtime/kernel_adapter_common.h"
+#include "minillm/runtime/kernels/cuda_kernels.h"
+#include "minillm/runtime/kernels/kernel_adapter_common.h"
 #include "minillm/runtime/kernel_registry.h"
 #include "minillm/runtime/runtime_context.h"
 

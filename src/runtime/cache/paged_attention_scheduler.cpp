@@ -1,4 +1,4 @@
-#include "minillm/runtime/paged_attention_scheduler.h"
+#include "minillm/runtime/cache/paged_attention_scheduler.h"
 
 #include <algorithm>
 #include <string>

@@ -1,6 +1,6 @@
-#include "minillm/runtime/cpu_kernels_bf16.h"
+#include "minillm/runtime/kernels/cpu_kernels_bf16.h"
 
-#include "minillm/runtime/cpu_simd.h"
+#include "minillm/runtime/kernels/cpu_simd.h"
 
 #include <algorithm>
 #include <cstring>

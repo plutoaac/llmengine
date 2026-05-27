@@ -1,6 +1,6 @@
-#include "minillm/runtime/cpu_kernels.h"
+#include "minillm/runtime/kernels/cpu_kernels.h"
 
-#include "minillm/runtime/cpu_simd.h"
+#include "minillm/runtime/kernels/cpu_simd.h"
 
 #include <algorithm>
 #include <cmath>

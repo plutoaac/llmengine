@@ -317,20 +317,27 @@ The test suite covers:
 include/minillm/
   core/        Tensor, Shape, DType, Device, Status
   graph/       Graph IR, Node, Value, attributes, shape inference
-  runtime/     Backend, executor, CPU/CUDA kernels, KV cache, paged KV cache, sampler, scheduler, kernel adapter common helpers
+  runtime/     Backend, executor, kernel registry, memory planner, sampler, scheduler
+  runtime/kernels/  CPU/CUDA kernel declarations, SIMD helpers, adapter layer
+  runtime/cache/    KV cache, paged KV cache, paged attention scheduler
   io/          GGUF parser, weight loader, tokenizer
   model/       Transformer graph builder
+  utils/       bfloat16 type
 
 src/
   core/        Core runtime data structures
   graph/       Graph implementation and builder logic
   runtime/     CPU backend, optional CUDA backend, and execution paths
+  runtime/kernels/  CPU/CUDA kernel implementations
+  runtime/cache/    KV cache implementations
   io/          GGUF and tokenizer implementation
   model/       Decoder-only graph construction
 
 examples/      CLI demos, generation, and benchmark
+tools/         Utility programs (dump_tokens)
 tests/         Unit, integration, and E2E verification tests
 docs/          Design notes
+scripts/       Alignment helper scripts
 ```
 
 ## Design Notes

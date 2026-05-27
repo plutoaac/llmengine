@@ -5,8 +5,8 @@
 #include <random>
 #include <algorithm>
 
-#include "minillm/runtime/cpu_kernels.h"
-#include "minillm/runtime/cpu_kernels_bf16.h"
+#include "minillm/runtime/kernels/cpu_kernels.h"
+#include "minillm/runtime/kernels/cpu_kernels_bf16.h"
 #include "minillm/utils/bfloat16.hpp"
 
 using namespace minillm;

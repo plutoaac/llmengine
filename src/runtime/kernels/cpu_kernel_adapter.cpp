@@ -1,4 +1,4 @@
-#include "minillm/runtime/cpu_kernel_adapter.h"
+#include "minillm/runtime/kernels/cpu_kernel_adapter.h"
 
 #include <cmath>
 #include <cstring>
@@ -9,9 +9,9 @@
 #include "minillm/core/tensor.h"
 #include "minillm/graph/node.h"
 #include "minillm/graph/op_type.h"
-#include "minillm/runtime/cpu_kernels.h"
-#include "minillm/runtime/cpu_kernels_bf16.h"
-#include "minillm/runtime/kernel_adapter_common.h"
+#include "minillm/runtime/kernels/cpu_kernels.h"
+#include "minillm/runtime/kernels/cpu_kernels_bf16.h"
+#include "minillm/runtime/kernels/kernel_adapter_common.h"
 #include "minillm/runtime/runtime_context.h"
 
 namespace minillm {

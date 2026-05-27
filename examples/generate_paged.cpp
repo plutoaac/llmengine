@@ -10,7 +10,7 @@
 #include "minillm/io/gguf_weight_loader.h"
 #include "minillm/io/bpe_tokenizer.h"
 #include "minillm/runtime/sampler.h"
-#include "minillm/runtime/paged_kv_cache.h"
+#include "minillm/runtime/cache/paged_kv_cache.h"
 
 using namespace minillm;
 

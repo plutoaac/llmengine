@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "minillm/minillm.h"
-#include "minillm/runtime/cpu_kernels.h"
+#include "minillm/runtime/kernels/cpu_kernels.h"
 
 using namespace minillm;
 

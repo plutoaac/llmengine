@@ -8,9 +8,9 @@
 
 #include "minillm/core/tensor.h"
 #include "minillm/graph/value.h"
-#include "minillm/runtime/kv_cache.h"
+#include "minillm/runtime/cache/kv_cache.h"
 #include "minillm/runtime/memory_planner.h"
-#include "minillm/runtime/paged_kv_cache.h"
+#include "minillm/runtime/cache/paged_kv_cache.h"
 
 namespace minillm {
 

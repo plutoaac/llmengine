@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "minillm/minillm.h"
-#include "minillm/runtime/paged_kv_cache.h"
-#include "minillm/runtime/paged_attention_scheduler.h"
+#include "minillm/runtime/cache/paged_kv_cache.h"
+#include "minillm/runtime/cache/paged_attention_scheduler.h"
 
 using namespace minillm;
 
