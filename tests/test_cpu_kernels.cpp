@@ -1,5 +1,6 @@
 #include <cassert>
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -65,6 +66,23 @@ static std::vector<float> reference_attention_row(
     return out;
 }
 
+static std::vector<uint8_t> pack_q8_0_scale1(const std::vector<int8_t>& values) {
+    constexpr size_t block_elems = 32;
+    constexpr size_t block_bytes = 34;
+    const size_t blocks = (values.size() + block_elems - 1) / block_elems;
+    std::vector<uint8_t> packed(blocks * block_bytes, 0);
+
+    for (size_t b = 0; b < blocks; ++b) {
+        const size_t base = b * block_bytes;
+        packed[base + 0] = 0x00;  // fp16 1.0, little-endian
+        packed[base + 1] = 0x3c;
+        for (size_t i = 0; i < block_elems && b * block_elems + i < values.size(); ++i) {
+            packed[base + 2 + i] = static_cast<uint8_t>(values[b * block_elems + i]);
+        }
+    }
+    return packed;
+}
+
 void test_sgemm() {
     const float A[] = {1, 2, 3, 4, 5, 6};          // [2, 3]
     const float B[] = {7, 8, 9, 10, 11, 12};       // [3, 2]
@@ -87,6 +105,66 @@ void test_sgemm_nt() {
     const float expected[] = {50, 68, 122, 167};
     for (int i = 0; i < 4; ++i) assert_near(C[i], expected[i]);
     std::cout << "  PASS test_sgemm_nt\n";
+}
+
+void test_sgemm_q8_0() {
+    constexpr int M = 2;
+    constexpr int K = 2;
+    constexpr int N = 32;
+    const float A[M * K] = {1.0f, 2.0f, -1.0f, 3.0f};
+
+    std::vector<int8_t> B(static_cast<size_t>(K) * N);
+    for (int n = 0; n < N; ++n) {
+        B[static_cast<size_t>(n)] = static_cast<int8_t>((n % 9) - 4);
+        B[static_cast<size_t>(N + n)] = static_cast<int8_t>((n % 7) - 3);
+    }
+    auto B_q8 = pack_q8_0_scale1(B);
+
+    float C[M * N] = {};
+    cpu::sgemm(A, B_q8.data(), C, M, N, K);
+
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float expected = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                expected += A[m * K + k] * static_cast<float>(B[static_cast<size_t>(k) * N + n]);
+            }
+            assert_near(C[m * N + n], expected);
+        }
+    }
+    std::cout << "  PASS test_sgemm_q8_0\n";
+}
+
+void test_sgemm_nt_q8_0() {
+    constexpr int M = 2;
+    constexpr int N = 3;
+    constexpr int K = 32;
+
+    std::vector<float> A(static_cast<size_t>(M) * K);
+    for (size_t i = 0; i < A.size(); ++i) {
+        A[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.25f;
+    }
+
+    std::vector<int8_t> B(static_cast<size_t>(N) * K);
+    for (size_t i = 0; i < B.size(); ++i) {
+        B[i] = static_cast<int8_t>((static_cast<int>(i) * 5) % 17 - 8);
+    }
+    auto B_q8 = pack_q8_0_scale1(B);
+
+    float C[M * N] = {};
+    cpu::sgemm_nt(A.data(), B_q8.data(), C, M, N, K);
+
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float expected = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                expected += A[static_cast<size_t>(m) * K + k] *
+                    static_cast<float>(B[static_cast<size_t>(n) * K + k]);
+            }
+            assert_near(C[m * N + n], expected);
+        }
+    }
+    std::cout << "  PASS test_sgemm_nt_q8_0\n";
 }
 
 void test_rmsnorm() {
@@ -150,6 +228,33 @@ void test_softmax_all_negative_infinity() {
         assert_near(v, 0.25f);
     }
     std::cout << "  PASS test_softmax_all_negative_infinity\n";
+}
+
+void test_embedding_q8_0() {
+    constexpr int vocab = 3;
+    constexpr int hidden = 32;
+    const int ids[] = {2, 0};
+
+    std::vector<int8_t> weight(static_cast<size_t>(vocab) * hidden);
+    for (int row = 0; row < vocab; ++row) {
+        for (int h = 0; h < hidden; ++h) {
+            weight[static_cast<size_t>(row) * hidden + h] =
+                static_cast<int8_t>(row * 10 + h - 12);
+        }
+    }
+    auto weight_q8 = pack_q8_0_scale1(weight);
+
+    float out[2 * hidden] = {};
+    cpu::embedding(weight_q8.data(), ids, out, 2, hidden);
+
+    for (int s = 0; s < 2; ++s) {
+        for (int h = 0; h < hidden; ++h) {
+            const int row = ids[s];
+            float expected = static_cast<float>(weight[static_cast<size_t>(row) * hidden + h]);
+            assert_near(out[s * hidden + h], expected);
+        }
+    }
+    std::cout << "  PASS test_embedding_q8_0\n";
 }
 
 void test_rope() {
@@ -324,10 +429,13 @@ int main() {
     std::cout << "test_cpu_kernels:\n";
     test_sgemm();
     test_sgemm_nt();
+    test_sgemm_q8_0();
+    test_sgemm_nt_q8_0();
     test_rmsnorm();
     test_silu_swiglu();
     test_softmax();
     test_softmax_all_negative_infinity();
+    test_embedding_q8_0();
     test_rope();
     test_transpose();
     test_sdpa_causal();

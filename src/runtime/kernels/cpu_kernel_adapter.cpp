@@ -16,6 +16,31 @@
 namespace minillm {
 using namespace detail;
 
+namespace {
+
+constexpr int64_t kQ8_0BlockElems = 32;
+
+Status check_dtype_float_bf16_or_q8(const Tensor* t, std::string_view name) {
+    if (t->dtype() == DType::Float32 || t->dtype() == DType::BFloat16 ||
+        t->dtype() == DType::Q8_0) {
+        return Status::make_ok();
+    }
+    return Status::unsupported(
+        std::string(name) + " supports Float32, BFloat16, or Q8_0 weights, got " +
+        std::string(dtype_name(t->dtype())));
+}
+
+Status check_q8_block_aligned(const Tensor* t, int64_t block_dim, std::string_view op) {
+    if (t->dtype() != DType::Q8_0 || block_dim % kQ8_0BlockElems == 0) {
+        return Status::make_ok();
+    }
+    return Status::unsupported(
+        std::string(op) + " Q8_0 weights require the packed dimension to be a multiple of 32, got " +
+        std::to_string(block_dim));
+}
+
+} // namespace
+
 static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     auto ids_t = get_tensor(node.inputs()[0], ctx, "input_ids");
     if (!ids_t) return ids_t.error();
@@ -27,7 +52,7 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*ids_t, "input_ids"));
     TRY(check_allocated(*wt, "weight"));
     TRY(check_allocated(*ot, "output"));
-    TRY(check_dtype_floating(*wt, "weight"));
+    TRY(check_dtype_float_bf16_or_q8(*wt, "weight"));
     TRY(check_dtype_float(*ot, "output"));
     if ((*ids_t)->dtype() != DType::Int32) {
         return Status::unsupported(
@@ -40,6 +65,10 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     int seq_len = static_cast<int>(*ids_numel);
     int hidden = static_cast<int>((*wt)->shape().dim(1));
     int vocab_size = static_cast<int>((*wt)->shape().dim(0));
+    if (seq_len < 0 || hidden <= 0 || vocab_size <= 0) {
+        return Status::invalid_argument("invalid embedding shape");
+    }
+    TRY(check_q8_block_aligned(*wt, hidden, "embedding"));
     const int* ids = int_data(*ids_t);
     for (int i = 0; i < seq_len; ++i) {
         if (ids[i] < 0 || ids[i] >= vocab_size) {
@@ -49,7 +78,10 @@ static Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     }
     if ((*wt)->dtype() == DType::BFloat16) {
         cpu::embedding(bf16_data(*wt), int_data(*ids_t), float_data_mut(*ot),
-                            seq_len, hidden);
+                       seq_len, hidden);
+    } else if ((*wt)->dtype() == DType::Q8_0) {
+        cpu::embedding(q8_data(*wt), int_data(*ids_t), float_data_mut(*ot),
+                       seq_len, hidden);
     } else {
         cpu::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
                        seq_len, hidden);
@@ -69,7 +101,7 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*wt, "weight"));
     TRY(check_allocated(*ot, "output"));
     TRY(check_dtype_float(*xt, "x"));
-    TRY(check_dtype_floating(*wt, "weight"));
+    TRY(check_dtype_float_bf16_or_q8(*wt, "weight"));
     TRY(check_dtype_float(*ot, "output"));
 
     // x: [batch, seq, in] flattened to [M, K]
@@ -81,9 +113,13 @@ static Status kernel_linear(const Node& node, RuntimeContext& ctx) {
     }
     int K = static_cast<int>((*xt)->shape().dim((*xt)->shape().rank() - 1));
     int N = static_cast<int>((*wt)->shape().dim(0));
+    if (M <= 0 || N <= 0 || K <= 0) return Status::invalid_argument("invalid linear shape");
 
+    TRY(check_q8_block_aligned(*wt, K, "linear"));
     if ((*wt)->dtype() == DType::BFloat16) {
         cpu::sgemm_nt(float_data(*xt), bf16_data(*wt), float_data_mut(*ot), M, N, K);
+    } else if ((*wt)->dtype() == DType::Q8_0) {
+        cpu::sgemm_nt(float_data(*xt), q8_data(*wt), float_data_mut(*ot), M, N, K);
     } else {
         cpu::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot), M, N, K);
     }
@@ -117,15 +153,19 @@ static Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
     TRY(check_allocated(*bt, "b"));
     TRY(check_allocated(*ot, "output"));
     TRY(check_dtype_float(*at, "a"));
-    TRY(check_dtype_floating(*bt, "b"));
+    TRY(check_dtype_float_bf16_or_q8(*bt, "b"));
     TRY(check_dtype_float(*ot, "output"));
 
     int M = static_cast<int>((*at)->shape().dim(0));
     int K = static_cast<int>((*at)->shape().dim(1));
     int N = static_cast<int>((*bt)->shape().dim(1));
+    if (M <= 0 || N <= 0 || K <= 0) return Status::invalid_argument("invalid matmul shape");
 
+    TRY(check_q8_block_aligned(*bt, N, "matmul"));
     if ((*bt)->dtype() == DType::BFloat16) {
         cpu::sgemm(float_data(*at), bf16_data(*bt), float_data_mut(*ot), M, N, K);
+    } else if ((*bt)->dtype() == DType::Q8_0) {
+        cpu::sgemm(float_data(*at), q8_data(*bt), float_data_mut(*ot), M, N, K);
     } else {
         cpu::sgemm(float_data(*at), float_data(*bt), float_data_mut(*ot), M, N, K);
     }

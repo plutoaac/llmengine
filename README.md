@@ -15,7 +15,7 @@ The goal is not to clone llama.cpp. The goal is to show the engineering ideas be
 - **Paged KV cache** with vLLM-style block tables, free-block reuse, CPU decode attention, multi-sequence scheduler, and CUDA device memory + paged decode over device block tables.
 - **Continuous batching scheduler** with waiting→prefilling→decoding→finished lifecycle, auto-assigned sequence IDs, and KV block eviction/reuse.
 - **Graph memory planner** with liveness analysis, O(n log n) best-fit buffer reuse, contiguous CPU/CUDA arena pools, and peak-memory reporting.
-- **GGUF support** for bounds-checked metadata parsing, mmap-backed tensor byte views, F32/F16/BF16/Q8_0 weight loading, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
+- **GGUF support** for bounds-checked metadata parsing, mmap-backed tensor byte views, F32/F16/BF16/Q8_0 weight loading, native BF16 weights, CPU Q8_0 weight-only kernels, shared prefill/decode weight storage, tied-embedding aliases, and common Llama/Qwen weight-name mapping.
 - **BPE tokenizer** with GPT-2 byte-to-unicode mapping, full regex pre-tokenization state machine, added-token longest-match, and `<0xHH>` byte token decoding.
 - **Testing and benchmarks** with CTest, kernel reference tests, executor integration tests, and CPU GEMM/FlashAttention benchmarks.
 - **Code quality** with `TRY`/`TRY_TENSOR` macros eliminating ~50 boilerplate error-propagation if-statements, `concepts` and `constexpr` replacing runtime helpers, `std::unreachable()` in exhaustive switches, and `kernel_adapter_common.h` deduplicating ~95 lines of shared adapter helpers.
@@ -64,7 +64,7 @@ flowchart LR
 | Optional CUDA executor/backend | Experimental, disabled by default |
 | FP32 CUDA kernels | Implemented with CUDA correctness tests |
 | Graph memory planner | Implemented for CPU and CUDA intermediates, with O(n log n) matching and contiguous arena binding |
-| GGUF metadata and tensor loading | Implemented for F32/F16/BF16, with parser safety checks and shared weight storage |
+| GGUF metadata and tensor loading | Implemented for F32/F16/BF16/Q8_0, with parser safety checks, mmap tensor views, shared weight storage, native BF16, and CPU Q8_0 weight-only loading |
 | Byte-level BPE tokenizer | Implemented with GPT-2 pre-tokenization, merge-based BPE, and `<0xHH>` byte token support |
 | KV cache prefill/decode | Implemented for single-batch generation |
 | Paged KV cache / PagedAttention | CPU: implemented. CUDA: device memory, block table upload, single-sequence & batched paged decode, contiguous cache prefill/decode — all wired through adapter. |
@@ -110,6 +110,21 @@ Run examples:
 ./build-cuda/benchmark_cuda
 ./build-cuda/generate_cuda /path/to/model.gguf "Hello" 2
 ```
+
+## Precision Modes
+
+MiniLLMEngine keeps activations, logits, and KV cache in FP32 on the CPU path. Weights can use lower-precision physical storage when the kernel knows how to read them:
+
+| GGUF dtype | CPU storage | CPU compute path | Notes |
+|------------|-------------|------------------|-------|
+| F32 | `Float32` | FP32 load + FP32 accumulate | Baseline path |
+| F16 | `Float32` | Expanded to FP32 at load | Kept simple and safe |
+| BF16 | `BFloat16` | Weight-only BF16 read + FP32 activation/output | Default Qwen BF16 path |
+| Q8_0 | `Q8_0` raw blocks | Weight-only dequant inside `Embedding`/`Linear`/`MatMul`, FP32 accumulate | Packed dimension must be a multiple of 32 |
+
+The Q8_0 path is true weight-only quantization: the shared weight tensor stores the original GGML `block_q8_0` bytes instead of expanding them at load time. The first implementation is intentionally scalar and readable; SIMD/packed fast paths and CUDA quantized matmul are left as future extensions.
+
+CUDA currently keeps BF16 GGUF weights native on device; other non-BF16 formats stage through FP32 unless a dedicated CUDA kernel path exists.
 
 ## llama.cpp Alignment Check
 
@@ -284,6 +299,7 @@ CTest currently runs:
 ./build/test_graph_builder
 ./build/test_runtime
 ./build/test_cpu_kernels
+./build/test_cpu_kernels_bf16
 ./build/test_memory_planner
 ./build/test_paged_kv_cache
 ./build/test_paged_attention_scheduler
@@ -299,7 +315,7 @@ The test suite covers:
 - shape and tensor allocation behavior
 - graph construction and validation
 - CPU executor integration
-- CPU kernel numerical reference checks, including FlashAttention-style SDPA comparisons
+- CPU kernel numerical reference checks, including BF16 weights, Q8_0 weight-only GEMM/embedding, and FlashAttention-style SDPA comparisons
 - graph liveness, memory reuse planning, and CPU/CUDA arena binding
 - transformer graph weight naming and RoPE metadata propagation
 - tokenizer boundary behavior and GGUF parser safety checks
@@ -308,7 +324,7 @@ The test suite covers:
 - continuous batching scheduler: admission, eviction, phase transitions, block reuse
 - contiguous vs paged KV cache numerical alignment (cosine similarity, max abs diff)
 - CUDA elementwise, GEMM, norm, RoPE, softmax, transpose, SDPA, single/batched paged decode, and executor dispatch
-- GGUF parser and weight conversion helpers
+- GGUF parser, mmap tensor views, F16/BF16 conversion, native BF16 load, CPU Q8_0 raw weight loading, and shared-weight binding
 - CUDA single-batch GGUF generation smoke path through `generate_cuda`
 
 ## Project Layout
@@ -355,7 +371,7 @@ Key design choices:
 - `SharedWeightStore` lets prefill and decode contexts reuse one loaded GGUF weight set instead of duplicating model parameters.
 - `PagedKVCache` separates logical sequence positions from physical KV blocks; `PagedAttentionScheduler` turns several active sequences into padded block-table batches.
 - `MemoryPlanner` computes intermediate tensor live ranges; `RuntimeContext::allocate_intermediates_planned()` binds non-overlapping CPU/CUDA intermediates to shared arena buffers.
-- CUDA currently covers FP32 operator dispatch, tensor allocation, GGUF weight staging to device tensors, contiguous CUDA KV cache generation, paged decode kernels with full adapter integration, and graph-memory arena allocation for intermediate tensors (both CPU and CUDA). Production batching policy and quantized CUDA matmul are intentionally left as future work.
+- CUDA currently covers FP32 operator dispatch, tensor allocation, native BF16 GGUF weight copies, FP32 staging for other weight formats, contiguous CUDA KV cache generation, paged decode kernels with full adapter integration, and graph-memory arena allocation for intermediate tensors (both CPU and CUDA). Production batching policy and quantized CUDA matmul are intentionally left as future work.
 
 ## References
 
@@ -372,12 +388,12 @@ Near-term work with high portfolio value:
 - ~~Run and document end-to-end Qwen3-0.6B CPU and CUDA generation smoke demos with reference alignment.~~ Done.
 - ~~Add Release-mode benchmark tables for prefill/decode latency and GEMM throughput.~~ Done.
 - ~~Add Release-mode CUDA benchmark numbers for the tested FP32 kernels.~~ Done.
-- Implement the first quantized weight path, likely `Q8_0`.
+- ~~Implement the first quantized weight path: CPU `Q8_0` weight-only loading and kernels.~~ Done.
 - Connect `ContinuousBatchScheduler` to a real decode loop.
 
 Longer-term experiments:
 
-- More optimized GEMM micro-kernels and weight packing.
+- More optimized GEMM micro-kernels, CPU Q8_0 SIMD dot kernels, and weight packing.
 - Multi-threaded CPU execution.
 - Prefix cache, production continuous batching, and multi-sequence scheduling.
 - Minimal streaming HTTP API.

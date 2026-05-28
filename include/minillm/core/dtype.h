@@ -13,6 +13,7 @@ enum class DType {
     Float32,
     Float16,
     BFloat16,
+    Q8_0,
     Int32,
     Int64,
     UInt8,
@@ -26,6 +27,7 @@ constexpr std::string_view dtype_name(DType type) {
     case DType::Float32:  return "Float32";
     case DType::Float16:  return "Float16";
     case DType::BFloat16: return "BFloat16";
+    case DType::Q8_0:     return "Q8_0";
     case DType::Int32:    return "Int32";
     case DType::Int64:    return "Int64";
     case DType::UInt8:    return "UInt8";
@@ -41,6 +43,8 @@ inline std::expected<size_t, Status> dtype_size(DType type) {
     case DType::Float32:  return 4;
     case DType::Float16:  return 2;
     case DType::BFloat16: return 2;
+    case DType::Q8_0:     return std::unexpected(Status::unsupported(
+                              "Q8_0 is block-quantized and has no per-element byte size"));
     case DType::Int32:    return 4;
     case DType::Int64:    return 8;
     case DType::UInt8:    return 1;

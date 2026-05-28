@@ -1,7 +1,7 @@
 #pragma once
 
 // CPU kernel declarations.
-// Supports FP32 and BF16 weights. Input activations and outputs are always FP32.
+// Supports FP32, BF16, and Q8_0 weight-only paths. Activations and outputs are FP32.
 
 #include <cstddef>
 #include <cstdint>
@@ -13,10 +13,12 @@ namespace minillm::cpu {
 // GEMM: C[M,N] = A[M,K] @ B[K,N], row-major
 void sgemm(const float* A, const float* B, float* C, int M, int N, int K);
 void sgemm(const float* A, const bfloat16_t* B, float* C, int M, int N, int K);
+void sgemm(const float* A, const uint8_t* B_q8_0, float* C, int M, int N, int K);
 
 // GEMM with transposed B: C[M,N] = A[M,K] @ B^T[K,N], B stored as [N,K]
 void sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K);
 void sgemm_nt(const float* A, const bfloat16_t* B, float* C, int M, int N, int K);
+void sgemm_nt(const float* A, const uint8_t* B_q8_0, float* C, int M, int N, int K);
 
 // RMSNorm: y = x / rms(x) * gamma
 void rmsnorm(const float* x, const float* gamma, float* y,
@@ -26,6 +28,8 @@ void rmsnorm(const float* x, const float* gamma, float* y,
 void embedding(const float* weight, const int* ids, float* out,
                int seq_len, int hidden);
 void embedding(const bfloat16_t* weight, const int* ids, float* out,
+               int seq_len, int hidden);
+void embedding(const uint8_t* weight_q8_0, const int* ids, float* out,
                int seq_len, int hidden);
 
 // RoPE (on-the-fly, no cache table)

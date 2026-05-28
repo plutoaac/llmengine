@@ -118,6 +118,17 @@ public:
         tensors_.push_back(std::move(e));
     }
 
+    // Add a 2D Q8_0 tensor. Data must already be packed as GGML block_q8_0.
+    void add_tensor_q8_0(const std::string& name, int64_t d0, int64_t d1,
+                         const std::vector<uint8_t>& data) {
+        TensorEntry e;
+        e.name = name;
+        e.dims = {d0, d1};
+        e.dtype = static_cast<uint32_t>(GgmlDataType::Q8_0);
+        e.data_u8 = data;
+        tensors_.push_back(std::move(e));
+    }
+
     void write() {
         buf_.clear();
 
@@ -184,6 +195,12 @@ public:
                     write_float_le(val);
                 }
                 current_offset += elem_count * 4;
+            } else if (t.dtype == static_cast<uint32_t>(GgmlDataType::Q8_0)) {
+                const size_t bytes = ((elem_count + 31) / 32) * 34;
+                for (size_t i = 0; i < bytes; ++i) {
+                    write_u8(i < t.data_u8.size() ? t.data_u8[i] : 0);
+                }
+                current_offset += bytes;
             } else {
                 // F16 or BF16
                 for (size_t i = 0; i < elem_count; ++i) {
@@ -211,6 +228,7 @@ private:
         uint64_t data_offset = 0;
         std::vector<float> data_f32;
         std::vector<uint16_t> data_u16;
+        std::vector<uint8_t> data_u8;
     };
 
     void rewrite_with_offsets(uint64_t data_offset_start) {
@@ -258,9 +276,11 @@ private:
             size_t elem_count = 1;
             for (auto d : t.dims) elem_count *= static_cast<size_t>(d);
             if (t.dtype == static_cast<uint32_t>(GgmlDataType::F32)) {
-                current_data_offset += elem_count * 4;
+                current_data_offset += elem_count * sizeof(float);
+            } else if (t.dtype == static_cast<uint32_t>(GgmlDataType::Q8_0)) {
+                current_data_offset += ((elem_count + 31) / 32) * 34;
             } else {
-                current_data_offset += elem_count * 2;
+                current_data_offset += elem_count * sizeof(uint16_t);
             }
         }
 
@@ -287,6 +307,11 @@ private:
                     float val = (i < t.data_f32.size()) ? t.data_f32[i] : 0.0f;
                     write_float_le(val);
                 }
+            } else if (t.dtype == static_cast<uint32_t>(GgmlDataType::Q8_0)) {
+                const size_t bytes = ((elem_count + 31) / 32) * 34;
+                for (size_t i = 0; i < bytes; ++i) {
+                    write_u8(i < t.data_u8.size() ? t.data_u8[i] : 0);
+                }
             } else {
                 for (size_t i = 0; i < elem_count; ++i) {
                     uint16_t val = (i < t.data_u16.size()) ? t.data_u16[i] : 0;
@@ -310,6 +335,25 @@ void test_ggml_dtype_size() {
     ASSERT_EQ(ggml_dtype_size(GgmlDataType::F32), size_t(4));
     ASSERT_EQ(ggml_dtype_size(GgmlDataType::F16), size_t(2));
     ASSERT_EQ(ggml_dtype_size(GgmlDataType::BF16), size_t(2));
+    ASSERT_EQ(ggml_dtype_size(GgmlDataType::Q8_0), size_t(34));
+    ASSERT_EQ(ggml_blck_size(GgmlDataType::Q8_0), size_t(32));
+}
+
+static std::vector<uint8_t> pack_q8_0_scale1(const std::vector<int8_t>& values) {
+    constexpr size_t block_elems = 32;
+    constexpr size_t block_bytes = 34;
+    const size_t blocks = (values.size() + block_elems - 1) / block_elems;
+    std::vector<uint8_t> packed(blocks * block_bytes, 0);
+
+    for (size_t b = 0; b < blocks; ++b) {
+        const size_t base = b * block_bytes;
+        packed[base + 0] = 0x00;
+        packed[base + 1] = 0x3c;
+        for (size_t i = 0; i < block_elems && b * block_elems + i < values.size(); ++i) {
+            packed[base + 2 + i] = static_cast<uint8_t>(values[b * block_elems + i]);
+        }
+    }
+    return packed;
 }
 
 void test_map_ggml_dtype() {
@@ -324,6 +368,10 @@ void test_map_ggml_dtype() {
     auto bf16 = map_ggml_dtype(GgmlDataType::BF16);
     ASSERT_TRUE(bf16.has_value());
     ASSERT_TRUE(*bf16 == DType::BFloat16);
+
+    auto q8 = map_ggml_dtype(GgmlDataType::Q8_0);
+    ASSERT_TRUE(q8.has_value());
+    ASSERT_TRUE(*q8 == DType::Q8_0);
 
     // Unsupported type should fail
     auto bad = map_ggml_dtype(static_cast<GgmlDataType>(99));
@@ -711,6 +759,88 @@ void test_cuda_bf16_shared_weight_load() {
 }
 #endif
 
+void test_f16_shared_weight_store_cpu() {
+    std::string path = temp_path("test_minillm_gguf_f16_shared_weight.gguf");
+    std::vector<uint16_t> raw_f16 = {0x3C00, 0x4000, 0x4200, 0x4400};
+    {
+        GgufWriter w(path);
+        w.add_meta_string("general.architecture", "llama");
+        w.add_tensor_f16("token_embd.weight", 2, 2, raw_f16);
+        w.write();
+    }
+
+    WeightLoader loader(path);
+    auto file = loader.open();
+    ASSERT_TRUE(file.has_value());
+
+    Graph graph;
+    auto tok = graph.add_value("tok_embeddings.weight", Shape({2, 2}),
+                               DType::Float32, Device::cpu(), ValueKind::Constant);
+    ASSERT_TRUE(tok.has_value());
+
+    auto store = loader.load_shared_weights(*file, graph);
+    ASSERT_TRUE(store.has_value());
+    ASSERT_EQ(store->tensor_count(), size_t(1));
+    ASSERT_EQ(store->alias_count(), size_t(1));
+    ASSERT_EQ(store->total_bytes(), size_t(4 * sizeof(float)));
+
+    Tensor* tensor = store->get("tok_embeddings.weight");
+    ASSERT_TRUE(tensor != nullptr);
+    ASSERT_EQ(tensor->dtype(), DType::Float32);
+
+    const auto* data = reinterpret_cast<const float*>(tensor->data());
+    const float expected[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    for (size_t i = 0; i < 4; ++i) {
+        ASSERT_TRUE(std::abs(data[i] - expected[i]) < 1e-4f);
+    }
+}
+
+void test_q8_0_shared_weight_store_cpu() {
+    std::string path = temp_path("test_minillm_gguf_q8_shared_weight.gguf");
+    std::vector<int8_t> values(2 * 32);
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = static_cast<int8_t>((static_cast<int>(i) * 3) % 23 - 11);
+    }
+    auto packed = pack_q8_0_scale1(values);
+    {
+        GgufWriter w(path);
+        w.add_meta_string("general.architecture", "llama");
+        w.add_tensor_q8_0("token_embd.weight", 2, 32, packed);
+        w.write();
+    }
+
+    WeightLoader loader(path);
+    auto file = loader.open();
+    ASSERT_TRUE(file.has_value());
+
+    Graph graph;
+    auto tok = graph.add_value("tok_embeddings.weight", Shape({2, 32}),
+                               DType::Float32, Device::cpu(), ValueKind::Constant);
+    ASSERT_TRUE(tok.has_value());
+
+    auto store = loader.load_shared_weights(*file, graph);
+    ASSERT_TRUE(store.has_value());
+    ASSERT_EQ(store->tensor_count(), size_t(1));
+    ASSERT_EQ(store->alias_count(), size_t(1));
+    ASSERT_EQ(store->total_bytes(), packed.size());
+
+    Tensor* tensor = store->get("tok_embeddings.weight");
+    ASSERT_TRUE(tensor != nullptr);
+    ASSERT_EQ(tensor->dtype(), DType::Q8_0);
+    ASSERT_EQ(tensor->device().type, DeviceType::CPU);
+    ASSERT_TRUE(tensor->is_allocated());
+
+    const auto* data = reinterpret_cast<const uint8_t*>(tensor->data());
+    for (size_t i = 0; i < packed.size(); ++i) {
+        ASSERT_EQ(data[i], packed[i]);
+    }
+
+    RuntimeContext ctx;
+    auto st = store->bind(graph, ctx);
+    ASSERT_TRUE(st.ok());
+    ASSERT_TRUE(ctx.get(*tok) == tensor);
+}
+
 void test_shared_weight_store_tied_embeddings() {
     std::string path = temp_path("test_minillm_gguf_shared_weights.gguf");
     {
@@ -779,6 +909,8 @@ int main() {
 #if defined(MINILLM_ENABLE_CUDA)
     TEST(cuda_bf16_shared_weight_load);
 #endif
+    TEST(f16_shared_weight_store_cpu);
+    TEST(q8_0_shared_weight_store_cpu);
     TEST(shared_weight_store_tied_embeddings);
 
     std::cout << (tests_failed == 0 ? "All tests passed!" : "Some tests FAILED!")

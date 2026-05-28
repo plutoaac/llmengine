@@ -15,13 +15,13 @@ namespace minillm {
 
 namespace {
 
-// Map GGML dtype to engine DType. BF16 stays BF16 for native path.
+// Map GGML dtype to physical engine storage dtype. BF16 and Q8_0 stay native; F16 expands to FP32.
 DType ggml_to_dtype(GgmlDataType ggml_dt) {
     switch (ggml_dt) {
     case GgmlDataType::F32:  return DType::Float32;
-    case GgmlDataType::F16:  return DType::Float16;
+    case GgmlDataType::F16:  return DType::Float32;
     case GgmlDataType::BF16: return DType::BFloat16;
-    case GgmlDataType::Q8_0: return DType::Float32;  // Q8_0 dequants to FP32
+    case GgmlDataType::Q8_0: return DType::Q8_0;
     default:                 return DType::Float32;
     }
 }
@@ -136,6 +136,17 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
 #endif
     }
 
+    if (ti.dtype == GgmlDataType::Q8_0 && tensor.dtype() == DType::Q8_0) {
+        auto expected_bytes_exp = ti.bytes();
+        if (!expected_bytes_exp) return expected_bytes_exp.error();
+        const size_t expected_bytes = *expected_bytes_exp;
+        if (raw_view.size() < expected_bytes) {
+            return Status::out_of_range("Q8_0 raw view too small for tensor " + tensor.name());
+        }
+        std::memcpy(tensor.data(), raw_view.data(), expected_bytes);
+        return Status::make_ok();
+    }
+
     // BF16 native path: raw bytes go directly into the tensor without conversion.
     // This halves weight memory compared to dequantizing to FP32.
     if (ti.dtype == GgmlDataType::BF16 && tensor.dtype() == DType::BFloat16) {
@@ -162,10 +173,11 @@ Status check_compatible_weight(const Tensor& tensor, const Value& value) {
             ": tensor " + tensor.shape().to_string() +
             " vs value " + value.shape.to_string());
     }
-    // Allow BF16 tensors to serve FP32 graph values because adapters
-    // dispatch on the physical weight tensor dtype at kernel time.
+    // Allow native low-precision weight tensors to serve FP32 graph values because
+    // adapters dispatch on the physical weight tensor dtype at kernel time.
     bool dtype_ok = (tensor.dtype() == value.dtype) ||
-                    (tensor.dtype() == DType::BFloat16 && value.dtype == DType::Float32);
+                    (tensor.dtype() == DType::BFloat16 && value.dtype == DType::Float32) ||
+                    (tensor.dtype() == DType::Q8_0 && value.dtype == DType::Float32);
     if (!dtype_ok) {
         return Status::type_error("shared weight dtype mismatch for " + value.name);
     }
@@ -492,21 +504,32 @@ std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
             }
             auto tensor = std::make_unique<Tensor>(v.name, v.shape, tensor_dtype, v.device);
             Status st;
+            size_t loaded_bytes = 0;
             if (v.device.type == DeviceType::CUDA) {
                 st = tensor->allocate_cuda();
+                if (!st.ok()) return std::unexpected(st);
+                auto bytes = tensor->nbytes();
+                if (!bytes) return std::unexpected(bytes.error());
+                loaded_bytes = *bytes;
+            } else if (tensor_dtype == DType::Q8_0) {
+                auto raw_bytes = info_it->second->bytes();
+                if (!raw_bytes) return std::unexpected(raw_bytes.error());
+                st = tensor->allocate_cpu_bytes(*raw_bytes);
+                if (!st.ok()) return std::unexpected(st);
+                loaded_bytes = *raw_bytes;
             } else {
                 st = tensor->allocate_cpu();
+                if (!st.ok()) return std::unexpected(st);
+                auto bytes = tensor->nbytes();
+                if (!bytes) return std::unexpected(bytes.error());
+                loaded_bytes = *bytes;
             }
-            if (!st.ok()) return std::unexpected(st);
-
-            auto bytes = tensor->nbytes();
-            if (!bytes) return std::unexpected(bytes.error());
 
             st = load_tensor_from_gguf(gguf_path_, file, *info_it->second, *tensor);
             if (!st.ok()) return std::unexpected(st);
 
             shared_tensor = tensor.get();
-            store.total_bytes_ += *bytes;
+            store.total_bytes_ += loaded_bytes;
             store.storage_by_gguf_name_[gguf_name] = std::move(tensor);
         } else {
             shared_tensor = existing->second.get();

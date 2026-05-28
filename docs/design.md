@@ -290,6 +290,19 @@ Implemented CPU ops include:
 - `Reshape`
 - `Transpose`
 
+### Weight Precision
+
+The CPU runtime keeps activations, intermediate tensors, logits, and KV cache in FP32. Weight tensors may use a different physical dtype when the adapter and kernel know how to consume it:
+
+| GGUF dtype | Physical tensor dtype | CPU behavior |
+|------------|-----------------------|--------------|
+| F32 | `Float32` | copied as FP32 |
+| F16 | `Float32` | expanded to FP32 during loading |
+| BF16 | `BFloat16` | stored as 16-bit BF16; `Embedding`, `Linear`, and `MatMul` read weights and accumulate into FP32 outputs |
+| Q8_0 | `Q8_0` | stored as raw GGML `block_q8_0`; CPU weight-only kernels dequantize blocks on the fly and accumulate in FP32 |
+
+The Q8_0 implementation is deliberately a small reference-quality path, not a production quantized GEMM. It proves the important systems boundary: weights stay compressed in `SharedWeightStore`, while activations and accumulators remain FP32. The packed dimension is checked to be a multiple of 32 because each GGML Q8_0 block stores one fp16 scale plus 32 int8 values.
+
 The CPU attention path now has two implementations. `sdpa()` is the straightforward reference-style implementation that materializes a score row, applies softmax, and then multiplies by V. `flash_sdpa()` and `flash_sdpa_decode()` use tiled K/V traversal with online softmax state:
 
 ```text
@@ -514,18 +527,19 @@ The `generate_paged` example currently demonstrates multi-sequence decode using 
 
 The IO layer is split into:
 
-- `GGUFParser`: reads file header, metadata, tensor infos, and raw tensor data.
-- `WeightLoader`: maps GGUF tensor names to graph value names and converts supported formats to FP32 runtime tensors.
+- `GGUFParser`: reads file header, metadata, tensor infos, and raw tensor data or mmap-backed tensor slices.
+- `WeightLoader`: maps GGUF tensor names to graph value names and chooses the physical tensor storage dtype.
 - `Tokenizer`: small interface for replacing the text-to-token backend.
 - `BPETokenizer`: default byte-level BPE backend with GGUF-driven special tokens and a Qwen3-oriented pre-tokenization path.
 
 Currently supported weight data types:
 
-- F32
-- F16 to F32
-- BF16 to F32
+- F32 copied as FP32
+- F16 expanded to FP32
+- BF16 copied as native BF16 weight storage on CPU and CUDA
+- Q8_0 copied as raw compressed CPU weight storage, with CPU weight-only `Embedding`/`Linear`/`MatMul` kernels
 
-When built with `MINILLM_ENABLE_CUDA=ON`, `WeightLoader` can dequantize through a temporary CPU staging buffer and copy the FP32 result into CUDA tensors. This keeps parsing and conversion simple while allowing real GPU forward-pass smoke tests.
+When built with `MINILLM_ENABLE_CUDA=ON`, `WeightLoader` keeps BF16 GGUF weights native on device and stages other formats through FP32 unless a dedicated CUDA path exists. CUDA quantized matmul is intentionally future work.
 
 For generation, `WeightLoader::load_shared_weights()` returns a `SharedWeightStore` instead of immediately copying into one context. The store owns CPU or CUDA tensors according to the graph device, while each `RuntimeContext` only binds pointers to those tensors:
 
@@ -565,19 +579,22 @@ flowchart TD
     File --> View["GGUFFile::tensor_view(tensor_info)"]
     View --> Bounds["offset + bytes bounds check"]
     Bounds --> Raw["span<const byte> over mapped file"]
-    Raw --> Dequant["WeightLoader::dequantize_to_f32"]
-    Dequant --> CpuTensor["CPU Tensor storage"]
-    Dequant -. "CUDA build" .-> Staging["host F32 staging"]
-    Staging -. "cudaMemcpy" .-> CudaTensor["CUDA Tensor storage"]
+    Raw --> Select["WeightLoader dtype dispatch"]
+    Select --> F32["F32 / F16 -> CPU Float32"]
+    Select --> BF16["BF16 -> native BFloat16 tensor"]
+    Select --> Q8["Q8_0 -> raw CPU Q8_0 blocks"]
+    F32 -. "CUDA non-BF16" .-> CudaF32["host F32 staging -> cudaMemcpy"]
+    BF16 -. "CUDA BF16" .-> CudaBF16["raw BF16 cudaMemcpy"]
 ```
 
 This keeps model loading easy to explain:
 
 - metadata and tensor offsets are still parsed normally
 - tensor bytes are not copied into an intermediate raw buffer on the mmap path
-- F16/BF16/Q8_0 are still expanded into the engine's FP32 runtime tensors
-- CUDA still stages through host FP32 before copying to device tensors
-- malformed tensor ranges fail before any dequantization starts
+- F16 expands to FP32 because there is no CPU F16 kernel surface
+- BF16 stays native for weight-only CPU/CUDA kernels
+- CPU Q8_0 stores compressed GGML blocks and dequantizes inside the weight kernel
+- malformed tensor ranges fail before any dtype conversion or copy starts
 
 ## Testing Strategy
 
@@ -618,8 +635,8 @@ The important split is:
 
 MiniLLMEngine is intentionally CPU-first and small. It does not currently implement:
 
-- quantized kernels such as Q8_0 or Q4_K
-- multi-threaded execution
+- optimized quantized kernels such as Q4_K and SIMD-packed Q8_0
+- multi-threaded graph execution beyond OpenMP inside kernels
 - continuous batching and a production request scheduler
 - prefix cache and block sharing across requests
 - full llama.cpp tokenizer parity across all model families
@@ -670,11 +687,11 @@ This project is useful to discuss:
 - how CUDA paged decode reads K/V through device block tables
 - how CUDA generation uses a device-side contiguous KV cache for prefill/decode
 - how shared GGUF weights avoid loading parameters once per generation graph
-- how GGUF weights can be staged from host parsing into CUDA tensor storage
+- how GGUF weights can stay native BF16 or CPU Q8_0 instead of always expanding to FP32
 - how to test numerical kernels separately from runtime integration
 
 Good follow-up improvements:
 
-- add true Q8_0 quantized matmul
+- optimize the CPU Q8_0 path with SIMD dot kernels and packed layouts
 - connect the toy scheduler to an end-to-end decode loop
 - extend memory planner to handle KV cache buffer reuse

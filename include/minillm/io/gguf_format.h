@@ -51,8 +51,8 @@ size_t ggml_blck_size(GgmlDataType dt);
 
 std::string_view ggml_dtype_name(GgmlDataType dt);
 
-// Map GGML dtype to engine DType. Block-quantized types map to Float32
-// (they are dequantized to F32 at load time).
+// Map GGML dtype to engine DType. Q8_0 maps to a physical
+// block-quantized weight dtype; kernels decide whether to consume it directly.
 std::expected<DType, Status> map_ggml_dtype(GgmlDataType dt);
 
 } // namespace minillm

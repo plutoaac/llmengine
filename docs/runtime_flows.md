@@ -22,14 +22,23 @@ flowchart TD
     Loop --> TensorRaw["tensor_raw_view(tensor_info)"]
     TensorRaw -->|has memory_view| ViewSlice["file.tensor_view(ti) → span slice of mmap region"]
     TensorRaw -->|no memory_view| Fallback["read_tensor_data() → ifstream seek+read"]
-    ViewSlice --> Dequant["WeightLoader::dequantize_to_f32(raw bytes)"]
-    Fallback --> Dequant
-    Dequant --> Store["Store in SharedWeightStore (CPU vector or cudaMemcpy to GPU)"]
+    ViewSlice --> DTypeDispatch["WeightLoader dtype dispatch"]
+    Fallback --> DTypeDispatch
+    DTypeDispatch --> F32["F32 / F16 -> CPU Float32"]
+    DTypeDispatch --> BF16["BF16 -> native BFloat16"]
+    DTypeDispatch --> Q8["Q8_0 -> raw CPU block_q8_0"]
+    F32 -. "CUDA non-BF16" .-> CudaF32["host F32 staging -> cudaMemcpy"]
+    BF16 -. "CUDA BF16" .-> CudaBF16["raw BF16 cudaMemcpy"]
+    F32 --> Store["SharedWeightStore"]
+    BF16 --> Store
+    Q8 --> Store
+    CudaF32 --> Store
+    CudaBF16 --> Store
 
     Store --> Bind["bind(graph, context): map value names → loaded Tensors"]
 ```
 
-**Key design**: `GGUFMemoryView` is a cross-platform read-only memory view. On Linux it uses `mmap()` with `MAP_PRIVATE`. On Windows it uses `CreateFileMappingA` + `MapViewOfFile`. The `SharedWeightStore` holds canonical tensors; `RuntimeContext` holds non-owning pointers.
+**Key design**: `GGUFMemoryView` is a cross-platform read-only memory view. On Linux it uses `mmap()` with `MAP_PRIVATE`. On Windows it uses `CreateFileMappingA` + `MapViewOfFile`. The `SharedWeightStore` holds canonical tensors; `RuntimeContext` holds non-owning pointers. CPU Q8_0 weights remain compressed in this store; CUDA Q8_0 still stages through FP32 until a CUDA quantized matmul path is added.
 
 ## Single-Sequence Generation (CPU)
 
@@ -95,15 +104,19 @@ flowchart TD
 
 ## Quantized Weight Loading (Q8_0)
 
-```mermaid  
+```mermaid
 flowchart LR
-    RawBytes["GGUF raw bytes: [scale:2B][int8×32]"] --> DeqLoop["for each 32-element block:"]
-    DeqLoop --> DecodeScale["scale = f16_to_f32(block[0:2])"]
-    DecodeScale --> DecodeVal["float[i] = int8(block[2+i]) * scale, for i=0..31"]
-    DecodeVal --> StoreF32["Store in F32 destination tensor"]
+    RawBytes["GGUF raw bytes: [scale:2B][int8 x 32]"] --> StoreQ8["Tensor dtype = Q8_0\nraw block_q8_0 storage"]
+    Act["FP32 activation"] --> Kernel["CPU Embedding / Linear / MatMul"]
+    StoreQ8 --> Kernel
+    Kernel --> BlockLoop["per block: scale = f16_to_f32; q = int8"]
+    BlockLoop --> Dot["acc += activation * (q * scale)"]
+    Dot --> Out["FP32 output"]
 ```
 
-Q8_0 stores weights as 8-bit integers with a per-block 16-bit float scale. Dequantization happens once at load time; inference uses F32.
+Q8_0 stores weights as 8-bit integers with a per-block 16-bit float scale. On the CPU path MiniLLMEngine now keeps those packed bytes in `SharedWeightStore` and dequantizes inside the weight kernel while accumulating in FP32. That is true weight-only quantization: lower weight memory, unchanged FP32 activations and outputs.
+
+This first path is intentionally minimal and readable. It requires the packed weight dimension to be a multiple of 32 and does not yet include SIMD dot kernels, Q4 formats, or CUDA quantized matmul.
 
 ## Tokenizer Flow
 

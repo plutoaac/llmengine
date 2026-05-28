@@ -3,6 +3,7 @@
 #include "minillm/runtime/kernels/cpu_simd.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -11,6 +12,54 @@
 using namespace minillm::simd;
 
 namespace minillm::cpu {
+
+namespace {
+
+constexpr size_t kQ8_0BlockSize = 34;
+constexpr size_t kQ8_0BlockElems = 32;
+
+float f16_to_f32(uint16_t bits) {
+    const bool neg = (bits & 0x8000u) != 0;
+    const uint32_t exp = (bits >> 10) & 0x1fu;
+    const uint32_t mant = bits & 0x03ffu;
+
+    float value = 0.0f;
+    if (exp == 0) {
+        value = mant == 0 ? 0.0f : std::ldexp(static_cast<float>(mant), -24);
+    } else if (exp == 31) {
+        value = mant == 0 ? std::numeric_limits<float>::infinity()
+                          : std::numeric_limits<float>::quiet_NaN();
+    } else {
+        value = std::ldexp(static_cast<float>(0x400u | mant),
+                           static_cast<int>(exp) - 25);
+    }
+    return neg ? -value : value;
+}
+
+float q8_0_scale(const uint8_t* block) {
+    uint16_t bits = static_cast<uint16_t>(block[0]) |
+                    (static_cast<uint16_t>(block[1]) << 8);
+    return f16_to_f32(bits);
+}
+
+float q8_0_value(const uint8_t* blocks, size_t element_index) {
+    const size_t block_index = element_index / kQ8_0BlockElems;
+    const size_t block_offset = element_index % kQ8_0BlockElems;
+    const uint8_t* block = blocks + block_index * kQ8_0BlockSize;
+    const auto* qs = reinterpret_cast<const int8_t*>(block + 2);
+    return q8_0_scale(block) * static_cast<float>(qs[block_offset]);
+}
+
+float q8_0_dot_contiguous(const float* a, const uint8_t* q8,
+                          size_t q8_element_offset, int len) {
+    float acc = 0.0f;
+    for (int i = 0; i < len; ++i) {
+        acc += a[i] * q8_0_value(q8, q8_element_offset + static_cast<size_t>(i));
+    }
+    return acc;
+}
+
+} // namespace
 
 // ===========================================================================
 // GEMM: C[M,N] = A[M,K] @ B[K,N]
@@ -62,6 +111,22 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
 
 void sgemm(const float* A, const bfloat16_t* B, float* C, int M, int N, int K) {
     sgemm_impl(A, B, C, M, N, K);
+}
+
+void sgemm(const float* A, const uint8_t* B, float* C, int M, int N, int K) {
+    #pragma omp parallel for
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + static_cast<size_t>(m) * K;
+        float* c_row = C + static_cast<size_t>(m) * N;
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const size_t b_index = static_cast<size_t>(k) * N + n;
+                acc += a_row[k] * q8_0_value(B, b_index);
+            }
+            c_row[n] = acc;
+        }
+    }
 }
 
 // ===========================================================================
@@ -140,6 +205,18 @@ void sgemm_nt(const float* A, const bfloat16_t* B, float* C, int M, int N, int K
     sgemm_nt_impl(A, B, C, M, N, K);
 }
 
+void sgemm_nt(const float* A, const uint8_t* B, float* C, int M, int N, int K) {
+    #pragma omp parallel for
+    for (int m = 0; m < M; ++m) {
+        const float* a_row = A + static_cast<size_t>(m) * K;
+        float* c_row = C + static_cast<size_t>(m) * N;
+        for (int n = 0; n < N; ++n) {
+            const size_t b_offset = static_cast<size_t>(n) * K;
+            c_row[n] = q8_0_dot_contiguous(a_row, B, b_offset, K);
+        }
+    }
+}
+
 // ===========================================================================
 // RMSNorm: y = x * inv_rms * gamma
 // SIMD: vectorized sum-of-squares and elementwise multiply
@@ -204,6 +281,17 @@ void embedding(const float* weight, const int* ids, float* out,
 void embedding(const bfloat16_t* weight, const int* ids, float* out,
                int seq_len, int hidden) {
     embedding_impl(weight, ids, out, seq_len, hidden);
+}
+
+void embedding(const uint8_t* weight, const int* ids, float* out,
+               int seq_len, int hidden) {
+    for (int s = 0; s < seq_len; ++s) {
+        const size_t row_offset = static_cast<size_t>(ids[s]) * hidden;
+        float* out_row = out + static_cast<size_t>(s) * hidden;
+        for (int h = 0; h < hidden; ++h) {
+            out_row[h] = q8_0_value(weight, row_offset + static_cast<size_t>(h));
+        }
+    }
 }
 
 // ===========================================================================

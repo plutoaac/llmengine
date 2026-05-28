@@ -1,5 +1,7 @@
 #include <cassert>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -46,6 +48,23 @@ static std::vector<float> reference_attention_row(
         }
     }
     return out;
+}
+
+static std::vector<uint8_t> pack_q8_0_scale1(const std::vector<int8_t>& values) {
+    constexpr size_t block_elems = 32;
+    constexpr size_t block_bytes = 34;
+    const size_t blocks = (values.size() + block_elems - 1) / block_elems;
+    std::vector<uint8_t> packed(blocks * block_bytes, 0);
+
+    for (size_t b = 0; b < blocks; ++b) {
+        const size_t base = b * block_bytes;
+        packed[base + 0] = 0x00;
+        packed[base + 1] = 0x3c;
+        for (size_t i = 0; i < block_elems && b * block_elems + i < values.size(); ++i) {
+            packed[base + 2 + i] = static_cast<uint8_t>(values[b * block_elems + i]);
+        }
+    }
+    return packed;
 }
 
 void test_sampler_greedy() {
@@ -538,6 +557,73 @@ void test_cpu_executor_embedding_rank1() {
     std::cout << "  PASS test_cpu_executor_embedding_rank1\n";
 }
 
+void test_cpu_executor_linear_q8_0_weight() {
+    Graph g;
+    GraphBuilder gb(g);
+
+    auto x = gb.input("x", Shape({1, 2, 32}), DType::Float32);
+    assert(x);
+    auto w = gb.constant("w", Shape({3, 32}), DType::Float32);
+    assert(w);
+    auto b = gb.constant("b", Shape({3}), DType::Float32);
+    assert(b);
+    auto y = gb.linear(*x, *w, *b, "linear_q8");
+    assert(y);
+    auto out = gb.output(*y, "out");
+    assert(out);
+
+    Tensor x_tensor("x", Shape({1, 2, 32}), DType::Float32);
+    Tensor w_tensor("w", Shape({3, 32}), DType::Q8_0);
+    Tensor b_tensor("b", Shape({3}), DType::Float32);
+    assert(x_tensor.allocate_cpu().ok());
+    assert(b_tensor.allocate_cpu().ok());
+
+    auto* x_data = reinterpret_cast<float*>(x_tensor.data());
+    for (int i = 0; i < 64; ++i) {
+        x_data[i] = static_cast<float>((i % 11) - 5) * 0.125f;
+    }
+    auto* b_data = reinterpret_cast<float*>(b_tensor.data());
+    b_data[0] = 0.5f;
+    b_data[1] = -1.0f;
+    b_data[2] = 1.5f;
+
+    std::vector<int8_t> weight(3 * 32);
+    for (size_t i = 0; i < weight.size(); ++i) {
+        weight[i] = static_cast<int8_t>((static_cast<int>(i) * 7) % 19 - 9);
+    }
+    auto packed = pack_q8_0_scale1(weight);
+    assert(w_tensor.allocate_cpu_bytes(packed.size()).ok());
+    std::memcpy(w_tensor.data(), packed.data(), packed.size());
+
+    RuntimeContext ctx;
+    assert(ctx.bind(*x, &x_tensor).ok());
+    assert(ctx.bind(*w, &w_tensor).ok());
+    assert(ctx.bind(*b, &b_tensor).ok());
+    assert(ctx.allocate_intermediates(g).ok());
+
+    KernelRegistry registry;
+    register_cpu_kernels(registry);
+    CpuExecutor executor(std::make_shared<CpuBackend>(), registry);
+    assert(executor.compile(g).ok());
+    assert(executor.run(ctx).ok());
+
+    Tensor* out_tensor = ctx.get(*y);
+    assert(out_tensor != nullptr);
+    const auto* result = reinterpret_cast<const float*>(out_tensor->data());
+    for (int token = 0; token < 2; ++token) {
+        for (int out_idx = 0; out_idx < 3; ++out_idx) {
+            float expected = b_data[out_idx];
+            for (int k = 0; k < 32; ++k) {
+                expected += x_data[token * 32 + k] *
+                    static_cast<float>(weight[static_cast<size_t>(out_idx) * 32 + k]);
+            }
+            assert(std::abs(result[token * 3 + out_idx] - expected) < 1e-5f);
+        }
+    }
+
+    std::cout << "  PASS test_cpu_executor_linear_q8_0_weight\n";
+}
+
 void test_cpu_executor_embedding_id_out_of_range() {
     Graph g;
     GraphBuilder gb(g);
@@ -584,6 +670,7 @@ int main() {
     test_cpu_executor_softmax_transpose_reshape();
     test_cpu_executor_linear_bias();
     test_cpu_executor_embedding_rank1();
+    test_cpu_executor_linear_q8_0_weight();
     test_cpu_executor_embedding_id_out_of_range();
     std::cout << "All tests passed!\n";
     return 0;

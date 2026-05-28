@@ -40,7 +40,7 @@ std::expected<DType, Status> map_ggml_dtype(GgmlDataType dt) {
     case GgmlDataType::F32:  return DType::Float32;
     case GgmlDataType::F16:  return DType::Float16;
     case GgmlDataType::BF16: return DType::BFloat16;
-    case GgmlDataType::Q8_0: return DType::Float32;
+    case GgmlDataType::Q8_0: return DType::Q8_0;
     default:
         return std::unexpected(Status::unsupported(
             std::string("unsupported GGML dtype ") +
