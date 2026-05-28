@@ -120,7 +120,7 @@ MiniLLMEngine keeps activations, logits, and KV cache in FP32 on the CPU path. W
 | F32 | `Float32` | FP32 load + FP32 accumulate | Baseline path |
 | F16 | `Float32` | Expanded to FP32 at load | Kept simple and safe |
 | BF16 | `BFloat16` | Weight-only BF16 read + FP32 activation/output | Default Qwen BF16 path |
-| Q8_0 | `Q8_0` raw blocks | Weight-only dequant inside `Embedding`/`Linear`/`MatMul`, FP32 accumulate | Packed dimension must be a multiple of 32 |
+| Q8_0 | `Q8_0` raw blocks | Weight-only dequant inside `Embedding`/`Linear`/`MatMul`, FP32 accumulate | Packed dimensions used by the kernel must be multiples of 32 |
 
 The Q8_0 path is true weight-only quantization: the shared weight tensor stores the original GGML `block_q8_0` bytes instead of expanding them at load time. The first implementation is intentionally scalar and readable; SIMD/packed fast paths and CUDA quantized matmul are left as future extensions.
 

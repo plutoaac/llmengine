@@ -161,7 +161,10 @@ static Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
     int N = static_cast<int>((*bt)->shape().dim(1));
     if (M <= 0 || N <= 0 || K <= 0) return Status::invalid_argument("invalid matmul shape");
 
-    TRY(check_q8_block_aligned(*bt, N, "matmul"));
+    if ((*bt)->dtype() == DType::Q8_0) {
+        TRY(check_q8_block_aligned(*bt, K, "matmul reduction dimension"));
+        TRY(check_q8_block_aligned(*bt, N, "matmul output dimension"));
+    }
     if ((*bt)->dtype() == DType::BFloat16) {
         cpu::sgemm(float_data(*at), bf16_data(*bt), float_data_mut(*ot), M, N, K);
     } else if ((*bt)->dtype() == DType::Q8_0) {

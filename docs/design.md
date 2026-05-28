@@ -301,7 +301,7 @@ The CPU runtime keeps activations, intermediate tensors, logits, and KV cache in
 | BF16 | `BFloat16` | stored as 16-bit BF16; `Embedding`, `Linear`, and `MatMul` read weights and accumulate into FP32 outputs |
 | Q8_0 | `Q8_0` | stored as raw GGML `block_q8_0`; CPU weight-only kernels dequantize blocks on the fly and accumulate in FP32 |
 
-The Q8_0 implementation is deliberately a small reference-quality path, not a production quantized GEMM. It proves the important systems boundary: weights stay compressed in `SharedWeightStore`, while activations and accumulators remain FP32. The packed dimension is checked to be a multiple of 32 because each GGML Q8_0 block stores one fp16 scale plus 32 int8 values.
+The Q8_0 implementation is deliberately a small reference-quality path, not a production quantized GEMM. It proves the important systems boundary: weights stay compressed in `SharedWeightStore`, while activations and accumulators remain FP32. Packed dimensions are checked conservatively: `Linear`/`Embedding` check the contiguous weight row, while `MatMul` checks both the reduction dimension and output dimension so block boundaries stay explicit.
 
 The CPU attention path now has two implementations. `sdpa()` is the straightforward reference-style implementation that materializes a score row, applies softmax, and then multiplies by V. `flash_sdpa()` and `flash_sdpa_decode()` use tiled K/V traversal with online softmax state:
 

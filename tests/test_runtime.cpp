@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "minillm/minillm.h"
@@ -624,6 +625,103 @@ void test_cpu_executor_linear_q8_0_weight() {
     std::cout << "  PASS test_cpu_executor_linear_q8_0_weight\n";
 }
 
+void test_cpu_executor_matmul_q8_0_weight() {
+    Graph g;
+    GraphBuilder gb(g);
+
+    auto a = gb.input("a", Shape({2, 32}), DType::Float32);
+    assert(a);
+    auto b = gb.constant("b", Shape({32, 32}), DType::Float32);
+    assert(b);
+    auto y = gb.matmul(*a, *b, "matmul_q8");
+    assert(y);
+    auto out = gb.output(*y, "out");
+    assert(out);
+
+    Tensor a_tensor("a", Shape({2, 32}), DType::Float32);
+    Tensor b_tensor("b", Shape({32, 32}), DType::Q8_0);
+    assert(a_tensor.allocate_cpu().ok());
+
+    auto* a_data = reinterpret_cast<float*>(a_tensor.data());
+    for (int i = 0; i < 64; ++i) {
+        a_data[i] = static_cast<float>((i % 13) - 6) * 0.125f;
+    }
+
+    std::vector<int8_t> b_data(32 * 32);
+    for (size_t i = 0; i < b_data.size(); ++i) {
+        b_data[i] = static_cast<int8_t>((static_cast<int>(i) * 5) % 17 - 8);
+    }
+    auto packed = pack_q8_0_scale1(b_data);
+    assert(b_tensor.allocate_cpu_bytes(packed.size()).ok());
+    std::memcpy(b_tensor.data(), packed.data(), packed.size());
+
+    RuntimeContext ctx;
+    assert(ctx.bind(*a, &a_tensor).ok());
+    assert(ctx.bind(*b, &b_tensor).ok());
+    assert(ctx.allocate_intermediates(g).ok());
+
+    KernelRegistry registry;
+    register_cpu_kernels(registry);
+    CpuExecutor executor(std::make_shared<CpuBackend>(), registry);
+    assert(executor.compile(g).ok());
+    assert(executor.run(ctx).ok());
+
+    Tensor* out_tensor = ctx.get(*y);
+    assert(out_tensor != nullptr);
+    const auto* result = reinterpret_cast<const float*>(out_tensor->data());
+    for (int m = 0; m < 2; ++m) {
+        for (int n = 0; n < 32; ++n) {
+            float expected = 0.0f;
+            for (int k = 0; k < 32; ++k) {
+                expected += a_data[m * 32 + k] *
+                    static_cast<float>(b_data[static_cast<size_t>(k) * 32 + n]);
+            }
+            assert(std::abs(result[m * 32 + n] - expected) < 1e-5f);
+        }
+    }
+
+    std::cout << "  PASS test_cpu_executor_matmul_q8_0_weight\n";
+}
+
+void test_cpu_executor_matmul_q8_0_rejects_unaligned_k() {
+    Graph g;
+    GraphBuilder gb(g);
+
+    auto a = gb.input("a", Shape({1, 31}), DType::Float32);
+    assert(a);
+    auto b = gb.constant("b", Shape({31, 32}), DType::Float32);
+    assert(b);
+    auto y = gb.matmul(*a, *b, "matmul_q8_bad_k");
+    assert(y);
+
+    Tensor a_tensor("a", Shape({1, 31}), DType::Float32);
+    Tensor b_tensor("b", Shape({31, 32}), DType::Q8_0);
+    assert(a_tensor.allocate_cpu().ok());
+
+    std::vector<int8_t> b_data(31 * 32, 1);
+    auto packed = pack_q8_0_scale1(b_data);
+    assert(b_tensor.allocate_cpu_bytes(packed.size()).ok());
+    std::memcpy(b_tensor.data(), packed.data(), packed.size());
+
+    RuntimeContext ctx;
+    assert(ctx.bind(*a, &a_tensor).ok());
+    assert(ctx.bind(*b, &b_tensor).ok());
+    assert(ctx.allocate_intermediates(g).ok());
+
+    KernelRegistry registry;
+    register_cpu_kernels(registry);
+    CpuExecutor executor(std::make_shared<CpuBackend>(), registry);
+    assert(executor.compile(g).ok());
+    auto st = executor.run(ctx);
+    assert(!st.ok());
+    assert(st.code() == ErrorCode::RuntimeError);
+    const std::string msg(st.message());
+    assert(msg.find("Q8_0") != std::string::npos);
+    assert(msg.find("32") != std::string::npos);
+
+    std::cout << "  PASS test_cpu_executor_matmul_q8_0_rejects_unaligned_k\n";
+}
+
 void test_cpu_executor_embedding_id_out_of_range() {
     Graph g;
     GraphBuilder gb(g);
@@ -671,6 +769,8 @@ int main() {
     test_cpu_executor_linear_bias();
     test_cpu_executor_embedding_rank1();
     test_cpu_executor_linear_q8_0_weight();
+    test_cpu_executor_matmul_q8_0_weight();
+    test_cpu_executor_matmul_q8_0_rejects_unaligned_k();
     test_cpu_executor_embedding_id_out_of_range();
     std::cout << "All tests passed!\n";
     return 0;
