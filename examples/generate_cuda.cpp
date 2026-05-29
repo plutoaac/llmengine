@@ -27,6 +27,19 @@ bool check_cuda(cudaError_t err, const std::string& what) {
     return false;
 }
 
+std::string build_chat_prompt(const std::string& system_prompt,
+                              const std::string& user_prompt,
+                              bool enable_thinking = false) {
+    std::string prompt =
+        "<|im_start|>system\n" + system_prompt + "<|im_end|>\n"
+        "<|im_start|>user\n" + user_prompt + "<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    if (!enable_thinking) {
+        prompt += "<think>\n\n</think>\n\n";
+    }
+    return prompt;
+}
+
 Status allocate_input_tensors(const Graph& graph, RuntimeContext& ctx) {
     for (const auto& v : graph.values()) {
         if (v.kind != ValueKind::Input) continue;
@@ -124,9 +137,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::string chat_prompt =
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-        "<|im_start|>user\n" + prompt + "<|im_end|>\n"
-        "<|im_start|>assistant\n";
+        build_chat_prompt("You are a helpful assistant.", prompt, false);
     auto encoded = tokenizer.encode(chat_prompt, false, false);
     if (!encoded) {
         std::cerr << "Failed to encode prompt: " << encoded.error().to_string() << "\n";

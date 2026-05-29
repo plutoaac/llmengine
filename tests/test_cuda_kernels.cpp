@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "minillm/minillm.h"
@@ -45,6 +46,23 @@ static uint16_t bf16_bits(float value) {
 static std::vector<uint16_t> to_bf16_bits(const std::vector<float>& values) {
     std::vector<uint16_t> out(values.size());
     for (size_t i = 0; i < values.size(); ++i) out[i] = bf16_bits(values[i]);
+    return out;
+}
+
+static std::vector<uint8_t> pack_q8_0(const std::vector<int8_t>& values,
+                                      uint16_t scale_bits) {
+    constexpr size_t block_elems = 32;
+    constexpr size_t block_bytes = 34;
+    const size_t blocks = (values.size() + block_elems - 1) / block_elems;
+    std::vector<uint8_t> out(blocks * block_bytes, 0);
+    for (size_t b = 0; b < blocks; ++b) {
+        const size_t base = b * block_bytes;
+        out[base + 0] = static_cast<uint8_t>(scale_bits & 0xffu);
+        out[base + 1] = static_cast<uint8_t>(scale_bits >> 8);
+        for (size_t i = 0; i < block_elems && b * block_elems + i < values.size(); ++i) {
+            out[base + 2 + i] = static_cast<uint8_t>(values[b * block_elems + i]);
+        }
+    }
     return out;
 }
 
@@ -238,10 +256,20 @@ void test_cuda_gemm_and_bias() {
     const std::vector<float> expected{58, 64, 139, 154};
     for (size_t i = 0; i < expected.size(); ++i) assert_near(C[i], expected[i]);
 
+    check_status(cuda::sgemm_reference(dA.get(), dB.get(), dC.get(), 2, 2, 3));
+    sync_ok();
+    C = dC.copy_to_host();
+    for (size_t i = 0; i < expected.size(); ++i) assert_near(C[i], expected[i]);
+
     check_status(cuda::sgemm_nt(dA.get(), dBt.get(), dC.get(), 2, 2, 3));
     sync_ok();
     C = dC.copy_to_host();
     const std::vector<float> expected_nt{50, 68, 122, 167};
+    for (size_t i = 0; i < expected_nt.size(); ++i) assert_near(C[i], expected_nt[i]);
+
+    check_status(cuda::sgemm_nt_reference(dA.get(), dBt.get(), dC.get(), 2, 2, 3));
+    sync_ok();
+    C = dC.copy_to_host();
     for (size_t i = 0; i < expected_nt.size(); ++i) assert_near(C[i], expected_nt[i]);
 
     const std::vector<float> bias{0.5f, -1.0f};
@@ -254,6 +282,60 @@ void test_cuda_gemm_and_bias() {
         for (int c = 0; c < 2; ++c) {
             assert_near(C[static_cast<size_t>(r * 2 + c)],
                         expected_nt[static_cast<size_t>(r * 2 + c)] + bias[static_cast<size_t>(c)]);
+        }
+    }
+
+    {
+        const int M = 3;
+        const int N = 5;
+        const int K = 4;
+        std::vector<float> hA(static_cast<size_t>(M) * K);
+        std::vector<float> hB(static_cast<size_t>(K) * N);
+        std::vector<float> hBt(static_cast<size_t>(N) * K);
+        for (int i = 0; i < M * K; ++i) {
+            hA[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.25f;
+        }
+        for (int i = 0; i < K * N; ++i) {
+            hB[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.125f;
+        }
+        for (int n = 0; n < N; ++n) {
+            for (int k = 0; k < K; ++k) {
+                hBt[static_cast<size_t>(n) * K + k] = hB[static_cast<size_t>(k) * N + n];
+            }
+        }
+
+        DeviceBuffer<float> dA2(hA.size()), dB2(hB.size()), dBt2(hBt.size()),
+            dC2(static_cast<size_t>(M) * N);
+        dA2.copy_from(hA);
+        dB2.copy_from(hB);
+        dBt2.copy_from(hBt);
+
+        check_status(cuda::sgemm(dA2.get(), dB2.get(), dC2.get(), M, N, K));
+        sync_ok();
+        auto got = dC2.copy_to_host();
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float expected_val = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    expected_val += hA[static_cast<size_t>(m) * K + k] *
+                                    hB[static_cast<size_t>(k) * N + n];
+                }
+                assert_near(got[static_cast<size_t>(m) * N + n], expected_val, 1e-5f);
+            }
+        }
+
+        check_status(cuda::sgemm_nt(dA2.get(), dBt2.get(), dC2.get(), M, N, K));
+        sync_ok();
+        got = dC2.copy_to_host();
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float expected_val = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    expected_val += hA[static_cast<size_t>(m) * K + k] *
+                                    hBt[static_cast<size_t>(n) * K + k];
+                }
+                assert_near(got[static_cast<size_t>(m) * N + n], expected_val, 1e-5f);
+            }
         }
     }
 
@@ -322,6 +404,128 @@ void test_cuda_bf16_weight_kernels() {
     for (size_t i = 0; i < expected_embedding.size(); ++i) assert_near(y[i], expected_embedding[i]);
 
     std::cout << "  PASS test_cuda_bf16_weight_kernels\n";
+}
+
+void test_cuda_q8_0_weight_kernels() {
+    {
+        const int M = 1;
+        const int N = 2;
+        const int K = 32;
+        std::vector<float> A(static_cast<size_t>(M) * K);
+        std::vector<int8_t> B(static_cast<size_t>(N) * K);
+        for (int i = 0; i < M * K; ++i) A[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.25f;
+        for (int i = 0; i < N * K; ++i) B[static_cast<size_t>(i)] = static_cast<int8_t>((i * 5) % 17 - 8);
+        auto packed = pack_q8_0(B, 0x3c00);
+
+        DeviceBuffer<float> dA(A.size()), dC(static_cast<size_t>(M) * N);
+        DeviceBuffer<uint8_t> dB(packed.size());
+        dA.copy_from(A);
+        dB.copy_from(packed);
+        check_status(cuda::sgemm_nt(dA.get(), dB.get(), dC.get(), M, N, K));
+        sync_ok();
+        auto C = dC.copy_to_host();
+        for (int n = 0; n < N; ++n) {
+            float expected = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                expected += A[static_cast<size_t>(k)] *
+                            static_cast<float>(B[static_cast<size_t>(n) * K + k]);
+            }
+            assert_near(C[static_cast<size_t>(n)], expected, 1e-5f);
+        }
+    }
+
+    {
+        const int M = 2;
+        const int N = 3;
+        const int K = 64;
+        constexpr float scale = 0.5f;
+        std::vector<float> A(static_cast<size_t>(M) * K);
+        std::vector<int8_t> B(static_cast<size_t>(N) * K);
+        for (int i = 0; i < M * K; ++i) A[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.125f;
+        for (int i = 0; i < N * K; ++i) B[static_cast<size_t>(i)] = static_cast<int8_t>((i * 7) % 23 - 11);
+        auto packed = pack_q8_0(B, 0x3800);
+
+        DeviceBuffer<float> dA(A.size()), dC(static_cast<size_t>(M) * N);
+        DeviceBuffer<uint8_t> dB(packed.size());
+        dA.copy_from(A);
+        dB.copy_from(packed);
+        check_status(cuda::sgemm_nt(dA.get(), dB.get(), dC.get(), M, N, K));
+        sync_ok();
+        auto C = dC.copy_to_host();
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float expected = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    expected += A[static_cast<size_t>(m) * K + k] *
+                                static_cast<float>(B[static_cast<size_t>(n) * K + k]) *
+                                scale;
+                }
+                assert_near(C[static_cast<size_t>(m) * N + n], expected, 1e-4f);
+            }
+        }
+    }
+
+    {
+        const int M = 2;
+        const int N = 64;
+        const int K = 32;
+        constexpr float scale = 0.5f;
+        std::vector<float> A(static_cast<size_t>(M) * K);
+        std::vector<int8_t> B(static_cast<size_t>(K) * N);
+        for (int i = 0; i < M * K; ++i) A[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.125f;
+        for (int i = 0; i < K * N; ++i) B[static_cast<size_t>(i)] = static_cast<int8_t>((i * 3) % 29 - 14);
+        auto packed = pack_q8_0(B, 0x3800);
+
+        DeviceBuffer<float> dA(A.size()), dC(static_cast<size_t>(M) * N);
+        DeviceBuffer<uint8_t> dB(packed.size());
+        dA.copy_from(A);
+        dB.copy_from(packed);
+        check_status(cuda::sgemm(dA.get(), dB.get(), dC.get(), M, N, K));
+        sync_ok();
+        auto C = dC.copy_to_host();
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float expected = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    expected += A[static_cast<size_t>(m) * K + k] *
+                                static_cast<float>(B[static_cast<size_t>(k) * N + n]) *
+                                scale;
+                }
+                assert_near(C[static_cast<size_t>(m) * N + n], expected, 1e-4f);
+            }
+        }
+    }
+
+    {
+        const int vocab = 3;
+        const int hidden = 64;
+        constexpr float scale = 0.5f;
+        std::vector<int8_t> W(static_cast<size_t>(vocab) * hidden);
+        for (int i = 0; i < vocab * hidden; ++i) {
+            W[static_cast<size_t>(i)] = static_cast<int8_t>((i * 5) % 31 - 15);
+        }
+        auto packed = pack_q8_0(W, 0x3800);
+        const std::vector<int> ids{2, 0, 1};
+
+        DeviceBuffer<uint8_t> dW(packed.size());
+        DeviceBuffer<int> dids(ids.size());
+        DeviceBuffer<float> dout(static_cast<size_t>(ids.size()) * hidden);
+        dW.copy_from(packed);
+        dids.copy_from(ids);
+        check_status(cuda::embedding(dW.get(), dids.get(), dout.get(),
+                                     static_cast<int>(ids.size()), vocab, hidden));
+        sync_ok();
+        auto out = dout.copy_to_host();
+        for (size_t s = 0; s < ids.size(); ++s) {
+            for (int h = 0; h < hidden; ++h) {
+                const float expected =
+                    static_cast<float>(W[static_cast<size_t>(ids[s]) * hidden + h]) * scale;
+                assert_near(out[s * static_cast<size_t>(hidden) + h], expected, 1e-5f);
+            }
+        }
+    }
+
+    std::cout << "  PASS test_cuda_q8_0_weight_kernels\n";
 }
 
 void test_cuda_norm_embedding_rope_softmax_transpose() {
@@ -454,6 +658,40 @@ void test_cuda_sdpa_gqa() {
     auto expected = reference_sdpa(q, k, v, batch, q_len, num_heads, num_kv_heads, head_dim, true);
     for (size_t i = 0; i < expected.size(); ++i) {
         assert_near(out[i], expected[i], 1e-3f);
+    }
+
+    {
+        const int batch2 = 2;
+        const int q_len2 = 37;
+        const int num_heads2 = 4;
+        const int num_kv_heads2 = 2;
+        const int head_dim2 = 64;
+        const int q_hidden = num_heads2 * head_dim2;
+        const int kv_hidden = num_kv_heads2 * head_dim2;
+        std::vector<float> q2(static_cast<size_t>(batch2) * q_len2 * q_hidden);
+        std::vector<float> k2(static_cast<size_t>(batch2) * q_len2 * kv_hidden);
+        std::vector<float> v2(k2.size());
+        for (size_t i = 0; i < q2.size(); ++i) {
+            q2[i] = static_cast<float>((static_cast<int>(i) % 17) - 8) * 0.03125f;
+        }
+        for (size_t i = 0; i < k2.size(); ++i) {
+            k2[i] = static_cast<float>((static_cast<int>(i * 3) % 19) - 9) * 0.025f;
+            v2[i] = static_cast<float>((static_cast<int>(i * 5) % 23) - 11) * 0.05f;
+        }
+
+        DeviceBuffer<float> dq2(q2.size()), dk2(k2.size()), dv2(v2.size()), dout2(q2.size());
+        dq2.copy_from(q2);
+        dk2.copy_from(k2);
+        dv2.copy_from(v2);
+        check_status(cuda::sdpa(dq2.get(), dk2.get(), dv2.get(), dout2.get(),
+                                batch2, q_len2, num_heads2, num_kv_heads2, head_dim2, true));
+        sync_ok();
+        auto got2 = dout2.copy_to_host();
+        auto expected2 = reference_sdpa(q2, k2, v2, batch2, q_len2, num_heads2,
+                                        num_kv_heads2, head_dim2, true);
+        for (size_t i = 0; i < expected2.size(); ++i) {
+            assert_near(got2[i], expected2[i], 2e-3f);
+        }
     }
 
     std::cout << "  PASS test_cuda_sdpa_gqa\n";
@@ -712,6 +950,178 @@ void test_cuda_executor_linear_bias() {
     std::cout << "  PASS test_cuda_executor_linear_bias\n";
 }
 
+void test_cuda_executor_q8_0_linear_and_matmul() {
+    {
+        Graph graph;
+        GraphBuilder gb(graph);
+        auto x = gb.input("x", Shape({2, 32}), DType::Float32, Device::cuda(0));
+        auto w = gb.constant("w", Shape({3, 32}), DType::Float32, Device::cuda(0));
+        assert(x && w);
+        auto y = gb.linear(*x, *w, std::nullopt, "linear_q8");
+        assert(y);
+        auto out = gb.output(*y, "out");
+        assert(out);
+
+        Tensor tx("x", Shape({2, 32}), DType::Float32, Device::cuda(0));
+        Tensor tw("w", Shape({3, 32}), DType::Q8_0, Device::cuda(0));
+        check_status(tx.allocate_cuda());
+
+        std::vector<float> hx(64);
+        for (int i = 0; i < 64; ++i) hx[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.125f;
+        std::vector<int8_t> hw(3 * 32);
+        for (size_t i = 0; i < hw.size(); ++i) hw[i] = static_cast<int8_t>((static_cast<int>(i) * 7) % 19 - 9);
+        auto packed = pack_q8_0(hw, 0x3c00);
+        check_status(tw.allocate_cuda_bytes(packed.size()));
+        check_cuda(cudaMemcpy(tx.data(), hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(tw.data(), packed.data(), packed.size(), cudaMemcpyHostToDevice));
+
+        RuntimeContext ctx;
+        check_status(ctx.bind(*x, &tx));
+        check_status(ctx.bind(*w, &tw));
+        check_status(ctx.allocate_intermediates(graph));
+
+        KernelRegistry registry;
+        register_cuda_kernels(registry);
+        CudaExecutor executor(std::make_shared<CudaBackend>(), registry);
+        check_status(executor.compile(graph));
+        check_status(executor.run(ctx));
+        sync_ok();
+
+        Tensor* y_tensor = ctx.get(*y);
+        assert(y_tensor != nullptr);
+        std::vector<float> got(6);
+        check_cuda(cudaMemcpy(got.data(), y_tensor->data(), got.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        for (int m = 0; m < 2; ++m) {
+            for (int n = 0; n < 3; ++n) {
+                float expected = 0.0f;
+                for (int k = 0; k < 32; ++k) {
+                    expected += hx[static_cast<size_t>(m) * 32 + k] *
+                                static_cast<float>(hw[static_cast<size_t>(n) * 32 + k]);
+                }
+                assert_near(got[static_cast<size_t>(m) * 3 + n], expected, 1e-4f);
+            }
+        }
+    }
+
+    {
+        Graph graph;
+        GraphBuilder gb(graph);
+        auto a = gb.input("a", Shape({2, 32}), DType::Float32, Device::cuda(0));
+        auto b = gb.constant("b", Shape({32, 32}), DType::Float32, Device::cuda(0));
+        assert(a && b);
+        auto y = gb.matmul(*a, *b, "matmul_q8");
+        assert(y);
+        auto out = gb.output(*y, "out");
+        assert(out);
+
+        Tensor ta("a", Shape({2, 32}), DType::Float32, Device::cuda(0));
+        Tensor tb("b", Shape({32, 32}), DType::Q8_0, Device::cuda(0));
+        check_status(ta.allocate_cuda());
+
+        std::vector<float> ha(64);
+        for (int i = 0; i < 64; ++i) ha[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.125f;
+        std::vector<int8_t> hb(32 * 32);
+        for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<int8_t>((static_cast<int>(i) * 5) % 17 - 8);
+        auto packed = pack_q8_0(hb, 0x3c00);
+        check_status(tb.allocate_cuda_bytes(packed.size()));
+        check_cuda(cudaMemcpy(ta.data(), ha.data(), ha.size() * sizeof(float), cudaMemcpyHostToDevice));
+        check_cuda(cudaMemcpy(tb.data(), packed.data(), packed.size(), cudaMemcpyHostToDevice));
+
+        RuntimeContext ctx;
+        check_status(ctx.bind(*a, &ta));
+        check_status(ctx.bind(*b, &tb));
+        check_status(ctx.allocate_intermediates(graph));
+
+        KernelRegistry registry;
+        register_cuda_kernels(registry);
+        CudaExecutor executor(std::make_shared<CudaBackend>(), registry);
+        check_status(executor.compile(graph));
+        check_status(executor.run(ctx));
+        sync_ok();
+
+        Tensor* y_tensor = ctx.get(*y);
+        assert(y_tensor != nullptr);
+        std::vector<float> got(64);
+        check_cuda(cudaMemcpy(got.data(), y_tensor->data(), got.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        for (int m = 0; m < 2; ++m) {
+            for (int n = 0; n < 32; ++n) {
+                float expected = 0.0f;
+                for (int k = 0; k < 32; ++k) {
+                    expected += ha[static_cast<size_t>(m) * 32 + k] *
+                                static_cast<float>(hb[static_cast<size_t>(k) * 32 + n]);
+                }
+                assert_near(got[static_cast<size_t>(m) * 32 + n], expected, 1e-4f);
+            }
+        }
+    }
+
+    std::cout << "  PASS test_cuda_executor_q8_0_linear_and_matmul\n";
+}
+
+void test_cuda_executor_q8_0_rejects_invalid_inputs() {
+    {
+        Graph graph;
+        GraphBuilder gb(graph);
+        auto x = gb.input("x", Shape({1, 31}), DType::Float32, Device::cuda(0));
+        auto w = gb.constant("w", Shape({2, 31}), DType::Float32, Device::cuda(0));
+        assert(x && w);
+        auto y = gb.linear(*x, *w, std::nullopt, "linear_q8_bad_k");
+        assert(y);
+
+        Tensor tx("x", Shape({1, 31}), DType::Float32, Device::cuda(0));
+        Tensor tw("w", Shape({2, 31}), DType::Q8_0, Device::cuda(0));
+        check_status(tx.allocate_cuda());
+        std::vector<int8_t> hw(2 * 31, 1);
+        auto packed = pack_q8_0(hw, 0x3c00);
+        check_status(tw.allocate_cuda_bytes(packed.size()));
+
+        RuntimeContext ctx;
+        check_status(ctx.bind(*x, &tx));
+        check_status(ctx.bind(*w, &tw));
+        check_status(ctx.allocate_intermediates(graph));
+
+        KernelRegistry registry;
+        register_cuda_kernels(registry);
+        CudaExecutor executor(std::make_shared<CudaBackend>(), registry);
+        check_status(executor.compile(graph));
+        auto st = executor.run(ctx);
+        assert(!st.ok());
+        assert(std::string(st.message()).find("Q8_0") != std::string::npos);
+    }
+
+    {
+        Graph graph;
+        GraphBuilder gb(graph);
+        auto x = gb.input("x", Shape({1, 32}), DType::Float32, Device::cuda(0));
+        auto w = gb.constant("w", Shape({1, 32}), DType::Float32, Device::cuda(0));
+        assert(x && w);
+        auto y = gb.linear(*x, *w, std::nullopt, "linear_q8_short_storage");
+        assert(y);
+
+        Tensor tx("x", Shape({1, 32}), DType::Float32, Device::cuda(0));
+        Tensor tw("w", Shape({1, 32}), DType::Q8_0, Device::cuda(0));
+        check_status(tx.allocate_cuda());
+        check_status(tw.allocate_cuda_bytes(1));
+
+        RuntimeContext ctx;
+        check_status(ctx.bind(*x, &tx));
+        check_status(ctx.bind(*w, &tw));
+        check_status(ctx.allocate_intermediates(graph));
+
+        KernelRegistry registry;
+        register_cuda_kernels(registry);
+        CudaExecutor executor(std::make_shared<CudaBackend>(), registry);
+        check_status(executor.compile(graph));
+        auto st = executor.run(ctx);
+        assert(!st.ok());
+        assert(std::string(st.message()).find("too small") != std::string::npos);
+    }
+
+    std::cout << "  PASS test_cuda_executor_q8_0_rejects_invalid_inputs\n";
+}
+
 void test_cuda_executor_rope_custom_base() {
     Graph g;
     GraphBuilder gb(g);
@@ -783,12 +1193,15 @@ int main() {
     test_cuda_elementwise();
     test_cuda_gemm_and_bias();
     test_cuda_bf16_weight_kernels();
+    test_cuda_q8_0_weight_kernels();
     test_cuda_norm_embedding_rope_softmax_transpose();
     test_cuda_sdpa_gqa();
     test_cuda_paged_attention_decode_gqa();
     test_cuda_paged_attention_decode_batch_gqa();
     test_cuda_kv_cache_attention_decode_gqa();
     test_cuda_executor_linear_bias();
+    test_cuda_executor_q8_0_linear_and_matmul();
+    test_cuda_executor_q8_0_rejects_invalid_inputs();
     test_cuda_executor_rope_custom_base();
     test_cuda_planned_memory_arena();
     std::cout << "All tests passed!\n";

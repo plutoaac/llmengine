@@ -26,19 +26,21 @@ flowchart TD
     Fallback --> DTypeDispatch
     DTypeDispatch --> F32["F32 / F16 -> CPU Float32"]
     DTypeDispatch --> BF16["BF16 -> native BFloat16"]
-    DTypeDispatch --> Q8["Q8_0 -> raw CPU block_q8_0"]
+    DTypeDispatch --> Q8["Q8_0 -> raw CPU/CUDA block_q8_0"]
     F32 -. "CUDA non-BF16" .-> CudaF32["host F32 staging -> cudaMemcpy"]
     BF16 -. "CUDA BF16" .-> CudaBF16["raw BF16 cudaMemcpy"]
+    Q8 -. "CUDA Q8_0" .-> CudaQ8["raw block_q8_0 cudaMemcpy"]
     F32 --> Store["SharedWeightStore"]
     BF16 --> Store
     Q8 --> Store
     CudaF32 --> Store
     CudaBF16 --> Store
+    CudaQ8 --> Store
 
     Store --> Bind["bind(graph, context): map value names → loaded Tensors"]
 ```
 
-**Key design**: `GGUFMemoryView` is a cross-platform read-only memory view. On Linux it uses `mmap()` with `MAP_PRIVATE`. On Windows it uses `CreateFileMappingA` + `MapViewOfFile`. The `SharedWeightStore` holds canonical tensors; `RuntimeContext` holds non-owning pointers. CPU Q8_0 weights remain compressed in this store; CUDA Q8_0 still stages through FP32 until a CUDA quantized matmul path is added.
+**Key design**: `GGUFMemoryView` is a cross-platform read-only memory view. On Linux it uses `mmap()` with `MAP_PRIVATE`. On Windows it uses `CreateFileMappingA` + `MapViewOfFile`. The `SharedWeightStore` holds canonical tensors; `RuntimeContext` holds non-owning pointers. CPU and CUDA Q8_0 weights remain compressed in this store, and CUDA copies the raw GGUF blocks into device byte storage for dedicated Q8 kernels.
 
 ## Single-Sequence Generation (CPU)
 
@@ -92,7 +94,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     CudaSetup["cudaSetDevice(0); config.device = Device::cuda(0)"] --> CudaGraph["Build graph with CUDA device"]
-    CudaGraph --> CudaWeights["load_shared_weights → dequantize → cudaMemcpy to GPU"]
+    CudaGraph --> CudaWeights["load_shared_weights → native/raw device copy or FP32 staging"]
     CudaWeights --> CudaCache["KVCache::init_cuda() → cudaMalloc K/V"]
     CudaCache --> CudaPrefill["CudaExecutor::run(prefill context)"]
     CudaPrefill --> CudaDecode["CudaExecutor::run(decode context)"]
@@ -107,16 +109,16 @@ flowchart TD
 ```mermaid
 flowchart LR
     RawBytes["GGUF raw bytes: [scale:2B][int8 x 32]"] --> StoreQ8["Tensor dtype = Q8_0\nraw block_q8_0 storage"]
-    Act["FP32 activation"] --> Kernel["CPU Embedding / Linear / MatMul"]
+    Act["FP32 activation"] --> Kernel["CPU/CUDA Embedding / Linear / MatMul"]
     StoreQ8 --> Kernel
     Kernel --> BlockLoop["per block: scale = f16_to_f32; q = int8"]
     BlockLoop --> Dot["acc += activation * (q * scale)"]
     Dot --> Out["FP32 output"]
 ```
 
-Q8_0 stores weights as 8-bit integers with a per-block 16-bit float scale. On the CPU path MiniLLMEngine now keeps those packed bytes in `SharedWeightStore` and dequantizes inside the weight kernel while accumulating in FP32. That is true weight-only quantization: lower weight memory, unchanged FP32 activations and outputs.
+Q8_0 stores weights as 8-bit integers with a per-block 16-bit float scale. MiniLLMEngine keeps those packed bytes in `SharedWeightStore` and dequantizes inside the CPU or CUDA weight kernel while accumulating in FP32. That is true weight-only quantization: lower weight memory, unchanged FP32 activations and outputs.
 
-This first path is intentionally minimal and readable. It requires the packed weight dimension to be a multiple of 32 and does not yet include SIMD dot kernels, Q4 formats, or CUDA quantized matmul.
+The CUDA Q8_0 path uses warp/tile kernels that read one GGUF block scale per warp and keep FP32 accumulation. It requires the packed weight dimension to be a multiple of 32 and does not yet include Q4 formats, cuBLASLt-style packing, or production-tuned low-bit GEMM.
 
 ## Tokenizer Flow
 

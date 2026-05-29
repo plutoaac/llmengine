@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <initializer_list>
 #include <utility>
@@ -19,6 +20,30 @@ namespace {
 Status cuda_status(cudaError_t err, const char* what) {
     if (err == cudaSuccess) return Status::make_ok();
     return Status::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+}
+
+Status cublas_status(cublasStatus_t err, const char* what) {
+    if (err == CUBLAS_STATUS_SUCCESS) return Status::make_ok();
+    return Status::runtime_error(
+        std::string(what) + ": cuBLAS status " + std::to_string(static_cast<int>(err)));
+}
+
+Status cublas_handle(cublasHandle_t& out) {
+    struct Handle {
+        cublasHandle_t h{nullptr};
+        ~Handle() {
+            if (h) (void)cublasDestroy(h);
+        }
+    };
+    thread_local Handle handle;
+    if (!handle.h) {
+        auto st = cublasCreate(&handle.h);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            return cublas_status(st, "cublasCreate failed");
+        }
+    }
+    out = handle.h;
+    return Status::make_ok();
 }
 
 Status launch_status(const char* what) {
@@ -168,6 +193,34 @@ __device__ __forceinline__ float weight_to_f32(uint16_t bf16_bits) {
     return __uint_as_float(static_cast<unsigned int>(bf16_bits) << 16);
 }
 
+__device__ __forceinline__ float f16_bits_to_f32(uint16_t bits) {
+    const unsigned sign = (bits >> 15) & 0x1u;
+    unsigned exp = (bits >> 10) & 0x1fu;
+    unsigned mant = bits & 0x3ffu;
+    unsigned f32 = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            f32 = sign << 31;
+        } else {
+            const int shift = __clz(mant) - 21;
+            mant <<= shift;
+            const int normalized_exp = 1 - shift;
+            f32 = (sign << 31) |
+                  (static_cast<unsigned>(normalized_exp + 112) << 23) |
+                  ((mant & 0x3ffu) << 13);
+        }
+    } else if (exp == 31) {
+        f32 = (sign << 31) | 0x7f800000u | (mant ? 0x400000u : 0u);
+    } else {
+        f32 = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return __uint_as_float(f32);
+}
+
+__device__ __forceinline__ uint16_t load_u16_le(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
 __global__ void add_kernel(const float* a, const float* b, float* y, size_t n) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) y[i] = a[i] + b[i];
@@ -240,6 +293,70 @@ __global__ void sgemm_nt_kernel(const float* A, const W* B, float* C,
     C[static_cast<size_t>(row) * N + col] = acc;
 }
 
+template <int WARPS>
+__global__ void sgemm_q8_0_nblock_kernel(const float* A, const uint8_t* B, float* C,
+                                         int M, int N, int K) {
+    constexpr int warp_size = 32;
+    constexpr int block_bytes = 34;
+    __shared__ float partials[WARPS][warp_size];
+
+    const int lane = threadIdx.x & (warp_size - 1);
+    const int warp = threadIdx.x >> 5;
+    const int n_block = blockIdx.x;
+    const int m = blockIdx.y;
+    const int n = n_block * warp_size + lane;
+    if (m >= M || n >= N) return;
+
+    const float* a_row = A + static_cast<size_t>(m) * K;
+    const int blocks_per_b_row = N / warp_size;
+    float local = 0.0f;
+    for (int k = warp; k < K; k += WARPS) {
+        const uint8_t* block =
+            B + (static_cast<size_t>(k) * blocks_per_b_row + n_block) * block_bytes;
+        uint16_t scale_bits = 0;
+        if (lane == 0) scale_bits = load_u16_le(block);
+        scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0);
+        const auto* qs = reinterpret_cast<const int8_t*>(block + 2);
+        local += a_row[k] * static_cast<float>(qs[lane]) * f16_bits_to_f32(scale_bits);
+    }
+    partials[warp][lane] = local;
+    __syncthreads();
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < WARPS; ++w) {
+        sum += partials[w][lane];
+    }
+    C[static_cast<size_t>(m) * N + n] = sum;
+}
+
+template <int WARPS>
+__global__ void sgemm_nt_q8_0_warp_kernel(const float* A, const uint8_t* B, float* C,
+                                          int M, int N, int K) {
+    constexpr int warp_size = 32;
+    constexpr int block_bytes = 34;
+    const int lane = threadIdx.x & (warp_size - 1);
+    const int warp = threadIdx.x >> 5;
+    const int n = blockIdx.x * WARPS + warp;
+    const int m = blockIdx.y;
+    if (m >= M || n >= N) return;
+
+    const float* a_row = A + static_cast<size_t>(m) * K;
+    const uint8_t* b_row = B + static_cast<size_t>(n) * (K / warp_size) * block_bytes;
+    float local = 0.0f;
+    for (int qb = 0; qb < K / warp_size; ++qb) {
+        const uint8_t* block = b_row + static_cast<size_t>(qb) * block_bytes;
+        uint16_t scale_bits = 0;
+        if (lane == 0) scale_bits = load_u16_le(block);
+        scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0);
+        const auto* qs = reinterpret_cast<const int8_t*>(block + 2);
+        local += a_row[qb * warp_size + lane] *
+                 static_cast<float>(qs[lane]) * f16_bits_to_f32(scale_bits);
+    }
+    const float sum = warp_reduce_sum(local);
+    if (lane == 0) C[static_cast<size_t>(m) * N + n] = sum;
+}
+
 template <typename W, int BLOCK>
 __global__ void rmsnorm_kernel(const float* x, const W* gamma, float* y,
                                int rows, int hidden, float eps) {
@@ -276,6 +393,36 @@ __global__ void embedding_kernel(const W* weight, const int* ids, float* out,
     const W* src = weight + static_cast<size_t>(id) * hidden;
     for (int h = threadIdx.x; h < hidden; h += BLOCK) {
         dst[h] = weight_to_f32(src[h]);
+    }
+}
+
+template <int WARPS>
+__global__ void embedding_q8_0_warp_kernel(const uint8_t* weight, const int* ids, float* out,
+                                           int seq_len, int vocab_size, int hidden) {
+    constexpr int warp_size = 32;
+    constexpr int block_bytes = 34;
+    const int lane = threadIdx.x & (warp_size - 1);
+    const int warp = threadIdx.x >> 5;
+    int s = blockIdx.x;
+    if (s >= seq_len) return;
+    int id = ids[s];
+    float* dst = out + static_cast<size_t>(s) * hidden;
+    if (id < 0 || id >= vocab_size) {
+        for (int h = threadIdx.x; h < hidden; h += WARPS * warp_size) {
+            dst[h] = 0.0f;
+        }
+        return;
+    }
+    const int blocks_per_row = hidden / warp_size;
+    const uint8_t* row = weight + static_cast<size_t>(id) * blocks_per_row * block_bytes;
+    for (int qb = warp; qb < blocks_per_row; qb += WARPS) {
+        const uint8_t* block = row + static_cast<size_t>(qb) * block_bytes;
+        uint16_t scale_bits = 0;
+        if (lane == 0) scale_bits = load_u16_le(block);
+        scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0);
+        const auto* qs = reinterpret_cast<const int8_t*>(block + 2);
+        dst[qb * warp_size + lane] =
+            static_cast<float>(qs[lane]) * f16_bits_to_f32(scale_bits);
     }
 }
 
@@ -401,6 +548,95 @@ __global__ void sdpa_kernel(const float* q, const float* k, const float* v, floa
         }
         l = l * alpha + beta;
         m = new_m;
+    }
+
+    if (tid < head_dim) {
+        out_vec[tid] = acc / l;
+    }
+}
+
+template <int BLOCK, int TILE>
+__global__ void flash_sdpa_tiled_kernel(const float* q, const float* k, const float* v,
+                                        float* out, int batch, int q_len,
+                                        int num_heads, int num_kv_heads,
+                                        int head_dim, bool causal) {
+    extern __shared__ float shared[];
+    float* q_s = shared;
+    float* k_s = q_s + head_dim;
+    float* v_s = k_s + TILE * head_dim;
+    float* scores = v_s + TILE * head_dim;
+
+    const int q_pos = blockIdx.x;
+    const int b = blockIdx.y;
+    const int qh = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const int group = num_heads / num_kv_heads;
+    const int kvh = qh / group;
+    const size_t q_hidden = static_cast<size_t>(num_heads) * head_dim;
+    const size_t kv_hidden = static_cast<size_t>(num_kv_heads) * head_dim;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+
+    const float* q_vec = q + static_cast<size_t>(b) * q_len * q_hidden +
+                         static_cast<size_t>(q_pos) * q_hidden +
+                         static_cast<size_t>(qh) * head_dim;
+    float* out_vec = out + static_cast<size_t>(b) * q_len * q_hidden +
+                     static_cast<size_t>(q_pos) * q_hidden +
+                     static_cast<size_t>(qh) * head_dim;
+
+    for (int d = tid; d < head_dim; d += BLOCK) {
+        q_s[d] = q_vec[d];
+    }
+    __syncthreads();
+
+    const int valid_keys = causal ? (q_pos + 1) : q_len;
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (int tile_start = 0; tile_start < valid_keys; tile_start += TILE) {
+        const int tile_count = min(TILE, valid_keys - tile_start);
+        const int tile_elems = tile_count * head_dim;
+
+        for (int idx = tid; idx < tile_elems; idx += BLOCK) {
+            const int t = idx / head_dim;
+            const int d = idx - t * head_dim;
+            const size_t base = static_cast<size_t>(b) * q_len * kv_hidden +
+                                static_cast<size_t>(tile_start + t) * kv_hidden +
+                                static_cast<size_t>(kvh) * head_dim + d;
+            k_s[idx] = k[base];
+            v_s[idx] = v[base];
+        }
+        __syncthreads();
+
+        float tile_m = -FLT_MAX;
+        for (int t = 0; t < tile_count; ++t) {
+            float partial = 0.0f;
+            for (int d = tid; d < head_dim; d += BLOCK) {
+                partial += q_s[d] * k_s[t * head_dim + d];
+            }
+            const float score = block_reduce_sum<BLOCK>(partial) * scale;
+            if (tid == 0) scores[t] = score;
+            tile_m = fmaxf(tile_m, score);
+        }
+        __syncthreads();
+
+        const float new_m = fmaxf(m, tile_m);
+        const float alpha = expf(m - new_m);
+        float beta_sum = 0.0f;
+        if (tid < head_dim) {
+            acc *= alpha;
+        }
+        for (int t = 0; t < tile_count; ++t) {
+            const float beta = expf(scores[t] - new_m);
+            beta_sum += beta;
+            if (tid < head_dim) {
+                acc += beta * v_s[t * head_dim + tid];
+            }
+        }
+        l = l * alpha + beta_sum;
+        m = new_m;
+        __syncthreads();
     }
 
     if (tid < head_dim) {
@@ -583,12 +819,52 @@ Status sgemm_impl(const float* A, const W* B, float* C, int M, int N, int K,
     return launch_status("cuda sgemm launch failed");
 }
 
+Status sgemm_reference(const float* A, const float* B, float* C, int M, int N, int K) {
+    return sgemm_impl(A, B, C, M, N, K, "sgemm_reference");
+}
+
+Status sgemm_cublas(const float* A, const float* B, float* C, int M, int N, int K) {
+    const char* ctx = "sgemm_cublas";
+    RETURN_IF_ERROR(require_all_non_null(ctx, A, "A", B, "B", C, "C"));
+    RETURN_IF_ERROR(validate_positive_dims(ctx, {{M, "M"}, {N, "N"}, {K, "K"}}));
+    RETURN_IF_ERROR(validate_gemm_sizes(M, N, K, ctx));
+
+    cublasHandle_t handle = nullptr;
+    RETURN_IF_ERROR(cublas_handle(handle));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    auto st = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                          N, M, K, &alpha,
+                          B, N,
+                          A, K,
+                          &beta, C, N);
+    return cublas_status(st, "cublasSgemm row-major NN failed");
+}
+
 Status sgemm(const float* A, const float* B, float* C, int M, int N, int K) {
-    return sgemm_impl(A, B, C, M, N, K, "sgemm");
+    return sgemm_cublas(A, B, C, M, N, K);
 }
 
 Status sgemm(const float* A, const uint16_t* B_bf16, float* C, int M, int N, int K) {
     return sgemm_impl(A, B_bf16, C, M, N, K, "sgemm_bf16_weight");
+}
+
+Status sgemm(const float* A, const uint8_t* B_q8_0, float* C, int M, int N, int K) {
+    const char* ctx = "sgemm_q8_0_weight";
+    RETURN_IF_ERROR(require_all_non_null(ctx, A, "A", B_q8_0, "B", C, "C"));
+    RETURN_IF_ERROR(validate_positive_dims(ctx, {{M, "M"}, {N, "N"}, {K, "K"}}));
+    if (K % 32 != 0 || N % 32 != 0) {
+        return Status::unsupported("cuda sgemm Q8_0 requires K and N to be multiples of 32");
+    }
+    RETURN_IF_ERROR(validate_gemm_sizes(M, N, K, ctx));
+    RETURN_IF_ERROR(require_grid_x(static_cast<size_t>(N), "sgemm_q8_0 grid.x"));
+    RETURN_IF_ERROR(require_grid_x(static_cast<size_t>(M), "sgemm_q8_0 grid.y"));
+
+    constexpr int warps = 8;
+    constexpr int block = warps * 32;
+    dim3 grid(static_cast<unsigned>(N / 32), static_cast<unsigned>(M));
+    sgemm_q8_0_nblock_kernel<warps><<<grid, block>>>(A, B_q8_0, C, M, N, K);
+    return launch_status("cuda sgemm Q8_0 launch failed");
 }
 
 template <typename W>
@@ -609,12 +885,54 @@ Status sgemm_nt_impl(const float* A, const W* B, float* C, int M, int N, int K,
     return launch_status("cuda sgemm_nt launch failed");
 }
 
+Status sgemm_nt_reference(const float* A, const float* B, float* C, int M, int N, int K) {
+    return sgemm_nt_impl(A, B, C, M, N, K, "sgemm_nt_reference");
+}
+
+Status sgemm_nt_cublas(const float* A, const float* B, float* C, int M, int N, int K) {
+    const char* ctx = "sgemm_nt_cublas";
+    RETURN_IF_ERROR(require_all_non_null(ctx, A, "A", B, "B", C, "C"));
+    RETURN_IF_ERROR(validate_positive_dims(ctx, {{M, "M"}, {N, "N"}, {K, "K"}}));
+    RETURN_IF_ERROR(validate_gemm_sizes(M, N, K, ctx));
+
+    cublasHandle_t handle = nullptr;
+    RETURN_IF_ERROR(cublas_handle(handle));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    auto st = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                          N, M, K, &alpha,
+                          B, K,
+                          A, K,
+                          &beta, C, N);
+    return cublas_status(st, "cublasSgemm row-major NT failed");
+}
+
 Status sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K) {
-    return sgemm_nt_impl(A, B, C, M, N, K, "sgemm_nt");
+    return sgemm_nt_cublas(A, B, C, M, N, K);
 }
 
 Status sgemm_nt(const float* A, const uint16_t* B_bf16, float* C, int M, int N, int K) {
     return sgemm_nt_impl(A, B_bf16, C, M, N, K, "sgemm_nt_bf16_weight");
+}
+
+Status sgemm_nt(const float* A, const uint8_t* B_q8_0, float* C, int M, int N, int K) {
+    const char* ctx = "sgemm_nt_q8_0_weight";
+    RETURN_IF_ERROR(require_all_non_null(ctx, A, "A", B_q8_0, "B", C, "C"));
+    RETURN_IF_ERROR(validate_positive_dims(ctx, {{M, "M"}, {N, "N"}, {K, "K"}}));
+    if (K % 32 != 0) {
+        return Status::unsupported("cuda sgemm_nt Q8_0 requires K to be a multiple of 32");
+    }
+    RETURN_IF_ERROR(validate_gemm_sizes(M, N, K, ctx));
+    RETURN_IF_ERROR(require_grid_x(static_cast<size_t>(N), "sgemm_nt_q8_0 grid.x"));
+    RETURN_IF_ERROR(require_grid_x(static_cast<size_t>(M), "sgemm_nt_q8_0 grid.y"));
+
+    constexpr int warps = 8;
+    constexpr int block = warps * 32;
+    const size_t gx = (static_cast<size_t>(N) + warps - 1) / warps;
+    RETURN_IF_ERROR(require_grid_x(gx, "sgemm_nt_q8_0 grid.x"));
+    dim3 grid(static_cast<unsigned>(gx), static_cast<unsigned>(M));
+    sgemm_nt_q8_0_warp_kernel<warps><<<grid, block>>>(A, B_q8_0, C, M, N, K);
+    return launch_status("cuda sgemm_nt Q8_0 launch failed");
 }
 
 Status add(const float* a, const float* b, float* y, int n) {
@@ -733,6 +1051,27 @@ Status embedding(const uint16_t* weight_bf16, const int* ids, float* out,
                           "embedding_bf16_weight");
 }
 
+Status embedding(const uint8_t* weight_q8_0, const int* ids, float* out,
+                 int seq_len, int vocab_size, int hidden) {
+    const char* ctx = "embedding_q8_0_weight";
+    RETURN_IF_ERROR(require_all_non_null(ctx, weight_q8_0, "weight", ids, "ids", out, "out"));
+    RETURN_IF_ERROR(validate_positive_dims(ctx,
+                                {{seq_len, "seq_len"}, {vocab_size, "vocab_size"}, {hidden, "hidden"}}));
+    if (hidden % 32 != 0) {
+        return Status::unsupported("cuda embedding Q8_0 requires hidden to be a multiple of 32");
+    }
+
+    size_t elems = 0;
+    RETURN_IF_ERROR(checked_mul_size(static_cast<size_t>(vocab_size), static_cast<size_t>(hidden), elems, "embedding Q8_0 weight"));
+    RETURN_IF_ERROR(checked_mul_size(static_cast<size_t>(seq_len), static_cast<size_t>(hidden), elems, "embedding Q8_0 output"));
+
+    constexpr int warps = 8;
+    constexpr int block = warps * 32;
+    embedding_q8_0_warp_kernel<warps><<<seq_len, block>>>(
+        weight_q8_0, ids, out, seq_len, vocab_size, hidden);
+    return launch_status("cuda embedding Q8_0 launch failed");
+}
+
 Status apply_rope(const float* x, float* y, int tokens, int num_heads,
                   int head_dim, float base, int pos_offset) {
     RETURN_IF_ERROR(require_all_non_null("rope", x, "x", y, "y"));
@@ -821,10 +1160,17 @@ Status sdpa(const float* q, const float* k, const float* v, float* out,
                                       static_cast<size_t>(num_kv_heads) * head_dim, elems, "sdpa k/v elements"));
 
     constexpr int block = 256;
+    constexpr int tile = 16;
     dim3 grid(q_len, batch, num_heads);
-    sdpa_kernel<block><<<grid, block>>>(q, k, v, out, batch, q_len,
-                                        num_heads, num_kv_heads, head_dim, causal);
-    return launch_status("cuda sdpa launch failed");
+    const size_t shared_floats =
+        static_cast<size_t>(head_dim) + 2 * static_cast<size_t>(tile) * head_dim + tile;
+    const size_t shared_bytes = shared_floats * sizeof(float);
+    if (shared_bytes > 48 * 1024) {
+        return Status::unsupported("cuda flash SDPA shared-memory tile exceeds 48 KiB");
+    }
+    flash_sdpa_tiled_kernel<block, tile><<<grid, block, shared_bytes>>>(
+        q, k, v, out, batch, q_len, num_heads, num_kv_heads, head_dim, causal);
+    return launch_status("cuda flash SDPA launch failed");
 }
 
 Status paged_attention_decode(const float* q, const float* k_cache,

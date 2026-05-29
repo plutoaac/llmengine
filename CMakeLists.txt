@@ -103,7 +103,7 @@ if(MINILLM_ENABLE_CUDA)
     target_compile_definitions(minillm_core PUBLIC MINILLM_ENABLE_CUDA=1)
     target_compile_definitions(minillm_runtime PUBLIC MINILLM_ENABLE_CUDA=1)
     target_link_libraries(minillm_core PUBLIC CUDA::cudart)
-    target_link_libraries(minillm_runtime PUBLIC CUDA::cudart)
+    target_link_libraries(minillm_runtime PUBLIC CUDA::cudart CUDA::cublas)
 endif()
 
 # Model library

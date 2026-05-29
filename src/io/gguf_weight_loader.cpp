@@ -99,6 +99,22 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
 
     if (tensor.device().type == DeviceType::CUDA) {
 #if defined(MINILLM_ENABLE_CUDA)
+        if (ti.dtype == GgmlDataType::Q8_0 && tensor.dtype() == DType::Q8_0) {
+            auto expected_bytes_exp = ti.bytes();
+            if (!expected_bytes_exp) return expected_bytes_exp.error();
+            const size_t expected_bytes = *expected_bytes_exp;
+            if (raw_view.size() < expected_bytes) {
+                return Status::out_of_range(
+                    "Q8_0 raw view too small for CUDA tensor " + tensor.name());
+            }
+            if (tensor.allocated_bytes() < expected_bytes) {
+                return Status::out_of_range(
+                    "CUDA Q8_0 tensor storage too small for " + tensor.name());
+            }
+            auto err = cudaMemcpy(tensor.data(), raw_view.data(), expected_bytes,
+                                  cudaMemcpyHostToDevice);
+            return cuda_status(err, "copy Q8_0 GGUF weight to CUDA tensor failed");
+        }
         if (tensor.dtype() == DType::BFloat16) {
             if (ti.dtype != GgmlDataType::BF16) {
                 return Status::unsupported(
@@ -114,13 +130,17 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
                 return Status::out_of_range(
                     "BF16 raw view too small for CUDA tensor " + tensor.name());
             }
+            if (tensor.allocated_bytes() < expected_bytes) {
+                return Status::out_of_range(
+                    "CUDA BF16 tensor storage too small for " + tensor.name());
+            }
             auto err = cudaMemcpy(tensor.data(), raw_view.data(), expected_bytes,
                                   cudaMemcpyHostToDevice);
             return cuda_status(err, "copy BF16 GGUF weight to CUDA tensor failed");
         }
         if (tensor.dtype() != DType::Float32) {
             return Status::unsupported(
-                "CUDA GGUF weight loader supports Float32 and native BF16 tensors only: " +
+                "CUDA GGUF weight loader supports Float32, native BF16, and native Q8_0 tensors only: " +
                 tensor.name());
         }
         std::vector<float> staging(num_el);
@@ -143,6 +163,9 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
         if (raw_view.size() < expected_bytes) {
             return Status::out_of_range("Q8_0 raw view too small for tensor " + tensor.name());
         }
+        if (tensor.allocated_bytes() < expected_bytes) {
+            return Status::out_of_range("Q8_0 tensor storage too small for " + tensor.name());
+        }
         std::memcpy(tensor.data(), raw_view.data(), expected_bytes);
         return Status::make_ok();
     }
@@ -157,6 +180,9 @@ Status load_tensor_from_gguf(const std::string& gguf_path, const GGUFFile& file,
         const size_t expected_bytes = num_el * sizeof(uint16_t);
         if (raw_view.size() < expected_bytes) {
             return Status::out_of_range("BF16 raw view too small for tensor " + tensor.name());
+        }
+        if (tensor.allocated_bytes() < expected_bytes) {
+            return Status::out_of_range("BF16 tensor storage too small for " + tensor.name());
         }
         std::memcpy(tensor.data(), raw_view.data(), expected_bytes);
         return Status::make_ok();
@@ -496,21 +522,29 @@ std::expected<SharedWeightStore, Status> WeightLoader::load_shared_weights(
         Tensor* shared_tensor = nullptr;
         auto existing = store.storage_by_gguf_name_.find(gguf_name);
         if (existing == store.storage_by_gguf_name_.end()) {
-            // Keep BF16 GGUF weights in native 16-bit storage on CUDA; other
-            // CUDA weight formats still dequantize to FP32 until kernels support them.
+            // Keep CUDA-native formats packed when a dedicated kernel path exists.
             DType tensor_dtype = ggml_to_dtype(info_it->second->dtype);
-            if (v.device.type == DeviceType::CUDA && tensor_dtype != DType::BFloat16) {
+            if (v.device.type == DeviceType::CUDA &&
+                tensor_dtype != DType::BFloat16 && tensor_dtype != DType::Q8_0) {
                 tensor_dtype = DType::Float32;
             }
             auto tensor = std::make_unique<Tensor>(v.name, v.shape, tensor_dtype, v.device);
             Status st;
             size_t loaded_bytes = 0;
             if (v.device.type == DeviceType::CUDA) {
-                st = tensor->allocate_cuda();
-                if (!st.ok()) return std::unexpected(st);
-                auto bytes = tensor->nbytes();
-                if (!bytes) return std::unexpected(bytes.error());
-                loaded_bytes = *bytes;
+                if (tensor_dtype == DType::Q8_0) {
+                    auto raw_bytes = info_it->second->bytes();
+                    if (!raw_bytes) return std::unexpected(raw_bytes.error());
+                    st = tensor->allocate_cuda_bytes(*raw_bytes);
+                    if (!st.ok()) return std::unexpected(st);
+                    loaded_bytes = *raw_bytes;
+                } else {
+                    st = tensor->allocate_cuda();
+                    if (!st.ok()) return std::unexpected(st);
+                    auto bytes = tensor->nbytes();
+                    if (!bytes) return std::unexpected(bytes.error());
+                    loaded_bytes = *bytes;
+                }
             } else if (tensor_dtype == DType::Q8_0) {
                 auto raw_bytes = info_it->second->bytes();
                 if (!raw_bytes) return std::unexpected(raw_bytes.error());

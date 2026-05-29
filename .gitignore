@@ -1,4 +1,5 @@
 build/
+build-*/
 build-cuda/
 *.o
 *.a

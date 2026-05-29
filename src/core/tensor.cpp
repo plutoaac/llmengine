@@ -63,6 +63,12 @@ std::expected<size_t, Status> Tensor::nbytes() const {
     return *n * *s;
 }
 
+size_t Tensor::allocated_bytes() const {
+    if (external_data_) return external_bytes_;
+    if (cuda_storage_) return cuda_bytes_;
+    return storage_.size();
+}
+
 bool Tensor::is_allocated() const {
     return external_data_ != nullptr || !storage_.empty() || cuda_storage_ != nullptr;
 }
@@ -123,6 +129,32 @@ Status Tensor::allocate_cuda() {
     device_ = Device::cuda(device_.index);
     return Status::make_ok();
 #else
+    return Status::unsupported("MiniLLMEngine was built without CUDA support");
+#endif
+}
+
+Status Tensor::allocate_cuda_bytes(size_t bytes) {
+    const int device_index = device_.index;
+    auto st = release();
+    if (!st.ok()) return st;
+#if defined(MINILLM_ENABLE_CUDA)
+    cudaError_t err = cudaSetDevice(device_index);
+    if (err != cudaSuccess) {
+        return Status::runtime_error(
+            "cudaSetDevice failed: " + std::string(cudaGetErrorString(err)));
+    }
+    err = cudaMalloc(&cuda_storage_, bytes);
+    if (err != cudaSuccess) {
+        cuda_storage_ = nullptr;
+        cuda_bytes_ = 0;
+        return Status::runtime_error(
+            "cudaMalloc failed: " + std::string(cudaGetErrorString(err)));
+    }
+    cuda_bytes_ = bytes;
+    device_ = Device::cuda(device_index);
+    return Status::make_ok();
+#else
+    (void)bytes;
     return Status::unsupported("MiniLLMEngine was built without CUDA support");
 #endif
 }

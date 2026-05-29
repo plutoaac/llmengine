@@ -299,9 +299,9 @@ The CPU runtime keeps activations, intermediate tensors, logits, and KV cache in
 | F32 | `Float32` | copied as FP32 |
 | F16 | `Float32` | expanded to FP32 during loading |
 | BF16 | `BFloat16` | stored as 16-bit BF16; `Embedding`, `Linear`, and `MatMul` read weights and accumulate into FP32 outputs |
-| Q8_0 | `Q8_0` | stored as raw GGML `block_q8_0`; CPU weight-only kernels dequantize blocks on the fly and accumulate in FP32 |
+| Q8_0 | `Q8_0` | stored as raw GGML `block_q8_0`; CPU/CUDA weight-only kernels dequantize blocks on the fly and accumulate in FP32 |
 
-The Q8_0 implementation is deliberately a small reference-quality path, not a production quantized GEMM. It proves the important systems boundary: weights stay compressed in `SharedWeightStore`, while activations and accumulators remain FP32. Packed dimensions are checked conservatively: `Linear`/`Embedding` check the contiguous weight row, while `MatMul` checks both the reduction dimension and output dimension so block boundaries stay explicit.
+The Q8_0 implementation is deliberately a small reference-quality path, not a production quantized GEMM. It proves the important systems boundary: weights stay compressed in `SharedWeightStore`, while activations and accumulators remain FP32. Packed dimensions are checked conservatively: `Linear`/`Embedding` check the contiguous weight row, while `MatMul` checks both the reduction dimension and output dimension so block boundaries stay explicit. CUDA follows the same storage contract and reads GGUF raw blocks directly from device memory.
 
 The CPU attention path now has two implementations. `sdpa()` is the straightforward reference-style implementation that materializes a score row, applies softmax, and then multiplies by V. `flash_sdpa()` and `flash_sdpa_decode()` use tiled K/V traversal with online softmax state:
 
@@ -333,10 +333,14 @@ Current CUDA scope:
 - FP32 single-sequence and batched PagedAttention decode over device block tables
 - FP32 `Transpose`
 - dtype-preserving CUDA `Reshape` through device-to-device copy
+- cuBLAS-backed FP32 `Linear`/`MatMul`
+- retained handwritten FP32 `sgemm_reference`/`sgemm_nt_reference` kernels for debugging and explanation
+- shared-memory tiled FlashAttention-style no-cache SDPA with online softmax
+- Q8_0 `Embedding`, `Linear`, and `MatMul` weight-only kernels with warp/tile raw GGUF block reads and FP32 accumulation
 - GGUF F32/F16/BF16/Q8_0 weight staging into CUDA tensors for generation smoke tests
 - single-batch CUDA generation with a contiguous device KV cache
 
-The kernels are intentionally straightforward. `sgemm` uses a tiled shared-memory path, `sgemm_nt` matches transformer weights stored as `[out_features, in_features]`, RMSNorm and Softmax use block reductions, RoPE computes sin/cos on the fly, and attention kernels support GQA by mapping query heads to KV heads. CUDA SDPA and decode attention use an online-softmax fused shape, but the CUDA path does not yet implement a full shared-memory tiled FlashAttention kernel.
+The kernels are intentionally straightforward where that helps readability. The hot CUDA matrix path delegates FP32 GEMM to cuBLAS, while the handwritten FP32 GEMM kernels are still exposed as reference/debug entry points. The no-cache SDPA path uses a shared-memory K/V tile with online softmax, while decode attention keeps a compact online-softmax kernel over the contiguous or paged KV cache. Q8_0 kernels keep the GGUF raw block layout and use warp-level block dequant/reduction to avoid scalar per-element scale reloads. This is still not a full FA2/cuBLASLt production stack, but it is past the purely teaching-kernel stage.
 
 The CUDA path is experimental and disabled by default:
 
@@ -350,9 +354,9 @@ By default the CUDA build targets `sm_86`, which matches the RTX 30-series GPU u
 The `test_cuda_kernels` executable validates:
 
 - elementwise ops and fused SwiGLU
-- `sgemm`, `sgemm_nt`, and Linear bias add
+- cuBLAS-backed `sgemm`, `sgemm_nt`, handwritten GEMM reference kernels, Linear bias add, and Q8_0 GEMM/embedding kernels
 - RMSNorm, Embedding, RoPE, Softmax, and Transpose
-- no-cache SDPA with GQA
+- shared-memory tiled no-cache SDPA with GQA
 - paged decode attention with non-contiguous single-sequence and batched block tables
 - `CudaExecutor` dispatch on a small graph
 - custom `rope_base` attribute through the CUDA adapter
@@ -362,7 +366,7 @@ What is not implemented yet:
 
 - CUDA paged-cache integration in the full generation loop
 - production serving integration around the toy paged attention scheduler
-- CUDA quantized matmul
+- FA2-style multi-query attention tiling and production-grade quantized GEMM tuning
 
 The current GPU smoke path is `generate_cuda`. It builds the graph on `Device::cuda(0)`, binds shared weights, allocates intermediate tensors through `allocate_intermediates_planned()` with per-device arena buffers, lets `WeightLoader` copy weights to device memory, and runs end-to-end generation with a contiguous CUDA `KVCache` before copying logits back to the host for validation.
 
@@ -423,7 +427,7 @@ With a cache, the runtime uses separate prefill and decode behavior.
 Prefill:
 
 1. K/V for the full prompt are copied into `KVCache`.
-2. attention is computed over the prompt with the FlashAttention-style CPU path or CUDA online-softmax SDPA.
+2. attention is computed over the prompt with the FlashAttention-style CPU path or shared-memory tiled CUDA SDPA.
 3. after the graph completes, the executor advances the cache by `prompt_len`.
 
 Decode:
@@ -537,9 +541,9 @@ Currently supported weight data types:
 - F32 copied as FP32
 - F16 expanded to FP32
 - BF16 copied as native BF16 weight storage on CPU and CUDA
-- Q8_0 copied as raw compressed CPU weight storage, with CPU weight-only `Embedding`/`Linear`/`MatMul` kernels
+- Q8_0 copied as raw compressed CPU or CUDA weight storage, with weight-only `Embedding`/`Linear`/`MatMul` kernels
 
-When built with `MINILLM_ENABLE_CUDA=ON`, `WeightLoader` keeps BF16 GGUF weights native on device and stages other formats through FP32 unless a dedicated CUDA path exists. CUDA quantized matmul is intentionally future work.
+When built with `MINILLM_ENABLE_CUDA=ON`, `WeightLoader` keeps BF16 GGUF weights native on device, copies Q8_0 raw GGUF blocks into device byte storage, and stages other formats through FP32 unless a dedicated CUDA path exists.
 
 For generation, `WeightLoader::load_shared_weights()` returns a `SharedWeightStore` instead of immediately copying into one context. The store owns CPU or CUDA tensors according to the graph device, while each `RuntimeContext` only binds pointers to those tensors:
 
@@ -557,8 +561,8 @@ The tokenizer layer is intentionally kept replaceable. The current in-tree
 `BPETokenizer` is the default backend, but a third-party implementation can be
 plugged in later without changing the runtime or examples.
 
-Q8_0 GGUF tensors can be expanded during weight loading. True quantized
-matmul kernels are a future extension.
+Q8_0 GGUF tensors stay compressed during weight loading. The weight kernels
+read each block scale and int8 payload on demand, then accumulate into FP32.
 
 ## GGUF mmap Weight Loading
 
@@ -582,9 +586,10 @@ flowchart TD
     Raw --> Select["WeightLoader dtype dispatch"]
     Select --> F32["F32 / F16 -> CPU Float32"]
     Select --> BF16["BF16 -> native BFloat16 tensor"]
-    Select --> Q8["Q8_0 -> raw CPU Q8_0 blocks"]
+    Select --> Q8["Q8_0 -> raw CPU/CUDA Q8_0 blocks"]
     F32 -. "CUDA non-BF16" .-> CudaF32["host F32 staging -> cudaMemcpy"]
     BF16 -. "CUDA BF16" .-> CudaBF16["raw BF16 cudaMemcpy"]
+    Q8 -. "CUDA Q8_0" .-> CudaQ8["raw block_q8_0 cudaMemcpy"]
 ```
 
 This keeps model loading easy to explain:
@@ -593,7 +598,7 @@ This keeps model loading easy to explain:
 - tensor bytes are not copied into an intermediate raw buffer on the mmap path
 - F16 expands to FP32 because there is no CPU F16 kernel surface
 - BF16 stays native for weight-only CPU/CUDA kernels
-- CPU Q8_0 stores compressed GGML blocks and dequantizes inside the weight kernel
+- CPU/CUDA Q8_0 stores compressed GGML blocks and dequantizes inside the weight kernel
 - malformed tensor ranges fail before any dtype conversion or copy starts
 
 ## Testing Strategy
@@ -608,7 +613,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_graph_builder` | shape inference and builder-level validation |
 | `test_cpu_kernels` | direct numerical checks for low-level CPU kernels, including FlashAttention-style SDPA |
 | `test_runtime` | executor integration, KV cache, embedding, linear bias, graph ops |
-| `test_gguf_parser` | GGUF parsing, metadata, mmap tensor views, tensor reading, F16/BF16 conversion, shared tied-weight binding |
+| `test_gguf_parser` | GGUF parsing, metadata, mmap tensor views, tensor reading, F16/BF16 conversion, Q8_0 raw loading, shared tied-weight binding |
 | `test_memory_planner` | graph liveness, buffer reuse planning, planned CPU/CUDA arena binding, skip reasons, report output |
 | `test_paged_kv_cache` | paged block allocation, sequence free/reuse, paged decode attention |
 | `test_paged_attention_scheduler` | active sequence batching, padded block tables, CPU multi-sequence decode |
@@ -616,7 +621,7 @@ The project uses small focused tests instead of relying only on end-to-end gener
 | `test_e2e_verification` | contiguous vs paged KV numerical alignment, multi-sequence paged decode, block reuse |
 | `test_transformer_graph_builder` | transformer weight naming and RoPE base propagation |
 | `test_bpe_tokenizer` | tokenizer initialization and boundary behavior |
-| `test_cuda_kernels` | CUDA kernels, single/batched CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
+| `test_cuda_kernels` | CUDA kernels, Q8_0 weight-only kernels, single/batched CUDA paged decode, and CUDA executor dispatch, only built with `MINILLM_ENABLE_CUDA=ON` |
 
 For end-to-end model alignment, `scripts/compare_llama_completion.py` runs the
 same Qwen3 prompt through `examples/generate` and `llama-completion`, then
@@ -640,7 +645,7 @@ MiniLLMEngine is intentionally CPU-first and small. It does not currently implem
 - continuous batching and a production request scheduler
 - prefix cache and block sharing across requests
 - full llama.cpp tokenizer parity across all model families
-- CUDA quantized kernels
+- FA2/cuBLASLt-level CUDA attention and production-tuned quantized kernels
 - Metal / Vulkan backends
 
 These are valid future extensions, but they are not required for the project's current purpose.
@@ -687,11 +692,11 @@ This project is useful to discuss:
 - how CUDA paged decode reads K/V through device block tables
 - how CUDA generation uses a device-side contiguous KV cache for prefill/decode
 - how shared GGUF weights avoid loading parameters once per generation graph
-- how GGUF weights can stay native BF16 or CPU Q8_0 instead of always expanding to FP32
+- how GGUF weights can stay native BF16 or raw CPU/CUDA Q8_0 instead of always expanding to FP32
 - how to test numerical kernels separately from runtime integration
 
 Good follow-up improvements:
 
-- optimize the CPU Q8_0 path with SIMD dot kernels and packed layouts
+- optimize the CPU Q8_0 path with SIMD and continue tuning CUDA low-bit packed layouts
 - connect the toy scheduler to an end-to-end decode loop
 - extend memory planner to handle KV cache buffer reuse

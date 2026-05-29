@@ -34,6 +34,7 @@ public:
 
     std::expected<size_t, Status> numel() const;
     std::expected<size_t, Status> nbytes() const;
+    size_t allocated_bytes() const;
 
     bool is_allocated() const;
     void* data();
@@ -41,6 +42,7 @@ public:
 
     Status allocate_cpu();
     Status allocate_cuda();
+    Status allocate_cuda_bytes(size_t bytes);
     Status release();
     Status allocate_cpu_bytes(size_t bytes);
     Status bind_cpu_data(void* data, size_t bytes);

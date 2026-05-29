@@ -7,10 +7,19 @@
 
 namespace minillm::cuda {
 
+// FP32 fast path used by inference: row-major wrappers over cuBLAS.
 Status sgemm(const float* A, const float* B, float* C, int M, int N, int K);
 Status sgemm(const float* A, const uint16_t* B_bf16, float* C, int M, int N, int K);
+Status sgemm(const float* A, const uint8_t* B_q8_0, float* C, int M, int N, int K);
 Status sgemm_nt(const float* A, const float* B, float* C, int M, int N, int K);
 Status sgemm_nt(const float* A, const uint16_t* B_bf16, float* C, int M, int N, int K);
+Status sgemm_nt(const float* A, const uint8_t* B_q8_0, float* C, int M, int N, int K);
+
+// Handwritten FP32 CUDA GEMM kernels kept for learning, debugging, and
+// correctness comparisons. Runtime inference uses sgemm()/sgemm_nt() above.
+Status sgemm_reference(const float* A, const float* B, float* C, int M, int N, int K);
+Status sgemm_nt_reference(const float* A, const float* B, float* C, int M, int N, int K);
+
 Status add(const float* a, const float* b, float* y, int n);
 Status add_bias(float* y, const float* bias, int rows, int cols);
 Status add_bias(float* y, const uint16_t* bias_bf16, int rows, int cols);
@@ -24,6 +33,8 @@ Status rmsnorm(const float* x, const uint16_t* gamma_bf16, float* y,
 Status embedding(const float* weight, const int* ids, float* out,
                  int seq_len, int vocab_size, int hidden);
 Status embedding(const uint16_t* weight_bf16, const int* ids, float* out,
+                 int seq_len, int vocab_size, int hidden);
+Status embedding(const uint8_t* weight_q8_0, const int* ids, float* out,
                  int seq_len, int vocab_size, int hidden);
 Status apply_rope(const float* x, float* y, int tokens, int num_heads,
                   int head_dim, float base, int pos_offset);

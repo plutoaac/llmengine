@@ -757,6 +757,63 @@ void test_cuda_bf16_shared_weight_load() {
         ASSERT_EQ(got[i], raw_bf16[i]);
     }
 }
+
+void test_cuda_q8_0_shared_weight_load() {
+    int device_count = 0;
+    auto err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count == 0) {
+        std::cout << "  SKIP test_cuda_q8_0_shared_weight_load: no CUDA device\n";
+        return;
+    }
+    ASSERT_TRUE(cudaSetDevice(0) == cudaSuccess);
+
+    std::string path = temp_path("test_minillm_cuda_q8_weight.gguf");
+    std::vector<int8_t> values(2 * 32);
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = static_cast<int8_t>((static_cast<int>(i) * 5) % 29 - 14);
+    }
+    auto packed = pack_q8_0_scale1(values);
+    {
+        GgufWriter w(path);
+        w.add_meta_string("general.architecture", "llama");
+        w.add_tensor_q8_0("token_embd.weight", 2, 32, packed);
+        w.write();
+    }
+
+    WeightLoader loader(path);
+    auto file = loader.open();
+    ASSERT_TRUE(file.has_value());
+
+    Graph graph;
+    auto tok = graph.add_value("tok_embeddings.weight", Shape({2, 32}),
+                               DType::Float32, Device::cuda(0), ValueKind::Constant);
+    ASSERT_TRUE(tok.has_value());
+
+    auto store = loader.load_shared_weights(*file, graph);
+    ASSERT_TRUE(store.has_value());
+    ASSERT_EQ(store->tensor_count(), size_t(1));
+    ASSERT_EQ(store->alias_count(), size_t(1));
+    ASSERT_EQ(store->total_bytes(), packed.size());
+
+    Tensor* t = store->get("tok_embeddings.weight");
+    ASSERT_TRUE(t != nullptr);
+    ASSERT_EQ(t->dtype(), DType::Q8_0);
+    ASSERT_EQ(t->device().type, DeviceType::CUDA);
+    ASSERT_TRUE(t->is_allocated());
+    ASSERT_EQ(t->allocated_bytes(), packed.size());
+
+    std::vector<uint8_t> got(packed.size());
+    err = cudaMemcpy(got.data(), t->data(), got.size(), cudaMemcpyDeviceToHost);
+    ASSERT_TRUE(err == cudaSuccess);
+    for (size_t i = 0; i < packed.size(); ++i) {
+        ASSERT_EQ(got[i], packed[i]);
+    }
+
+    RuntimeContext ctx;
+    auto st = store->bind(graph, ctx);
+    ASSERT_TRUE(st.ok());
+    ASSERT_TRUE(ctx.get(*tok) == t);
+}
 #endif
 
 void test_f16_shared_weight_store_cpu() {
@@ -908,6 +965,7 @@ int main() {
     TEST(extract_config);
 #if defined(MINILLM_ENABLE_CUDA)
     TEST(cuda_bf16_shared_weight_load);
+    TEST(cuda_q8_0_shared_weight_load);
 #endif
     TEST(f16_shared_weight_store_cpu);
     TEST(q8_0_shared_weight_store_cpu);

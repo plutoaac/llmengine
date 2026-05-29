@@ -23,6 +23,9 @@ using namespace detail;
 
 namespace {
 
+constexpr size_t kQ8_0BlockSize = 34;
+constexpr size_t kQ8_0BlockElems = 32;
+
 Status cuda_status(cudaError_t err, const char* what) {
     if (err == cudaSuccess) return Status::make_ok();
     return Status::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
@@ -57,6 +60,53 @@ Status check_cuda_float_or_bf16(const Tensor* t, std::string_view name) {
         std::string(dtype_name(t->dtype())));
 }
 
+Status check_cuda_float_bf16_or_q8_weight(const Tensor* t, std::string_view name) {
+    auto st = check_allocated(t, name);
+    if (!st.ok()) return st;
+    st = check_cuda_device(t, name);
+    if (!st.ok()) return st;
+    if (t->dtype() == DType::Float32 || t->dtype() == DType::BFloat16 ||
+        t->dtype() == DType::Q8_0) {
+        return Status::make_ok();
+    }
+    return Status::unsupported(
+        std::string(name) + " supports Float32, BFloat16, or Q8_0 weights, got " +
+        std::string(dtype_name(t->dtype())));
+}
+
+Status check_q8_block_aligned(const Tensor* t, int64_t block_dim, std::string_view op) {
+    if (t->dtype() != DType::Q8_0 || block_dim % static_cast<int64_t>(kQ8_0BlockElems) == 0) {
+        return Status::make_ok();
+    }
+    return Status::unsupported(
+        std::string(op) + " Q8_0 weights require the packed dimension to be a multiple of 32, got " +
+        std::to_string(block_dim));
+}
+
+std::expected<size_t, Status> q8_required_bytes(const Tensor* t, std::string_view name) {
+    auto n = t->numel();
+    if (!n) return std::unexpected(n.error());
+    const size_t blocks = (*n + kQ8_0BlockElems - 1) / kQ8_0BlockElems;
+    if (blocks > std::numeric_limits<size_t>::max() / kQ8_0BlockSize) {
+        return std::unexpected(Status::invalid_argument(
+            std::string(name) + " Q8_0 raw byte size overflow"));
+    }
+    return blocks * kQ8_0BlockSize;
+}
+
+Status check_q8_storage_bytes(const Tensor* t, std::string_view name) {
+    if (t->dtype() != DType::Q8_0) return Status::make_ok();
+    auto required = q8_required_bytes(t, name);
+    if (!required) return required.error();
+    const size_t available = t->allocated_bytes();
+    if (available < *required) {
+        return Status::out_of_range(
+            std::string(name) + " Q8_0 raw storage is too small: need " +
+            std::to_string(*required) + " bytes, got " + std::to_string(available));
+    }
+    return Status::make_ok();
+}
+
 Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
     auto ids_t = get_tensor(node.inputs()[0], ctx, "input_ids");
     if (!ids_t) return ids_t.error();
@@ -74,7 +124,7 @@ Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
             "input_ids only supports Int32, got " +
             std::string(dtype_name((*ids_t)->dtype())));
     }
-    st = check_cuda_float_or_bf16(*wt, "weight");
+    st = check_cuda_float_bf16_or_q8_weight(*wt, "weight");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -93,6 +143,14 @@ Status kernel_embedding(const Node& node, RuntimeContext& ctx) {
         return cuda::embedding(bf16_bits_data(*wt), int_data(*ids_t),
                                float_data_mut(*ot), *seq_len, *vocab_size, *hidden);
     }
+    if ((*wt)->dtype() == DType::Q8_0) {
+        st = check_q8_block_aligned(*wt, *hidden, "embedding");
+        if (!st.ok()) return st;
+        st = check_q8_storage_bytes(*wt, "embedding weight");
+        if (!st.ok()) return st;
+        return cuda::embedding(q8_data(*wt), int_data(*ids_t),
+                               float_data_mut(*ot), *seq_len, *vocab_size, *hidden);
+    }
     return cuda::embedding(float_data(*wt), int_data(*ids_t), float_data_mut(*ot),
                            *seq_len, *vocab_size, *hidden);
 }
@@ -107,7 +165,7 @@ Status kernel_linear(const Node& node, RuntimeContext& ctx) {
 
     auto st = check_cuda_float(*xt, "x");
     if (!st.ok()) return st;
-    st = check_cuda_float_or_bf16(*wt, "weight");
+    st = check_cuda_float_bf16_or_q8_weight(*wt, "weight");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -129,6 +187,13 @@ Status kernel_linear(const Node& node, RuntimeContext& ctx) {
 
     if ((*wt)->dtype() == DType::BFloat16) {
         st = cuda::sgemm_nt(float_data(*xt), bf16_bits_data(*wt), float_data_mut(*ot),
+                            *M, *N, *K);
+    } else if ((*wt)->dtype() == DType::Q8_0) {
+        st = check_q8_block_aligned(*wt, *K, "linear");
+        if (!st.ok()) return st;
+        st = check_q8_storage_bytes(*wt, "linear weight");
+        if (!st.ok()) return st;
+        st = cuda::sgemm_nt(float_data(*xt), q8_data(*wt), float_data_mut(*ot),
                             *M, *N, *K);
     } else {
         st = cuda::sgemm_nt(float_data(*xt), float_data(*wt), float_data_mut(*ot),
@@ -164,7 +229,7 @@ Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
 
     auto st = check_cuda_float(*at, "a");
     if (!st.ok()) return st;
-    st = check_cuda_float_or_bf16(*bt, "b");
+    st = check_cuda_float_bf16_or_q8_weight(*bt, "b");
     if (!st.ok()) return st;
     st = check_cuda_float(*ot, "output");
     if (!st.ok()) return st;
@@ -186,6 +251,16 @@ Status kernel_matmul(const Node& node, RuntimeContext& ctx) {
 
     if ((*bt)->dtype() == DType::BFloat16) {
         return cuda::sgemm(float_data(*at), bf16_bits_data(*bt), float_data_mut(*ot),
+                           *M, *N, *K);
+    }
+    if ((*bt)->dtype() == DType::Q8_0) {
+        st = check_q8_block_aligned(*bt, *K, "matmul reduction dimension");
+        if (!st.ok()) return st;
+        st = check_q8_block_aligned(*bt, *N, "matmul output dimension");
+        if (!st.ok()) return st;
+        st = check_q8_storage_bytes(*bt, "matmul b");
+        if (!st.ok()) return st;
+        return cuda::sgemm(float_data(*at), q8_data(*bt), float_data_mut(*ot),
                            *M, *N, *K);
     }
     return cuda::sgemm(float_data(*at), float_data(*bt), float_data_mut(*ot),
